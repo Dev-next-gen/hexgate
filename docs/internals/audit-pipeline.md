@@ -468,7 +468,7 @@ ENGINE = ReplacingMergeTree(received_at)
 -- client-supplied occurred_at (clock skew would break retention).
 PARTITION BY toYYYYMM(received_at)
 ORDER BY (project_id, agent_name, outcome, occurred_at, event_id)
-TTL toDateTime(received_at) + INTERVAL 90 DAY
+TTL toDateTime(received_at) + INTERVAL 180 DAY
 SETTINGS index_granularity = 8192;
 ```
 
@@ -483,7 +483,7 @@ SETTINGS index_granularity = 8192;
 - **`hint` / `arguments`** are stored as ZSTD-compressed JSON strings, not native
   JSON, and are documented as potentially lossy (`arguments` is SDK-truncated;
   see §6).
-- **TTL 90 days** — rows self-expire, consistent with the ingest retention guard.
+- **TTL 180 days** — rows self-expire, consistent with the ingest retention guard.
 
 ### 5.2 Insert semantics
 
@@ -511,7 +511,7 @@ HTTP ingest uses the single-row `insert_decision`, whose settings are:
 ## 6. Privacy & data-handling notes
 
 - **`arguments` carries tool inputs** (paths, payloads, possibly PII). It is
-  transmitted to the platform and stored (compressed) for up to 90 days. The
+  transmitted to the platform and stored (compressed) for up to 180 days. The
   default `base_url` is **plaintext `http://localhost:8000`**; production
   deployments must set `HEXGATE_API_URL` to a TLS endpoint.
 - **Default key-name redaction, always on.** `AuditEvent.span_attributes()` replaces
@@ -538,7 +538,7 @@ HTTP ingest uses the single-row `insert_decision`, whose settings are:
   trimmed: the `Decision` the host holds — and `as_error_payload()`, which the
   model sees — keeps the full `hint`.
 - **`attributes` carries the caller ABAC bag** (the `ctx.*` namespace the
-  decision was evaluated against): stored for 90 days and rendered verbatim in
+  decision was evaluated against): stored for 180 days and rendered verbatim in
   the dashboard's audit detail drawer for anyone with project read access. It
   goes through the same key-name redactor as `arguments`, with the same
   seatbelt-not-a-guarantee caveat, so content-sensitive values (emails,
@@ -565,7 +565,8 @@ sort key `(project_id, agent_name, outcome, occurred_at, event_id)` and
 | `GET /v1/projects/{id}/audit/decisions?window=&agent=&role=&outcome=&limit=&offset=` | Filterable detail rows, newest first, with `total` for pagination; `hint`/`arguments` decoded back to objects. |
 
 - **`window`** is `24h` / `7d` / `30d` / `90d`, validated by a `Literal` (bad
-  value → 422) and bounded by the 90-day storage TTL. `role=` (empty value)
+  value → 422). The presets stop at 90d; the storage TTL is 180 days, so
+  longer spans go through the explicit date range. `role=` (empty value)
   selects the empty-role bucket; an absent `role` means "no filter". No
   sentinel string is reserved on the wire — the dashboard's "(none)" is a
   display label only.
