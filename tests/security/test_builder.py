@@ -13,7 +13,9 @@ from hexgate.security import (
     assert_allows,
     assert_denies,
     assert_needs_approval,
+    run_namespace,
 )
+from hexgate.runtime.run_facts import KNOWN_RUN_PATHS, RUN_PATH_TYPES, RunFacts
 from hexgate.security.constraints import ConstraintParseError
 
 
@@ -216,3 +218,170 @@ def test_assert_allows_raises_on_wrong_outcome() -> None:
     policy = PolicyBuilder().deny("x").build()
     with pytest.raises(AssertionError, match="expected allow"):
         assert_allows(policy, "x")
+
+
+# ---------------------------------------------------------------------------
+# run.* — the assertion helpers model a freshly-started run by default
+# ---------------------------------------------------------------------------
+
+
+def test_assert_helpers_default_to_a_started_run_not_a_missing_one() -> None:
+    """``run=None`` models a fresh run's zeros, not a fail-closed absence."""
+    policy = PolicyBuilder().allow("refund", when=["run.elapsed_seconds < 300"]).build()
+    assert_allows(policy, "refund")
+
+
+def test_assert_helpers_accept_an_explicit_run_namespace() -> None:
+    policy = PolicyBuilder().allow("refund", when=['run.agent == "billing"']).build()
+
+    assert_allows(policy, "refund", run=run_namespace(agent="billing"))
+    assert_denies(policy, "refund", run=run_namespace(agent="support"))
+
+
+def test_run_namespace_fills_every_registered_path() -> None:
+    assert set(run_namespace()) == KNOWN_RUN_PATHS
+
+
+def test_run_namespace_rejects_an_unregistered_path() -> None:
+    with pytest.raises(ValueError, match="unknown run.* path"):
+        run_namespace(definitely_not_a_path=1)
+
+
+def test_run_path_types_covers_exactly_the_registered_paths() -> None:
+    """Keeps the type registry in step with the path registry, the way
+    ``as_namespace`` is kept in step with it."""
+    assert set(RUN_PATH_TYPES) == KNOWN_RUN_PATHS
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
+        # A quoted number is the classic JSON typo. Left untyped it fails the
+        # comparison closed and renders as an ordinary threshold trip, so the
+        # dry-run silently answers a different question.
+        {"tool_calls": "5"},
+        {"tool_calls": True},
+        {"elapsed_seconds": "300"},
+        {"agent": 1},
+        {"tools_used": "search"},
+    ],
+)
+def test_run_namespace_rejects_a_wrong_typed_value(facts: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="expects"):
+        run_namespace("search", **facts)
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
+        {"tool_calls": 5},
+        {"elapsed_seconds": 300},  # an int is an acceptable float
+        {"elapsed_seconds": 300.5},
+        {"agent": "billing"},
+        {"tools_used": ["search"]},
+    ],
+)
+def test_run_namespace_accepts_correctly_typed_values(facts: dict[str, object]) -> None:
+    assert run_namespace("search", **facts).items() >= facts.items()
+
+
+# ---------------------------------------------------------------------------
+# run_namespace projects the derived paths the way a real run does
+# ---------------------------------------------------------------------------
+
+
+def _production_namespace(tool: str, executions: int, tokens: tuple[int, int]) -> dict:
+    """The namespace a real run reaches, for parity assertions below."""
+    facts = RunFacts(id="run-1", agent="")
+    for _ in range(executions):
+        facts.record_execution(tool)
+    facts.record_llm_usage(*tokens)
+    return facts.as_namespace(tool)
+
+
+def test_run_namespace_derives_total_tokens_from_the_split() -> None:
+    """The regression this guards: merged flat, ``total_tokens`` kept the
+    zeroed 0 while the split read non-zero, so a ``run.total_tokens`` cap
+    passed in the test and fired in production."""
+    wire = run_namespace(input_tokens=100, output_tokens=50)
+
+    assert wire["total_tokens"] == 150
+
+
+def test_an_explicit_total_tokens_beats_the_derivation() -> None:
+    """The derived paths stay settable outright — the split is only a
+    fallback for the caller who did not name the total."""
+    wire = run_namespace(input_tokens=100, output_tokens=50, total_tokens=999)
+
+    assert wire["total_tokens"] == 999
+
+
+def test_a_token_cap_asserts_the_same_way_it_fires() -> None:
+    policy = PolicyBuilder().allow("ask", when=["run.total_tokens < 120"]).build()
+
+    assert_denies(policy, "ask", run=run_namespace(input_tokens=100, output_tokens=50))
+
+
+def test_run_namespace_credits_the_named_tool_with_the_calls() -> None:
+    """``tool`` keys the per-tool view. Before, it was inert: twenty calls
+    alongside ``tools_used == []``, and a per-tool cap read 0."""
+    wire = run_namespace("refund", tool_calls=20)
+
+    assert wire["calls_of_this_tool"] == 20
+    assert wire["tools_used"] == ["refund"]
+
+
+def test_the_credited_run_matches_the_one_a_real_run_reaches() -> None:
+    wire = run_namespace("refund", tool_calls=20, input_tokens=100, output_tokens=50)
+    real = _production_namespace("refund", executions=20, tokens=(100, 50))
+
+    derived = ("tool_calls", "calls_of_this_tool", "tools_used", "total_tokens")
+    assert [wire[name] for name in derived] == [real[name] for name in derived]
+
+
+def test_an_explicit_per_tool_count_models_a_mixed_run() -> None:
+    """Twenty calls of which three were this tool — the run-wide count is not
+    assumed to be single-tool once the caller says otherwise."""
+    wire = run_namespace("refund", tool_calls=20, calls_of_this_tool=3)
+
+    assert wire["calls_of_this_tool"] == 3
+    assert wire["tools_used"] == ["refund"]
+
+
+def test_an_unnamed_tool_credits_nothing() -> None:
+    """There is no key to credit by, so the per-tool view stays empty rather
+    than guessing — the pre-existing behaviour for a toolless call."""
+    wire = run_namespace(tool_calls=20)
+
+    assert wire["calls_of_this_tool"] == 0
+    assert wire["tools_used"] == []
+
+
+def test_a_per_tool_cap_asserts_the_same_way_it_fires() -> None:
+    policy = (
+        PolicyBuilder().allow("refund", when=["run.calls_of_this_tool < 5"]).build()
+    )
+
+    assert_denies(policy, "refund", run=run_namespace("refund", tool_calls=5))
+    assert_allows(policy, "refund", run=run_namespace("refund", tool_calls=4))
+
+
+def test_a_zeroed_run_is_unchanged_by_naming_a_tool() -> None:
+    """A fresh run has made no calls, whatever tool is about to be decided."""
+    wire = run_namespace("refund")
+
+    assert (wire["tool_calls"], wire["calls_of_this_tool"], wire["tools_used"]) == (
+        0,
+        0,
+        [],
+    )
+
+
+def test_a_wrong_typed_cap_is_not_mistaken_for_a_threshold_trip() -> None:
+    """The regression this guards: ``tool_calls="5"`` used to make a green
+    ``assert_denies`` against a cap the run is nowhere near."""
+    policy = PolicyBuilder().allow("refund", when=["run.tool_calls < 20"]).build()
+
+    assert_allows(policy, "refund", run=run_namespace("refund", tool_calls=5))
+    with pytest.raises(ValueError):
+        assert_denies(policy, "refund", run=run_namespace("refund", tool_calls="5"))

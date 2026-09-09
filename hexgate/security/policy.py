@@ -13,20 +13,19 @@ from hexgate.security.decision import DecisionOutcome, Verdict
 from hexgate.security.errors import ApprovalRequiredError, PolicyDeniedError
 from hexgate.security.file_scope import build_file_scope_hint, is_path_allowed
 from hexgate.security.models import (
-    AGENT_RUN_TOOL,
     AgentPolicy,
     BaseToolPolicy,
     FileToolPolicy,
     ToolPolicy,
-    is_agent_reach_key,
+    is_agent_key,
 )
 
-# Reach keys are closed-world: an unlisted agent.tool:/agent.handoff: denies
-# regardless of default_policy, so a permissive tool default never silently grants
-# agent reach. Admission (agent.run) is the opposite: opt-in, so an unlisted
-# agent.run admits (a role that declares no admission does not restrict it).
-_AGENT_REACH_CLOSED_WORLD_DENY = BaseToolPolicy(mode="deny")
-_ADMISSION_OPT_IN_ALLOW = BaseToolPolicy(mode="allow")
+# Agent keys (admission agent.run AND reach agent.tool:/agent.handoff:) are
+# closed-world: an unlisted agent key denies regardless of default_policy. A role
+# that is not granted admission is denied, so a permissive tool default cannot
+# silently grant a run or a handoff. Whether admission is enforced at all is the
+# gate's opt-in engagement decision (declares_admission), not this fallback (R-AGENT-002).
+_AGENT_CLOSED_WORLD_DENY = BaseToolPolicy(mode="deny")
 
 if TYPE_CHECKING:
     from hexgate.security.bundle import PolicyBundle
@@ -53,27 +52,18 @@ def get_tool_policy(policy: AgentPolicy, tool_name: str) -> ToolPolicy:
     """Resolve the effective policy for a tool name.
 
     Reads ``effective_tools`` (authored tools plus lowered ``agent.*`` keys) so a
-    synthetic agent-level key resolves through the same path as any tool. Fallbacks
-    for an unlisted key differ by kind:
-
-    * an unlisted **reach** key (``agent.tool:`` / ``agent.handoff:``) denies,
-      closed-world, so a permissive ``default_policy`` cannot silently grant a
-      handoff or sub-agent call;
-    * an unlisted ``agent.run`` **admits** (admission is opt-in — a role that
-      declares no admission does not restrict who may start the agent);
-    * any other unlisted tool falls to ``default_policy``.
-
-    The Rego compiler mirrors both (it excludes reach keys from its permissive
-    catch-all and emits an opt-in allow rule for ``agent.run``), keeping the engines
-    in agreement.
+    synthetic agent-level key resolves through the same path as any tool. An
+    unlisted **agent** key (admission or reach) denies, closed-world, so a
+    permissive ``default_policy`` never silently grants a run or a handoff; any
+    other unlisted tool falls to ``default_policy``. The Rego compiler mirrors this
+    (its permissive catch-all excludes every agent key), keeping the engines in
+    agreement (R-AGENT-002).
     """
     tool_policy = policy.effective_tools.get(tool_name)
     if tool_policy is not None:
         return tool_policy
-    if tool_name == AGENT_RUN_TOOL:
-        return _ADMISSION_OPT_IN_ALLOW
-    if is_agent_reach_key(tool_name):
-        return _AGENT_REACH_CLOSED_WORLD_DENY
+    if is_agent_key(tool_name):
+        return _AGENT_CLOSED_WORLD_DENY
     return policy.default_policy
 
 
@@ -84,6 +74,7 @@ def evaluate_tool_call(
     *,
     role: str | None = None,
     attributes: Mapping[str, Any] | None = None,
+    run: Mapping[str, Any] | None = None,
 ) -> Verdict:
     """Return a :class:`Verdict` for a proposed tool call (pydantic engine).
 
@@ -114,6 +105,7 @@ def evaluate_tool_call(
             role=role,
             consts=policy.consts,
             attributes=attributes,
+            run=run,
         )
     except PolicyDeniedError as exc:
         return Verdict(outcome=DecisionOutcome.DENY, reason=str(exc))
@@ -155,19 +147,18 @@ def authorize_tool_call(
     *,
     role: str | None = None,
     attributes: Mapping[str, Any] | None = None,
+    run: Mapping[str, Any] | None = None,
 ) -> None:
     """Raise when a tool call is denied or requires approval.
 
     Thin raise-on-deny wrapper over :func:`evaluate_tool_call`, kept for
     callers (the CLI, direct API users) that prefer the exception contract.
-    ``role`` is forwarded so ``role``-scoped constraints see the caller's
-    role — omitting it here would diverge from the WASM engine, which always
-    receives ``input.role``. ``attributes`` are forwarded for the same reason:
-    ``ctx.*`` constraints must see the caller's ABAC bag.
+    ``role``, ``attributes`` and ``run`` are all forwarded so their respective
+    constraints see the same inputs the WASM engine always receives.
     """
     _raise_for_verdict(
         evaluate_tool_call(
-            policy, tool_name, arguments, role=role, attributes=attributes
+            policy, tool_name, arguments, role=role, attributes=attributes, run=run
         )
     )
 
@@ -179,6 +170,7 @@ def evaluate_tool_call_wasm(
     arguments: dict[str, Any] | None = None,
     *,
     attributes: Mapping[str, Any] | None = None,
+    run: Mapping[str, Any] | None = None,
 ) -> Verdict:
     """WASM-backed counterpart of :func:`evaluate_tool_call`.
 
@@ -193,7 +185,11 @@ def evaluate_tool_call_wasm(
     a "no allow rule matched" hint so the message isn't silently empty.
     """
     decision = bundle.policy().decide(
-        role=role, tool=tool_name, args=arguments or {}, ctx=dict(attributes or {})
+        role=role,
+        tool=tool_name,
+        args=arguments or {},
+        ctx=dict(attributes or {}),
+        run=dict(run or {}),
     )
     return verdict_from_rego(decision, tool_name=tool_name, role=role)
 
@@ -238,6 +234,7 @@ def authorize_tool_call_wasm(
     arguments: dict[str, Any] | None = None,
     *,
     attributes: Mapping[str, Any] | None = None,
+    run: Mapping[str, Any] | None = None,
 ) -> None:
     """Raise-on-deny wrapper over :func:`evaluate_tool_call_wasm`.
 
@@ -246,6 +243,6 @@ def authorize_tool_call_wasm(
     """
     _raise_for_verdict(
         evaluate_tool_call_wasm(
-            bundle, role, tool_name, arguments, attributes=attributes
+            bundle, role, tool_name, arguments, attributes=attributes, run=run
         )
     )

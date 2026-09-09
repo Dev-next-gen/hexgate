@@ -31,22 +31,46 @@ Mixin policies (``is_mixin: true``) can only be referenced via ``inherits``
 from __future__ import annotations
 
 from collections.abc import Mapping
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from hexgate.security.constraints import iter_const_refs, parse_constraint
+from hexgate.runtime.run_facts import LIST_PATHS, SCALAR_PATHS
+from hexgate.security.constraints import (
+    LEFT,
+    Node,
+    Ref,
+    iter_arg_refs,
+    iter_cmp_operands,
+    iter_const_refs,
+    parse_constraint,
+)
 from hexgate.security.decision import Verdict
 from hexgate.security.models import (
+    AGENT_RUN_TOOL,
     AgentPolicy,
     AgentTargetPolicy,
     BaseToolPolicy,
     ToolPolicy,
+    is_agent_reach_key,
 )
 
-
 DEFAULT_ROLE_NAME = "default"
+
+# Top-level flag the resolve serializer stamps onto a resolved (already-lowered)
+# policy document, so ``load_policy_set_from_dict`` loads it under a "resolved"
+# context that accepts lowered ``agent.*`` keys in ``tools`` (R-POL-002 compiles a
+# modular agent's bundle from this re-parsed YAML). Hand-written policies omit it,
+# so the reserved-name guard still fires on authored source.
+RESOLVED_POLICY_MARKER = "_resolved"
+
+_RUN_ROOT = "run"
+_RUN_PATH_SEGMENTS = 2  # the namespace is flat: run.<name>
+_ORDERED_OPS = frozenset({"<", "<=", ">", ">="})
+# ==/!= excluded: list equality is well-defined, just not useful here.
+_SCALAR_ONLY_OPS = _ORDERED_OPS | {"in", "not in"}
 
 
 class PolicySetError(ValueError):
@@ -79,6 +103,7 @@ class PolicySet:
                 f"PolicySet missing required '{DEFAULT_ROLE_NAME}' role"
             )
         _validate_const_refs(policies)
+        _validate_run_refs(policies)
         self._policies = policies
         self._aliased_default = aliased_default
 
@@ -105,22 +130,46 @@ class PolicySet:
         tool: str,
         args: Mapping[str, Any],
         attributes: Mapping[str, Any] | None = None,
+        run: Mapping[str, Any] | None = None,
     ) -> Verdict:
         """:class:`~hexgate.security.decision.PolicyEngine` entry point.
 
         Resolves the role's policy and runs the pydantic engine. ``attributes``
-        feed the ``ctx.*`` constraint namespace; the role still selects the
-        policy bucket (``policy_for``) on its own."""
+        feed the ``ctx.*`` constraint namespace and ``run`` the ``run.*`` one;
+        the role still selects the policy bucket (``policy_for``) on its own."""
         from hexgate.security.policy import evaluate_tool_call
 
         return evaluate_tool_call(
-            self.policy_for(role), tool, dict(args), role=role, attributes=attributes
+            self.policy_for(role),
+            tool,
+            dict(args),
+            role=role,
+            attributes=attributes,
+            run=run,
         )
 
     @property
     def roles(self) -> list[str]:
         """List of role names, including ``default``, excluding mixins."""
         return sorted(self._policies)
+
+    def declares_admission(self) -> bool:
+        """True if any resolved role carries the ``agent.run`` key.
+
+        Derived from ``effective_tools`` rather than a source field so it holds
+        after inheritance and module folding, where the ``admission`` block has
+        become an ``agent.run`` key (R-AGENT-002)."""
+        return any(
+            AGENT_RUN_TOOL in policy.effective_tools
+            for policy in self._policies.values()
+        )
+
+    def declares_reach(self) -> bool:
+        """True if any resolved role carries an ``agent.tool:`` / ``agent.handoff:`` key."""
+        return any(
+            any(is_agent_reach_key(key) for key in policy.effective_tools)
+            for policy in self._policies.values()
+        )
 
     def __contains__(self, role: str) -> bool:
         return role in self._policies
@@ -148,6 +197,90 @@ def _validate_const_refs(policies: Mapping[str, AgentPolicy]) -> None:
                             f"role {role!r}: constraint {raw!r} references "
                             f"undefined constant consts.{name}"
                         )
+
+
+def _sdk_version() -> str:
+    try:
+        return version("hexgate")
+    except PackageNotFoundError:  # pragma: no cover - editable installs always resolve
+        return "unknown"
+
+
+def _run_paths_in(node: Node):
+    """Every ``run``-rooted path in a node, whatever its position."""
+    for path in iter_arg_refs(node):
+        if path and path[0] == _RUN_ROOT:
+            yield path
+
+
+def _validate_run_refs(
+    policies: Mapping[str, AgentPolicy],
+    *,
+    scalar_paths: frozenset[str] = SCALAR_PATHS,
+    list_paths: frozenset[str] = LIST_PATHS,
+) -> None:
+    """Reject a ``run.*`` reference this SDK cannot answer, or answers silently.
+
+    Sibling of :func:`_validate_const_refs` — same construction-time check, same
+    reason (pydantic and the Rego compiler must agree a policy is valid).
+
+    Two failure modes, both otherwise silent: an unknown or too-deep path
+    (``run.tool_call``, ``run.id.value``) resolves to missing and denies every
+    call; a list-valued path used as a scalar (``run.tools_used not in [...]``)
+    can silently *pass* every call instead.
+
+    Registries are parameters, not module reads, so the list rule is testable
+    before any list-valued path is registered.
+    """
+    for role, policy in policies.items():
+        for tool_policy in (*policy.tools.values(), policy.default_policy):
+            for raw in tool_policy.constraints:
+                node = parse_constraint(raw)
+                _reject_unknown_run_paths(node, role, raw, scalar_paths | list_paths)
+                _reject_list_paths_in_scalar_position(node, role, raw, list_paths)
+
+
+def _reject_unknown_run_paths(
+    node: Node, role: str, raw: str, known: frozenset[str]
+) -> None:
+    for path in _run_paths_in(node):
+        if len(path) != _RUN_PATH_SEGMENTS:
+            raise PolicySetError(
+                f"role {role!r}: constraint {raw!r} references run.* path "
+                f"{'.'.join(path[1:])!r}; run.* paths are exactly two segments "
+                "(run.<name>)"
+            )
+        if path[1] not in known:
+            raise PolicySetError(
+                f"role {role!r}: constraint {raw!r} references unknown run.* "
+                f"path {path[1]!r} (hexgate {_sdk_version()} knows: "
+                f"{', '.join(sorted(known))}). Upgrade the SDK or fix the path."
+            )
+
+
+def _reject_list_paths_in_scalar_position(
+    node: Node, role: str, raw: str, list_paths: frozenset[str]
+) -> None:
+    for operand, op, side in iter_cmp_operands(node):
+        # Ref-only: a Count is the correct way to use a list here.
+        if not isinstance(operand, Ref) or op not in _SCALAR_ONLY_OPS:
+            continue
+        if len(operand.path) != _RUN_PATH_SEGMENTS or operand.path[0] != _RUN_ROOT:
+            continue
+        if operand.path[1] not in list_paths:
+            continue
+        # in/not in only accept a literal or const on the right, so a
+        # list-valued ref can only ever be their left operand.
+        if op in _ORDERED_OPS or side == LEFT:
+            name = ".".join(operand.path)
+            effect = (
+                "silently passes" if op == "not in" else "silently fails every call"
+            )
+            raise PolicySetError(
+                f"role {role!r}: constraint {raw!r} uses the list-valued path "
+                f"{name!r} with {op!r}, which {effect}. Use: "
+                f'not any({name}, . == "<value>")'
+            )
 
 
 def load_policy_set(source: str | Path | AgentPolicy | None) -> PolicySet:
@@ -242,17 +375,28 @@ def load_policy_set_from_dict(payload: dict[str, Any]) -> PolicySet:
     * **Flat single-policy shape** (legacy) — anything else is treated as a
       single :class:`AgentPolicy` and wrapped as the ``default`` role.
 
+    A top-level ``_resolved: true`` marker (set by the resolve serializer,
+    :data:`RESOLVED_POLICY_MARKER`) validates under a ``{"resolved": True}``
+    context: a machine-resolved policy legitimately carries lowered ``agent.*``
+    keys in ``tools`` and must round-trip back through this loader when a modular
+    agent's bundle is compiled from its resolved YAML (R-POL-002). A hand-written
+    policy has no marker, so the reserved-``agent.*``-name guard still fires on it.
+
     Used by the cloud loader (the platform returns one ``policy_yaml`` string
     per agent, with roles potentially inline) and by ``_load_legacy_file``
     for SDK-local agents.
     """
+    context = {"resolved": True} if payload.get(RESOLVED_POLICY_MARKER) else None
     if isinstance(payload.get("roles"), dict):
         role_policies = {
-            role_name: AgentPolicy.model_validate(spec or {})
+            role_name: AgentPolicy.model_validate(spec or {}, context=context)
             for role_name, spec in payload["roles"].items()
         }
         return load_policy_map(role_policies)
-    return PolicySet({DEFAULT_ROLE_NAME: AgentPolicy.model_validate(payload)})
+    flat = {k: v for k, v in payload.items() if k != RESOLVED_POLICY_MARKER}
+    return PolicySet(
+        {DEFAULT_ROLE_NAME: AgentPolicy.model_validate(flat, context=context)}
+    )
 
 
 def _load_from_directory(root: Path) -> PolicySet:

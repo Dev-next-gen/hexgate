@@ -98,6 +98,30 @@ def test_dead_grant_when_a_boundary_hard_denies_the_tool():
     assert "denies" in dead[0].message
 
 
+def test_dead_reach_grant_flagged_like_a_tool_grant():
+    # Agent-level blocks compose through the linker (#124), so a reach grant a
+    # ceiling never permits is a dead grant — the lint passes read effective_tools,
+    # so the lowered agent.tool: key is covered like any tool.
+    ceiling = ModuleContent(
+        name="org",
+        kind="boundary",
+        policy=AgentPolicy(
+            default_policy=BaseToolPolicy(mode="deny")
+        ),  # lists no reach
+        source="org.yaml",
+        content_hash="hash-org",
+    )
+    cap = ModuleContent(
+        name="c",
+        kind="capability",
+        policy=AgentPolicy(agents={"evil_bot": {"via": ["tool"], "mode": "allow"}}),
+        source="c.yaml",
+        content_hash="hash-c",
+    )
+    dead = [lint for lint in check([ceiling], [cap]) if lint.code == "dead-grant"]
+    assert [lint.tool for lint in dead] == ["agent.tool:evil_bot"]
+
+
 # --- redundant-grant ---
 
 
@@ -481,6 +505,24 @@ def test_check_project_unknown_capability_is_a_link_error():
     assert [lint.code for lint in lints] == ["link-error"]
 
 
+def test_check_project_surfaces_named_agent_column_link_error():
+    # A named-agent column importing an unknown capability must show as a
+    # link-error lint (the "*" column alone would never touch it).
+    from hexgate.security import AgentBinding
+
+    read_only = _mod("read_only", "capability", {"view": _allow()})
+    roles = {
+        "member": {
+            "*": AgentBinding(capabilities=("read_only",)),
+            "billing_bot": AgentBinding(capabilities=("nonexistent",)),
+        }
+    }
+    lints = check_project([], [read_only], roles)
+    assert any(
+        lint.code == "link-error" and "billing_bot" in lint.message for lint in lints
+    )
+
+
 def test_no_roles_emit_no_project_lints():
     # None (no roles.yaml) -> one default importing everything. Nothing unused,
     # and the default is present, so neither project-level lint fires.
@@ -520,3 +562,15 @@ def test_authored_default_grant_messages_keep_the_no_named_role_wording() -> Non
 
     grant = next(lint for lint in lints if lint.tool == "deploy")
     assert "no named role does" in grant.message
+
+
+def test_run_constraints_are_not_linted_as_unknown_args():
+    """``_unknown_args`` only inspects ``args``-rooted paths, so ``run.*``
+    passes through untouched."""
+    boundary = _mod("b", "boundary", {"refund": _allow(["run.elapsed_seconds < 300"])})
+    cap = _mod("c", "capability", {"refund": _allow()})
+    manifest = _manifest(("refund", ["amount"]))
+
+    lints = check([boundary], [cap], manifest=manifest)
+
+    assert not [lint for lint in lints if lint.code == "unknown-arg"]

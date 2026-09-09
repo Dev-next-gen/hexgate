@@ -12,6 +12,9 @@ from pydantic import (
     model_validator,
 )
 
+# Ceiling for counters stored in ClickHouse UInt32 columns (schema.sql).
+UINT32_MAX = 2**32 - 1
+
 
 # ---------------------------------------------------------------------------
 # M3 Phase 4 — Organization wire shapes
@@ -368,13 +371,21 @@ class PolicyModuleWrite(BaseModel):
 
 
 class RoleBindingsRead(BaseModel):
-    """A project's role bindings: role name -> the capability names it imports."""
+    """A project's role bindings as the ``(role, agent)`` matrix:
+    ``role -> agent-or-"*" -> capability names``. The ``"*"`` agent is the
+    generic default; a project written before the agent axis reads back with all
+    capabilities under ``"*"``."""
 
-    roles: dict[str, list[str]] = Field(default_factory=dict)
+    roles: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
 
 
 class RoleBindingsWrite(BaseModel):
-    roles: dict[str, list[str]] = Field(default_factory=dict)
+    """Write role bindings. Accepts either the ``(role, agent)`` matrix
+    (``role -> {agent: [caps]}``) or the flat form (``role -> [caps]``, applied to
+    the generic ``"*"`` agent) — the service normalizes both, so a flat client
+    stays valid."""
+
+    roles: dict[str, dict[str, list[str]] | list[str]] = Field(default_factory=dict)
 
 
 class ResolvedPolicyResponse(BaseModel):
@@ -538,9 +549,13 @@ class LlmInvocationEvent(AuditEnvelope):
     """One LLM invocation; mirrors the llm_invocation table."""
 
     model: str = Field(min_length=1, max_length=256)
-    input_tokens: int = Field(ge=0)
-    output_tokens: int = Field(ge=0)
-    latency_ms: int = Field(ge=0)
+    # The upper bound mirrors the UInt32 columns in schema.sql. Without it an
+    # over-range value (e.g. latency sent in ns) passes validation and only
+    # fails at insert time — a permanent ClickHouse error the enricher would
+    # retry forever instead of rejecting the span to the DLQ.
+    input_tokens: int = Field(ge=0, le=UINT32_MAX)
+    output_tokens: int = Field(ge=0, le=UINT32_MAX)
+    latency_ms: int = Field(ge=0, le=UINT32_MAX)
     status: str = Field(default="success", max_length=64)
     error_code: str = Field(default="", max_length=64)
 

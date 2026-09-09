@@ -67,7 +67,24 @@ class PolicyEngine(Protocol):
         tool: str,
         args: Mapping[str, Any],
         attributes: Mapping[str, Any] | None = None,
+        run: Mapping[str, Any] | None = None,
     ) -> Verdict: ...
+
+    def declares_admission(self) -> bool:
+        """Whether this policy configures admission anywhere.
+
+        The agent gate's opt-in signal: it fires only when this is true, so an
+        agent that never mentions admission is never gated (agent keys are
+        otherwise closed-world). A pydantic engine derives it from the resolved
+        policy; a WASM bundle reads it from its signed manifest (R-AGENT-002)."""
+        ...
+
+    def declares_reach(self) -> bool:
+        """Whether this policy configures agent-to-agent reach anywhere.
+
+        The delegation seam's opt-in signal, the reach counterpart to
+        :meth:`declares_admission` (consumed once handoff interception lands)."""
+        ...
 
 
 # Over the platform's ``DecisionEvent.reason`` max_length the audit event is
@@ -199,8 +216,9 @@ class Decision:
     # The ABAC attribute snapshot the decision was evaluated against, so an
     # in-process observer sees the ``ctx.*`` values that drove the outcome, and
     # so the audit record can explain a ``ctx.*``-driven deny. Persisted by the
-    # audit sender (redacted + capped in ``audit.as_payload``); deliberately
-    # still absent from ``as_error_payload`` — the model must never see it.
+    # audit sender (redacted + capped in ``audit.AuditEvent.span_attributes``);
+    # deliberately still absent from ``as_error_payload`` — the model must
+    # never see it.
     attributes: dict[str, Any] | None = None
 
     @classmethod

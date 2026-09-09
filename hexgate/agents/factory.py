@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     # eventually import from this module).
     from hexgate.cloud.client import HexgateClient
     from hexgate.guards.types import Guard, GuardObserver
+    from hexgate.security.agent_gate import AgentGate
     from hexgate.security.bans import BanGate
     from hexgate.security.binding import PolicyBinding
     from hexgate.security.enforcer import DecisionObserver, PolicyEnforcer
@@ -38,10 +39,12 @@ from pydantic import BaseModel
 from hexgate.approvals import ApprovalHandler  # noqa: F401 — re-export
 from hexgate.config.env import resolve_api_key
 from hexgate.runtime import (
+    DEFAULT_AGENT_NAME,
     LocalWorkspace,
     ToolUseContext,
     Workspace,
     reset_current_tool_use_context,
+    run_scope,
     set_current_tool_use_context,
 )
 from hexgate.streaming import StreamEvent, new_root_run_id, normalize_langchain_events
@@ -334,6 +337,7 @@ class HexgateAgent:
         binding: PolicyBinding | None = None,
         hexgate_client: HexgateClient | None = None,
         ban_gate: BanGate | None = None,
+        agent_gate: AgentGate | None = None,
     ) -> None:
         # Private: run only via ainvoke/astream_events, which apply policy
         # refresh + the ban gate. Reaching self._graph directly skips both.
@@ -368,11 +372,17 @@ class HexgateAgent:
         # Kill-switch gate; attached by load_hexgate_agent (platform path only —
         # no gate without a control plane). Threaded through with_tools rebuilds.
         self._ban_gate: BanGate | None = ban_gate
+        # Admission gate; attached by enforce_policy alongside the binding (local,
+        # no control plane needed). Threaded through with_tools rebuilds. Whether it
+        # actually refuses is decided per run from the current policy.
+        self._agent_gate: AgentGate | None = agent_gate
         # api_key intentionally omitted — create_agent has no explicit api_key param
         # (only hexgate_client, attached post-init by _bind_policy). If one is added,
         # thread it through here too, or usage events will keep silently resolving
         # from HEXGATE_API_KEY instead of the caller's explicit key.
-        self._usage_handler = HexgateUsageCallbackHandler(agent_name=name or "default")
+        self._usage_handler = HexgateUsageCallbackHandler(
+            agent_name=name or DEFAULT_AGENT_NAME
+        )
 
     def _with_usage_callback(self, config: dict[str, Any]) -> dict[str, Any]:
         """Append the usage callback handler to ``config['callbacks']``."""
@@ -396,9 +406,11 @@ class HexgateAgent:
         """
         await _refresh_policy_safely(self)
         await self._check_ban()
-        return await self._graph.ainvoke(
-            payload, config=self._with_usage_callback(config)
-        )
+        await self._check_admission()
+        with run_scope(self.name or DEFAULT_AGENT_NAME):
+            return await self._graph.ainvoke(
+                payload, config=self._with_usage_callback(config)
+            )
 
     async def astream_events(
         self,
@@ -415,10 +427,12 @@ class HexgateAgent:
         """
         await _refresh_policy_safely(self)
         await self._check_ban()
-        async for event in self._graph.astream_events(
-            payload, config=self._with_usage_callback(config), version=version
-        ):
-            yield event
+        await self._check_admission()
+        with run_scope(self.name or DEFAULT_AGENT_NAME):
+            async for event in self._graph.astream_events(
+                payload, config=self._with_usage_callback(config), version=version
+            ):
+                yield event
 
     async def _check_ban(self) -> None:
         """Refuse a banned agent/user before the graph runs, if a gate is
@@ -430,6 +444,15 @@ class HexgateAgent:
         from hexgate.runtime.context import get_current_context
 
         await self._ban_gate.check_async(get_current_context())
+
+    async def _check_admission(self) -> None:
+        """Refuse a caller not admitted by policy before the graph runs, if an
+        admission gate is attached. The gate reads the active
+        :class:`HexgateContext` scope for the caller's role; a policy with no
+        admission block makes this a no-op."""
+        if self._agent_gate is None:
+            return
+        await self._agent_gate.check_admission_async()
 
     def with_tools(self, tools: Sequence[ToolSpec]) -> Self:
         """Rebuild the runtime with a new tool list."""
@@ -471,6 +494,7 @@ class HexgateAgent:
             binding=self._binding,
             hexgate_client=self.hexgate_client,
             ban_gate=self._ban_gate,
+            agent_gate=self._agent_gate,
         )
 
     def enforce_policy(
@@ -542,8 +566,13 @@ class HexgateAgent:
                 )
             if pipeline is None or pipeline.is_empty:
                 # Nothing to enforce and no guards to run (an observer-only
-                # pipeline can't fire without guards): return unguarded.
-                return self.with_tools(list(self.tools))
+                # pipeline can't fire without guards): return unguarded. Clear any
+                # admission gate a prior enforce_policy attached, or with_tools
+                # would carry it forward and the "unguarded" agent would still
+                # refuse admission.
+                unguarded = self.with_tools(list(self.tools))
+                unguarded._agent_gate = None
+                return unguarded
             enforcer = None  # guards-only gating, no policy engine
         else:
             if isinstance(policy, (PolicyBundle, PolicySet)):
@@ -552,7 +581,7 @@ class HexgateAgent:
                 engine = load_policy_set(policy)
             enforcer = build_enforcer(
                 engine,
-                agent_name=self.name or "default",
+                agent_name=self.name or DEFAULT_AGENT_NAME,
                 decision_observer=decision_observer,
             )
 
@@ -575,9 +604,20 @@ class HexgateAgent:
                 wrapped.append(tool_spec)
         rebuilt = self.with_tools(wrapped)
         if enforcer is not None:
+            from hexgate.security.agent_gate import resolve_agent_gate
+
             # The binding pairs the enforcer the tools just closed over with the
             # refresh source, so refresh_policy() can swap the policy in place.
             rebuilt._binding = PolicyBinding(enforcer, source)
+            # The admission gate shares that same enforcer, so a refresh that
+            # swaps the policy is reflected on the next run entry too.
+            rebuilt._agent_gate = resolve_agent_gate(
+                enforcer, approval_handler=approval_handler
+            )
+        else:
+            # Guards-only path: no enforcer, so no admission. Clear any gate a
+            # prior enforce_policy left, which with_tools would otherwise carry.
+            rebuilt._agent_gate = None
         return rebuilt
 
     def refresh_policy(self) -> None:

@@ -1,0 +1,447 @@
+"""What each path through the runner accrues to ``run.*``.
+
+Run against both sync and async runners, which are line-for-line mirrors —
+drift between them is the failure mode this file guards. A tool counts on
+execution, never on deny; a denied call accrues to ``run.denials`` instead; an
+approval gate counts on the decision, execution separately; a pre-guard halt
+is not a tool call, a post-guard halt is both a tool call and a denial.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from hexgate.guards import after_tool, before_tool
+from hexgate.guards.runner import run_guarded_async, run_guarded_sync
+from hexgate.guards.types import Halt, ToolPipeline
+from hexgate.runtime.run_facts import RunFacts, run_scope
+from hexgate.security.decision import DecisionOutcome
+from tests.guards.helpers import FakeEnforcer, RecordingInvoke, langchain_error
+
+_TOOL = "echo"
+_OTHER_TOOL = "search"
+
+_ASYNC, _SYNC = "async", "sync"
+_BOTH = pytest.mark.parametrize("path", [_ASYNC, _SYNC])
+
+
+# An approval handler is a bool or a ``Decision -> bool`` callable; the
+# constant form is what the existing runner suite uses.
+_APPROVE, _REFUSE = True, False
+
+
+class _Raises:
+    """An ``invoke`` that always raises — the tool ran and failed."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def aio(self, final: dict[str, Any]) -> Any:
+        self.calls.append(final)
+        raise RuntimeError("tool blew up")
+
+    def sync(self, final: dict[str, Any]) -> Any:
+        self.calls.append(final)
+        raise RuntimeError("tool blew up")
+
+
+async def _drive(
+    path: str,
+    *,
+    enforcer: Any,
+    pipeline: ToolPipeline | None = None,
+    invoke: Any = None,
+    approval_handler: Any = None,
+    tool: str = _TOOL,
+) -> Any:
+    """Run one guarded call through whichever runner ``path`` names."""
+    invoke = invoke if invoke is not None else RecordingInvoke()
+    if path == _ASYNC:
+        return await run_guarded_async(
+            tool,
+            {"x": 1},
+            enforcer=enforcer,
+            pipeline=pipeline,
+            approval_handler=approval_handler,
+            invoke=invoke.aio,
+            render_error=langchain_error,
+        )
+    return run_guarded_sync(
+        tool,
+        {"x": 1},
+        enforcer=enforcer,
+        pipeline=pipeline,
+        approval_handler=approval_handler,
+        invoke=invoke.sync,
+        render_error=langchain_error,
+    )
+
+
+def _halting(outcome: DecisionOutcome, *, post: bool = False) -> ToolPipeline:
+    halt = Halt(reason="guard says no", outcome=outcome)
+    if post:
+        return ToolPipeline(pre=[], post=[after_tool(lambda call, out: halt)])
+    return ToolPipeline(pre=[before_tool(lambda call: halt)], post=[])
+
+
+# ---------------------------------------------------------------------------
+# The matrix
+# ---------------------------------------------------------------------------
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_allowed_call_counts_one_execution(path: str) -> None:
+    with run_scope("a") as facts:
+        await _drive(path, enforcer=FakeEnforcer())
+
+    assert (facts.tool_calls, facts.errors, facts.denials, facts.approvals) == (
+        1,
+        0,
+        0,
+        0,
+    )
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_tool_that_raises_counts_an_execution_and_an_error(path: str) -> None:
+    with run_scope("a") as facts:
+        with pytest.raises(RuntimeError):
+            await _drive(path, enforcer=FakeEnforcer(), invoke=_Raises())
+
+    assert (facts.tool_calls, facts.errors) == (1, 1)
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_denied_call_consumes_no_tool_budget(path: str) -> None:
+    with run_scope("a") as facts:
+        await _drive(path, enforcer=FakeEnforcer(DecisionOutcome.DENY, "nope"))
+
+    assert (facts.tool_calls, facts.denials, facts.approvals) == (0, 1, 0)
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_granted_approval_counts_the_gate_and_the_execution(path: str) -> None:
+    with run_scope("a") as facts:
+        await _drive(
+            path,
+            enforcer=FakeEnforcer(DecisionOutcome.NEEDS_APPROVAL),
+            approval_handler=_APPROVE,
+        )
+
+    assert (facts.approvals, facts.tool_calls, facts.denials) == (1, 1, 0)
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_refused_approval_counts_the_gate_but_not_an_execution(
+    path: str,
+) -> None:
+    with run_scope("a") as facts:
+        await _drive(
+            path,
+            enforcer=FakeEnforcer(DecisionOutcome.NEEDS_APPROVAL),
+            approval_handler=_REFUSE,
+        )
+
+    assert (facts.approvals, facts.tool_calls) == (1, 0)
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_pre_guard_halt_is_a_denial_not_a_tool_call(path: str) -> None:
+    with run_scope("a") as facts:
+        await _drive(
+            path, enforcer=FakeEnforcer(), pipeline=_halting(DecisionOutcome.DENY)
+        )
+
+    assert (facts.denials, facts.tool_calls) == (1, 0)
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_granted_pre_guard_approval_halt_proceeds_and_counts_both(
+    path: str,
+) -> None:
+    with run_scope("a") as facts:
+        await _drive(
+            path,
+            enforcer=FakeEnforcer(),
+            pipeline=_halting(DecisionOutcome.NEEDS_APPROVAL),
+            approval_handler=_APPROVE,
+        )
+
+    assert (facts.approvals, facts.tool_calls, facts.denials) == (1, 1, 0)
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_post_guard_halt_still_counts_the_execution(path: str) -> None:
+    """Both counters move: the tool ran (only the result is withheld), and a
+    post-guard halt is a refusal like any other. The one case where a call is
+    an execution and a denial at once."""
+    with run_scope("a") as facts:
+        await _drive(
+            path,
+            enforcer=FakeEnforcer(),
+            pipeline=_halting(DecisionOutcome.DENY, post=True),
+        )
+
+    assert (facts.tool_calls, facts.denials) == (1, 1)
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_post_guard_halt_does_not_double_count_the_tool(path: str) -> None:
+    with run_scope("a") as facts:
+        await _drive(
+            path,
+            enforcer=FakeEnforcer(),
+            pipeline=_halting(DecisionOutcome.DENY, post=True),
+        )
+
+    assert facts.tool_calls == 1
+    assert facts._calls_by_tool == {_TOOL: 1}
+
+
+# ---------------------------------------------------------------------------
+# Per-tool counting and the projected namespace
+# ---------------------------------------------------------------------------
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_calls_of_this_tool_is_per_tool_across_a_run(path: str) -> None:
+    enforcer = FakeEnforcer()
+    with run_scope("a") as facts:
+        for _ in range(3):
+            await _drive(path, enforcer=enforcer, tool=_TOOL)
+        await _drive(path, enforcer=enforcer, tool=_OTHER_TOOL)
+
+    assert facts.as_namespace(_TOOL)["calls_of_this_tool"] == 3
+    assert facts.as_namespace(_OTHER_TOOL)["calls_of_this_tool"] == 1
+    assert facts.as_namespace(_TOOL)["tool_calls"] == 4
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_tools_used_is_first_use_ordered_and_deduplicated(path: str) -> None:
+    enforcer = FakeEnforcer()
+    with run_scope("a") as facts:
+        await _drive(path, enforcer=enforcer, tool=_OTHER_TOOL)
+        await _drive(path, enforcer=enforcer, tool=_TOOL)
+        await _drive(path, enforcer=enforcer, tool=_OTHER_TOOL)
+
+    assert facts.as_namespace(_TOOL)["tools_used"] == [_OTHER_TOOL, _TOOL]
+
+
+# ---------------------------------------------------------------------------
+# The detached path
+# ---------------------------------------------------------------------------
+
+
+@_BOTH
+@pytest.mark.asyncio
+async def test_recording_outside_a_run_scope_is_a_no_op(path: str) -> None:
+    from hexgate.runtime.run_facts import DETACHED
+
+    before = DETACHED.tool_calls
+    await _drive(path, enforcer=FakeEnforcer())
+    assert DETACHED.tool_calls == before
+
+
+# ---------------------------------------------------------------------------
+# The overshoot bound
+# ---------------------------------------------------------------------------
+
+_CAP = 5
+_CONCURRENCY = 50
+
+
+@pytest.mark.asyncio
+async def test_a_cap_holds_exactly_under_parallel_tool_calls() -> None:
+    """A cap of K admits exactly K executions out of N concurrent calls.
+
+    Guards the ordering in ``_record_run_execution``: the count is taken before
+    dispatch, and ``decide`` -> record has no ``await`` between them, so the
+    read-then-increment cannot interleave on an event loop. Counting after
+    ``invoke`` returned instead let all N calls read the same pre-increment
+    snapshot, and a cap of 5 admitted all 50.
+    """
+    import asyncio
+
+    executed = 0
+
+    class _CappingEnforcer:
+        """Denies once the run has already executed ``_CAP`` calls."""
+
+        agent_name = "a"
+
+        def decide(self, tool_name: str, arguments: Any) -> Any:
+            from hexgate.runtime.run_facts import get_run_facts
+            from hexgate.security.decision import Decision, Verdict
+
+            over = get_run_facts().as_namespace(tool_name)["tool_calls"] >= _CAP
+            return Decision.from_verdict(
+                Verdict(
+                    outcome=DecisionOutcome.DENY if over else DecisionOutcome.ALLOW,
+                    reason="cap",
+                ),
+                agent_name=self.agent_name,
+                tool_name=tool_name,
+            )
+
+        def record(self, decision: Any, **kwargs: Any) -> None:
+            pass
+
+    class _CountingInvoke:
+        async def aio(self, final: dict[str, Any]) -> Any:
+            nonlocal executed
+            await asyncio.sleep(0)  # yield, so the calls genuinely interleave
+            executed += 1
+            return "ok"
+
+    enforcer, invoke = _CappingEnforcer(), _CountingInvoke()
+    with run_scope("a"):
+        await asyncio.gather(
+            *(
+                run_guarded_async(
+                    _TOOL,
+                    {},
+                    enforcer=enforcer,
+                    pipeline=None,
+                    approval_handler=None,
+                    invoke=invoke.aio,
+                    render_error=langchain_error,
+                )
+                for _ in range(_CONCURRENCY)
+            )
+        )
+
+    assert executed == _CAP
+
+
+async def _drive_capped_fanout(
+    under_cap: DecisionOutcome, approval_handler: Any
+) -> int:
+    """Fan ``_CONCURRENCY`` calls at a ``_CAP`` cap; return how many executed."""
+    import asyncio
+
+    executed = 0
+
+    class _CappingEnforcer:
+        agent_name = "a"
+
+        def decide(self, tool_name: str, arguments: Any) -> Any:
+            from hexgate.runtime.run_facts import get_run_facts
+            from hexgate.security.decision import Decision, Verdict
+
+            over = get_run_facts().as_namespace(tool_name)["tool_calls"] >= _CAP
+            return Decision.from_verdict(
+                Verdict(
+                    outcome=DecisionOutcome.DENY if over else under_cap, reason="cap"
+                ),
+                agent_name=self.agent_name,
+                tool_name=tool_name,
+            )
+
+        def record(self, decision: Any, **kwargs: Any) -> None:
+            pass
+
+    async def invoke(final: dict[str, Any]) -> Any:
+        nonlocal executed
+        await asyncio.sleep(0)
+        executed += 1
+        return "ok"
+
+    enforcer = _CappingEnforcer()
+    with run_scope("a"):
+        await asyncio.gather(
+            *(
+                run_guarded_async(
+                    _TOOL,
+                    {},
+                    enforcer=enforcer,
+                    pipeline=None,
+                    approval_handler=approval_handler,
+                    invoke=invoke,
+                    render_error=langchain_error,
+                )
+                for _ in range(_CONCURRENCY)
+            )
+        )
+    return executed
+
+
+async def _approves_without_suspending(decision: Any) -> bool:
+    return True
+
+
+async def _approves_after_suspending(decision: Any) -> bool:
+    import asyncio
+
+    await asyncio.sleep(0)
+    return True
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [_APPROVE, lambda decision: True, _approves_without_suspending],
+    ids=["bool", "sync-callable", "async-no-suspend"],
+)
+@pytest.mark.asyncio
+async def test_an_approval_gate_keeps_the_cap_exact_when_nothing_suspends(
+    handler: Any,
+) -> None:
+    """None of these hands the event loop back, so the decide -> record window
+    stays closed and the cap holds as it does on the plain allow path."""
+    executed = await _drive_capped_fanout(DecisionOutcome.NEEDS_APPROVAL, handler)
+
+    assert executed == _CAP
+
+
+@pytest.mark.asyncio
+async def test_a_suspending_approval_handler_overshoots_the_cap() -> None:
+    """Pins a known, documented gap rather than a desired behaviour.
+
+    An approval handler that genuinely waits — the realistic kind — suspends
+    between ``decide``'s counter read and ``_record_run_execution``, so every
+    concurrent call decides against the same pre-approval count. Recording
+    before the await is not the fix: it would count executions for approvals
+    that are refused. Documented under "Parallel calls waiting on an approval"
+    in docs/policy/constraints.mdx; if this ever starts passing at ``_CAP``,
+    the gap was closed and both notes should go.
+    """
+    executed = await _drive_capped_fanout(
+        DecisionOutcome.NEEDS_APPROVAL, _approves_after_suspending
+    )
+
+    assert executed == _CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_do_not_share_facts() -> None:
+    """Catches a contextvar leak that would make one caller's budget bound
+    another's."""
+    import asyncio
+
+    seen: list[RunFacts] = []
+
+    async def one_run() -> None:
+        with run_scope("a") as facts:
+            enforcer = FakeEnforcer()
+            await _drive(_ASYNC, enforcer=enforcer)
+            await _drive(_ASYNC, enforcer=enforcer)
+            seen.append(facts)
+
+    await asyncio.gather(one_run(), one_run())
+
+    first, second = seen
+    assert first is not second
+    assert first.id != second.id
+    assert [first.tool_calls, second.tool_calls] == [2, 2]  # never 4

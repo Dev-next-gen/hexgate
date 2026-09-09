@@ -74,19 +74,19 @@ coverage-html: ## Coverage with a browsable HTML report under htmlcov/
 
 .PHONY: lint
 lint: ## Static check via ruff
-	$(UV) ruff check hexgate tests
+	$(UV) ruff check hexgate tests platform/scripts
 
 .PHONY: lint-fix
 lint-fix: ## Apply ruff autofixes
-	$(UV) ruff check --fix hexgate tests
+	$(UV) ruff check --fix hexgate tests platform/scripts
 
 .PHONY: fmt
-fmt: ## Format with ruff (SDK + platform/api)
-	$(UV) ruff format hexgate tests platform/api
+fmt: ## Format with ruff (SDK + platform/api + platform/scripts)
+	$(UV) ruff format hexgate tests platform/api platform/scripts
 
 .PHONY: fmt-check
 fmt-check: ## Check formatting without writing changes
-	$(UV) ruff format --check hexgate tests platform/api
+	$(UV) ruff format --check hexgate tests platform/api platform/scripts
 
 .PHONY: check
 check: lint fmt-check test ## Python CI parity: lint + fmt-check + test (no coverage overhead)
@@ -178,6 +178,14 @@ POSTGRES_DSN ?= postgresql+asyncpg://hexgate:hexgate-dev-password@localhost:5433
 postgres-up: ## Start local Postgres and wait until healthy
 	$(COMPOSE) up -d --wait postgres
 
+# The schema belongs to platform-api; anything else that reads the relational
+# store (collector, enricher, integration tests) creates it through here so a
+# fresh volume never surfaces as "no such table" on the first request.
+.PHONY: postgres-init
+postgres-init: postgres-up ## Create the platform-api tables on local Postgres (idempotent)
+	cd platform/api && DATABASE_URL=$(POSTGRES_DSN) uv run python -c \
+		"import asyncio; from hexgate_api.core.db import init_db; asyncio.run(init_db())"
+
 .PHONY: postgres-stop
 postgres-stop: ## Stop Postgres (keeps the data volume)
 	$(COMPOSE) stop postgres
@@ -253,12 +261,17 @@ collector-generate: ## Regenerate + compile the collector from builder-config.ya
 # The authenticator makes boot fatal without Postgres, the devtoken schema,
 # and the root public key, so this target now provides the first two and
 # checks for the third — the pre-auth collector booted on Redpanda alone.
-collector-run: postgres-up redpanda-topics ## Run the collector binary against config.yaml
-	cd platform/api && DATABASE_URL=$(POSTGRES_DSN) uv run python -c \
-		"import asyncio; from hexgate_api.core.db import init_db; asyncio.run(init_db())"
+collector-run: postgres-init redpanda-topics ## Run the collector binary against config.yaml
 	@test -f platform/api/data/hexgate.pub \
 		|| { echo "platform/api/data/hexgate.pub is missing — run 'make platform-api' once to generate the root keypair, or set HEXGATE_COLLECTOR_PUBLIC_KEY_FILE"; exit 1; }
 	cd platform/collector && ./hexgate-collector --config=config.yaml
+
+# Same Postgres as platform-api-pg: the resolver reads agent/agent_version
+# there, and pointing the job at the SQLite fallback instead would resolve
+# every agent_version_id to "" without an error.
+.PHONY: enricher-run
+enricher-run: postgres-init redpanda-topics clickhouse-up ## Run the span-enricher job (Redpanda → ClickHouse)
+	cd platform/api && DATABASE_URL=$(POSTGRES_DSN) uv run python -m hexgate_api.jobs.enricher
 
 .PHONY: collector-test
 collector-test: ## Unit tests for the collector's own Go modules
@@ -266,13 +279,11 @@ collector-test: ## Unit tests for the collector's own Go modules
 
 # Opt-in, like the Python side's `pytest -m integration`: these drive the real
 # binary against a real Postgres and Redpanda, so they are kept out of
-# collector-check. The schema belongs to platform-api, so it is created here
-# rather than by the Go tests.
+# collector-check. The schema belongs to platform-api, so postgres-init creates
+# it rather than the Go tests.
 .PHONY: collector-test-integration
-collector-test-integration: postgres-up redpanda-topics ## Collector integration tests (real Postgres + Redpanda)
+collector-test-integration: postgres-init redpanda-topics ## Collector integration tests (real Postgres + Redpanda)
 	cd platform/collector && go build -o hexgate-collector ./...
-	cd platform/api && DATABASE_URL=$(POSTGRES_DSN) uv run python -c \
-		"import asyncio; from hexgate_api.core.db import init_db; asyncio.run(init_db())"
 	cd $(COLLECTOR_EXT_INTEGRATION) && go test -tags integration -count=1 ./...
 
 .PHONY: collector-check
@@ -381,6 +392,30 @@ platform-down: _require-stage-env ## Stop a deploy stack, keeps volumes: make pl
 platform-logs: _require-stage-env ## Tail a deploy stack's logs: make platform-logs STAGE=prod
 	$(DEPLOY_COMPOSE) logs -f
 
+# Post-deploy check, run from anywhere with network access to the stage (a
+# laptop, not necessarily the box): sends one of every event type through the
+# SDK's OTLP sender and reads them back via the dashboard API. Covers the
+# pipeline from the sender onward (proxy → collector → redpanda → enricher →
+# clickhouse → read API); it runs no agent, so enforcer/adapter behaviour is
+# out of scope — that's `pytest -m integration` against a local stack. Needs
+# HEXGATE_API_KEY minted on that stage, plus HEXGATE_SMOKE_EMAIL/_PASSWORD (a
+# dashboard login there, project admin — the ban read is admin-gated) for the
+# read-back; without those it prints the ClickHouse queries to run on the box
+# instead. Stage → origin below; set HEXGATE_API_URL to target anything else (a
+# local stack, a new hostname). Unlike its siblings this target has no
+# _require-stage-env dep — it needs no env file, just network access — so it
+# guards the stage itself: an unknown STAGE would expand SMOKE_URL_ to empty,
+# and the SDK reads an empty HEXGATE_API_URL as unset and falls back to the
+# prod default, i.e. a typo would smoke-test production.
+SMOKE_URL_prod    = https://app.hexgate.ai
+SMOKE_URL_staging = https://app.staging.hexgate.ai
+.PHONY: platform-smoke
+platform-smoke: ## OTLP pipeline smoke test of a live stage, sender → ClickHouse (no agent): make platform-smoke STAGE=prod (needs HEXGATE_API_KEY)
+	@test -n "$${HEXGATE_API_URL:-$(SMOKE_URL_$(STAGE))}" || { \
+	  echo "unknown STAGE '$(STAGE)': add a SMOKE_URL_$(STAGE) line, or set HEXGATE_API_URL"; \
+	  exit 1; }
+	HEXGATE_API_URL=$${HEXGATE_API_URL:-$(SMOKE_URL_$(STAGE))} $(UV) python platform/scripts/otlp_smoke.py
+
 # -------- SDK → platform bridge --------
 
 # Make's rule parser treats colons specially, so a positional
@@ -405,26 +440,39 @@ serve: ## Run `hexgate serve` on the customer_bot demo (override with AGENT_SPEC
 # -------- Full platform demo (multi-terminal) --------
 
 .PHONY: demo-platform
-demo-platform: ## Print 3-terminal instructions for the full platform demo
+demo-platform: ## Print the multi-terminal recipe for running the full platform locally
 	@echo ""
-	@echo "Platform demo — open three terminals at the repo root:"
+	@echo "Platform — five terminals at the repo root (docs: internals/development.md):"
 	@echo ""
-	@echo "  Terminal 1 — FastAPI backend (control plane):"
-	@echo "      make platform-api"
+	@echo "  Terminal 1 — FastAPI backend on Postgres (NOT platform-api: the collector"
+	@echo "               checks key revocation in Postgres, SQLite-minted keys get 401):"
+	@echo "      make platform-api-pg"
 	@echo ""
-	@echo "  Terminal 2 — dashboard (Vite + React, http://localhost:5173):"
+	@echo "  Terminal 2 — OTLP collector on :4318 (starts Redpanda + topics):"
+	@echo "      make collector-run"
+	@echo ""
+	@echo "  Terminal 3 — span-enricher, Redpanda -> ClickHouse (starts ClickHouse):"
+	@echo "      make enricher-run"
+	@echo ""
+	@echo "  Terminal 4 — dashboard (Vite + React, http://localhost:5173):"
 	@echo "      make dashboard"
 	@echo ""
-	@echo "  Terminal 3 — your local agent bridged to the platform:"
+	@echo "  Terminal 5 — your local agent bridged to the platform:"
 	@echo "      1. Open  http://localhost:5173/tokens  and mint a dev token"
-	@echo "      2. Add to the repo-root .env:  HEXGATE_API_KEY=fty_live_..."
+	@echo "      2. Add to the repo-root .env:"
+	@echo "             HEXGATE_API_KEY=fty_live_..."
+	@echo "             HEXGATE_API_URL=http://localhost:8000"
+	@echo "             HEXGATE_OTLP_ENDPOINT=http://localhost:4318/v1/traces   # no proxy locally"
 	@echo "      3. make serve  (or: hexgate serve <your.module:agent>)"
 	@echo ""
-	@echo "Then chat with the live agent at  http://localhost:5173/playground"
+	@echo "Then chat at  http://localhost:5173/playground  — decisions appear on the"
+	@echo "audit page a few seconds later. Without terminals 2-3 the agent runs but"
+	@echo "its audit spans 404 against the API and are lost."
 	@echo ""
 	@echo "First-time setup (run once):"
 	@echo "      make platform-api-install"
 	@echo "      make dashboard-install"
+	@echo "      cd platform/collector && go build -o hexgate-collector ."
 	@echo ""
 
 # -------- Bundled notebook demo (one process locally / per-container on Modal) --------

@@ -24,6 +24,7 @@ from pydantic import ValidationError
 
 from hexgate_api.constants import ROLE_ADMIN, ROLE_MEMBER
 from hexgate_api.core import keystore as keystore_mod
+from hexgate_api.core.clickhouse import SchemaOutOfDate
 from hexgate_api.features.audit import service as audit
 from hexgate_api.features.audit.service import (
     list_ban_enforcements,
@@ -36,6 +37,7 @@ from hexgate_api.query_scope import (
     RETENTION_WINDOW,
     prepare_date_range,
 )
+from hexgate_api.core.clickhouse import BatchItem
 from hexgate_api.core.keystore import FileKeyStore
 from hexgate_api.core.db import get_session
 from hexgate_api.deps.clickhouse import require_clickhouse
@@ -203,7 +205,7 @@ def test_future_occurred_at_rejected(client: TestClient) -> None:
 
 
 def test_too_old_occurred_at_rejected(client: TestClient) -> None:
-    too_old = (_now() - timedelta(days=91)).isoformat()
+    too_old = (_now() - RETENTION_WINDOW - timedelta(days=1)).isoformat()
     r = client.post("/v1/audit/decisions", json=_event(occurred_at=too_old))
     assert r.status_code == 400
     assert "retention" in r.json()["detail"]
@@ -530,7 +532,7 @@ def test_verify_schema_names_the_missing_columns() -> None:
         for c in schema[audit.DECISION_TABLE]
         if c not in ("user_roles", "deciding_role")
     ]
-    with pytest.raises(audit.AuditSchemaOutOfDate) as exc:
+    with pytest.raises(SchemaOutOfDate) as exc:
         audit.verify_schema(_describing(columns_by_table=schema))
     assert exc.value.missing == {audit.DECISION_TABLE: ["deciding_role", "user_roles"]}
     assert "recreate the volume" in str(exc.value).lower()
@@ -539,7 +541,7 @@ def test_verify_schema_names_the_missing_columns() -> None:
 def test_verify_schema_covers_ban_enforcement_too() -> None:
     schema = _full_schema()
     schema[audit.BAN_ENFORCEMENT_TABLE].remove("ban_id")
-    with pytest.raises(audit.AuditSchemaOutOfDate) as exc:
+    with pytest.raises(SchemaOutOfDate) as exc:
         audit.verify_schema(_describing(columns_by_table=schema))
     assert exc.value.missing == {audit.BAN_ENFORCEMENT_TABLE: ["ban_id"]}
 
@@ -558,7 +560,7 @@ def test_verify_schema_reports_an_absent_table_as_a_schema_gap() -> None:
     escaping the lifespan and crash-looping the whole control plane."""
     client = MagicMock()
     client.query.side_effect = _server_error(60, "Table hexgate_audit.x does not exist")
-    with pytest.raises(audit.AuditSchemaOutOfDate) as exc:
+    with pytest.raises(SchemaOutOfDate) as exc:
         audit.verify_schema(client)
     assert exc.value.missing[audit.DECISION_TABLE] == sorted(audit._DECISION_COLUMNS)
 
@@ -1356,6 +1358,139 @@ def test_ban_enforcement_read_clamps_limit_to_200(
 
 
 # ---------------------------------------------------------------------------
+# Batch inserts (OTel migration design doc PR 4) — the span-enricher job's
+# write path. Nothing in the API calls these yet; the contract is exercised
+# directly with a MagicMock client capturing the insert call.
+# ---------------------------------------------------------------------------
+
+
+def test_insert_decisions_batch_happy_path() -> None:
+    """N per-item-resolved events become ONE insert call carrying N rows."""
+    from hexgate_api.features.audit.service import (
+        _DECISION_COLUMNS,
+        insert_decisions_batch,
+    )
+
+    clickhouse_client = MagicMock()
+    items = [
+        BatchItem(
+            DecisionEvent(**_event()),
+            project_id=f"proj_{i}",
+            agent_version_id=f"ver_{i}",
+        )
+        for i in range(3)
+    ]
+
+    insert_decisions_batch(clickhouse_client, items)
+
+    clickhouse_client.insert.assert_called_once()
+    args, kwargs = clickhouse_client.insert.call_args
+    assert args[0] == "policy_decision"
+    rows = args[1]
+    assert len(rows) == 3
+    assert kwargs["column_names"] == _DECISION_COLUMNS
+    # No async_insert on the batch path — it coalesces small inserts, and this
+    # insert is already a batch; pinned to 0 so a server-default flip can't
+    # silently make the insert ack-before-durable.
+    assert kwargs["settings"] == {"async_insert": 0}
+    # project_id / agent_version_id are per item, not hoisted batch-wide: a
+    # consumer batch aggregates across Kafka records and can span projects.
+    project_index = _DECISION_COLUMNS.index("project_id")
+    version_index = _DECISION_COLUMNS.index("agent_version_id")
+    assert [row[project_index] for row in rows] == ["proj_0", "proj_1", "proj_2"]
+    assert [row[version_index] for row in rows] == ["ver_0", "ver_1", "ver_2"]
+
+
+def test_when_the_batch_is_empty_then_clickhouse_is_not_called() -> None:
+    from hexgate_api.features.audit.service import (
+        insert_ban_enforcements_batch,
+        insert_decisions_batch,
+    )
+
+    clickhouse_client = MagicMock()
+
+    insert_decisions_batch(clickhouse_client, [])
+    insert_ban_enforcements_batch(clickhouse_client, [])
+
+    clickhouse_client.insert.assert_not_called()
+
+
+def test_when_an_event_has_a_legacy_role_then_batch_and_single_rows_match() -> None:
+    """The role→user_roles shim lives in the shared row builder, so the two
+    paths must produce identical rows for the same event — this is the guard
+    against the batch path drifting from the single-row serialization rules."""
+    from hexgate_api.features.audit.service import (
+        _DECISION_COLUMNS,
+        insert_decision,
+        insert_decisions_batch,
+    )
+
+    event = DecisionEvent(
+        **_event(role="billing", arguments={"path": "/tmp/x"}, attributes={})
+    )
+    single, batch = MagicMock(), MagicMock()
+
+    insert_decision(single, event=event, project_id="p", agent_version_id="v")
+    insert_decisions_batch(
+        batch, [BatchItem(event, project_id="p", agent_version_id="v")]
+    )
+
+    single_row = single.insert.call_args.args[1][0]
+    batch_row = batch.insert.call_args.args[1][0]
+    assert batch_row == single_row
+    assert batch_row[_DECISION_COLUMNS.index("user_roles")] == ["billing"]
+    assert batch_row[_DECISION_COLUMNS.index("attributes")] == ""  # falsy → ""
+
+
+def test_when_a_batch_row_exceeds_the_caps_then_it_is_inserted_as_given() -> None:
+    """Deliberate contract, not an omission: the batch path's caller (the
+    span-enricher job) is the authoritative truncation/redaction point, so the
+    batch functions trust their input where ``insert_decision`` re-checks. A
+    change in this behavior is a change to that contract."""
+    from hexgate_api.features.audit.service import (
+        MAX_ARGS_BYTES,
+        insert_decisions_batch,
+    )
+
+    oversized = DecisionEvent(**_event(arguments={"blob": "x" * (MAX_ARGS_BYTES + 1)}))
+    clickhouse_client = MagicMock()
+
+    insert_decisions_batch(
+        clickhouse_client, [BatchItem(oversized, project_id="p", agent_version_id="v")]
+    )
+
+    clickhouse_client.insert.assert_called_once()
+
+
+def test_insert_ban_enforcements_batch_happy_path() -> None:
+    from hexgate_api.features.audit.service import (
+        _BAN_ENFORCEMENT_COLUMNS,
+        insert_ban_enforcements_batch,
+    )
+    from hexgate_api.schemas import BanEnforcementEvent
+
+    clickhouse_client = MagicMock()
+    items = [
+        BatchItem(
+            BanEnforcementEvent(**_ban_enforcement()),
+            project_id=f"proj_{i}",
+            agent_version_id=f"ver_{i}",
+        )
+        for i in range(2)
+    ]
+
+    insert_ban_enforcements_batch(clickhouse_client, items)
+
+    clickhouse_client.insert.assert_called_once()
+    args, kwargs = clickhouse_client.insert.call_args
+    assert args[0] == "ban_enforcement"
+    assert len(args[1]) == 2
+    assert kwargs["column_names"] == _BAN_ENFORCEMENT_COLUMNS
+    project_index = _BAN_ENFORCEMENT_COLUMNS.index("project_id")
+    assert [row[project_index] for row in args[1]] == ["proj_0", "proj_1"]
+
+
+# ---------------------------------------------------------------------------
 # Health (liveness) vs readiness split
 # ---------------------------------------------------------------------------
 
@@ -1536,7 +1671,7 @@ def test_real_clickhouse_multi_role_read_path() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _prepare_date_range() — UTC normalization + 90-day retention clamping
+# _prepare_date_range() — UTC normalization + retention-window clamping
 # ---------------------------------------------------------------------------
 
 
@@ -1554,16 +1689,16 @@ def test_when_naive_datetimes_provided_then_utc_is_attached() -> None:
     assert end.tzinfo == timezone.utc
 
 
-def test_when_window_is_within_90d_then_start_date_is_unchanged() -> None:
+def test_when_window_is_within_retention_then_start_date_is_unchanged() -> None:
     start, end = prepare_date_range(_START, _END)  # 7-day window
     assert start == _START
     assert end == _END
 
 
-def test_when_window_exceeds_90d_then_start_date_is_clamped_to_end_minus_retention() -> (
+def test_when_window_exceeds_retention_then_start_date_is_clamped_to_end_minus_retention() -> (
     None
 ):
-    far_start = datetime(2024, 9, 1, tzinfo=timezone.utc)  # >90d before _END
+    far_start = _END - RETENTION_WINDOW - timedelta(days=30)  # past retention
     start, _ = prepare_date_range(far_start, _END)
     assert start == _END - RETENTION_WINDOW
 
@@ -1575,7 +1710,7 @@ def test_when_only_start_date_provided_then_no_clamping_occurs() -> None:
 
 
 def test_when_start_date_is_after_end_date_then_no_clamping_occurs() -> None:
-    # start > end: max(start, end - 90d) always returns start unchanged.
+    # start > end: max(start, end - retention) always returns start unchanged.
     # _date_range_valid handles the invalid pair downstream.
     start, end = prepare_date_range(_END, _START)
     assert start == _END
@@ -1883,3 +2018,96 @@ def test_audit_anomalies_clickhouse_error_returns_503(
     r = client.get("/v1/projects/proj_test/audit/anomalies")
     assert r.status_code == 503
     assert "unavailable" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Batch inserts — integration (real ClickHouse, opt-in via marker)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_real_clickhouse_batch_insert_lands_all_rows() -> None:
+    """One multi-row, multi-project insert through the real write path."""
+    from hexgate_api.core.clickhouse import get_clickhouse as real_get_clickhouse
+    from hexgate_api.features.audit.service import insert_decisions_batch
+
+    clickhouse_client = real_get_clickhouse()
+    project_a = f"test_proj_{uuid.uuid4().hex[:8]}"
+    project_b = f"test_proj_{uuid.uuid4().hex[:8]}"
+    items = [
+        BatchItem(
+            DecisionEvent(**_event(reason="batch-a1")),
+            project_id=project_a,
+            agent_version_id="ver_a",
+        ),
+        BatchItem(
+            DecisionEvent(**_event(reason="batch-a2")),
+            project_id=project_a,
+            agent_version_id="ver_a",
+        ),
+        BatchItem(
+            DecisionEvent(**_event(reason="batch-b1")),
+            project_id=project_b,
+            agent_version_id="ver_b",
+        ),
+    ]
+
+    insert_decisions_batch(clickhouse_client, items)
+
+    try:
+        rows = clickhouse_client.query(
+            "SELECT project_id, reason, agent_version_id FROM policy_decision "
+            "WHERE project_id IN ({a:String}, {b:String})",
+            parameters={"a": project_a, "b": project_b},
+        ).result_rows
+        assert sorted(rows) == sorted(
+            [
+                (project_a, "batch-a1", "ver_a"),
+                (project_a, "batch-a2", "ver_a"),
+                (project_b, "batch-b1", "ver_b"),
+            ]
+        )
+    finally:
+        for pid in (project_a, project_b):
+            clickhouse_client.command(
+                "ALTER TABLE policy_decision DELETE WHERE project_id = {pid:String}",
+                parameters={"pid": pid},
+            )
+
+
+@pytest.mark.integration
+def test_when_a_batch_is_reinserted_then_rows_collapse_to_one_per_event() -> None:
+    """The whole-batch-retry safety claim the enricher job will rely on:
+    re-inserting an already-landed batch deduplicates instead of
+    double-counting. ``SELECT ... FINAL`` applies ReplacingMergeTree's merge
+    semantics at read time, so this doesn't wait on a background merge."""
+    from hexgate_api.core.clickhouse import get_clickhouse as real_get_clickhouse
+    from hexgate_api.features.audit.service import insert_decisions_batch
+
+    clickhouse_client = real_get_clickhouse()
+    project_id = f"test_proj_{uuid.uuid4().hex[:8]}"
+    items = [
+        BatchItem(
+            DecisionEvent(**_event()), project_id=project_id, agent_version_id="ver_x"
+        )
+        for _ in range(3)
+    ]
+
+    insert_decisions_batch(clickhouse_client, items)
+    insert_decisions_batch(clickhouse_client, items)  # the retry
+
+    try:
+        counts = clickhouse_client.query(
+            "SELECT event_id, count() FROM policy_decision FINAL "
+            "WHERE project_id = {pid:String} GROUP BY event_id",
+            parameters={"pid": project_id},
+        ).result_rows
+        assert len(counts) == len(items), "every event must survive the retry"
+        assert all(int(n) == 1 for _, n in counts), (
+            "a retried batch must collapse to one row per event_id"
+        )
+    finally:
+        clickhouse_client.command(
+            "ALTER TABLE policy_decision DELETE WHERE project_id = {pid:String}",
+            parameters={"pid": project_id},
+        )

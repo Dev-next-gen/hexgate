@@ -292,18 +292,37 @@ class PolicyBundle:
         tool: str,
         args: Mapping[str, Any],
         attributes: Mapping[str, Any] | None = None,
+        run: Mapping[str, Any] | None = None,
     ) -> Verdict:
         """:class:`~hexgate.security.decision.PolicyEngine` entry point.
 
         Runs the compiled WASM module; ``None`` role falls back to the
         ``default`` role, matching the pydantic engine. ``attributes`` become
-        the ``input.ctx`` document the compiled ``ctx.*`` conditions read."""
+        the ``input.ctx`` document the compiled ``ctx.*`` conditions read, and
+        ``run`` the ``input.run`` document the ``run.*`` ones read."""
         from hexgate.security.policy import evaluate_tool_call_wasm
         from hexgate.security.policy_set import DEFAULT_ROLE_NAME
 
         return evaluate_tool_call_wasm(
-            self, role or DEFAULT_ROLE_NAME, tool, dict(args), attributes=attributes
+            self,
+            role or DEFAULT_ROLE_NAME,
+            tool,
+            dict(args),
+            attributes=attributes,
+            run=run,
         )
+
+    def declares_admission(self) -> bool:
+        """Read the admission-configured flag from the signed manifest.
+
+        The compiled WASM is opaque, so the derived signal is recorded at build
+        time (:func:`build_signed_bundle`) under ``agent_gating``. Absent (an older
+        bundle) reads False — safe, those predate agent-level policy (R-AGENT-002)."""
+        return bool(self.manifest.get("agent_gating", {}).get("admission", False))
+
+    def declares_reach(self) -> bool:
+        """Read the reach-configured flag from the signed manifest (reach counterpart)."""
+        return bool(self.manifest.get("agent_gating", {}).get("reach", False))
 
     # ---- Metadata ------------------------------------------------------
 
@@ -370,12 +389,22 @@ def build_signed_bundle(
     """
     # Lazy import keeps bundle.py importable (and the platform booting) even
     # when the opa-backed compiler isn't needed — only producers hit this.
+    from hexgate.security.policy_set import load_policy_set_from_dict
     from hexgate.security.rego import compile_to_rego
     from hexgate.security.rego_wasm import compile_to_wasm
 
     payload = yaml.safe_load(policy_yaml) or {}
     source_hash = hashlib.sha256(policy_yaml.encode("utf-8")).hexdigest()
     rego_text = compile_to_rego(payload, source_hash=source_hash)
+
+    # Record the agent-gate engagement flags derived from the resolved policy: the
+    # compiled WASM is opaque, so the bundle-backed gate reads these from the
+    # (signed) manifest to decide whether to fire (R-AGENT-002).
+    resolved = load_policy_set_from_dict(payload)
+    agent_gating = {
+        "admission": resolved.declares_admission(),
+        "reach": resolved.declares_reach(),
+    }
 
     wasm_bytes: bytes | None = None
     wasm_hash: str | None = None
@@ -389,6 +418,7 @@ def build_signed_bundle(
         "source_hash": source_hash,
         "rego_hash": hashlib.sha256(rego_text.encode("utf-8")).hexdigest(),
         "wasm_hash": wasm_hash,
+        "agent_gating": agent_gating,
     }
     # The one canonical serialization. Sign these exact bytes.
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(

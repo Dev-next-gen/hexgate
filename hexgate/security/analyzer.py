@@ -22,7 +22,7 @@ always-false, subsumption.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -37,12 +37,14 @@ from hexgate.security.linker import (
     resolve_role_map,
 )
 from hexgate.security.modules import (
+    DEFAULT_AGENT,
     GRANT_MODES,
     LayerKind,
     LinkError,
     LinkResult,
     ModuleContent,
     ProjectLinkResult,
+    RoleMatrix,
 )
 from hexgate.security.policy_set import DEFAULT_ROLE_NAME, PolicySet, PolicySetError
 
@@ -117,72 +119,87 @@ def analyze(
 def check_project(
     boundaries: list[ModuleContent],
     library: list[ModuleContent],
-    roles: Mapping[str, Sequence[str]] | None,
+    roles: RoleMatrix | None,
     *,
-    agent_leaf: Sequence[ModuleContent] = (),
-    agent_boundaries: Sequence[ModuleContent] = (),
     manifest: AgentManifest | None = None,
 ) -> list[PolicyLint]:
     """Resolve a project and lint every role. See :func:`check` for the single-role
     form. A hard failure folds into one ``error`` lint, same contract as ``check``.
+
+    Soft lints (dead-grant, drift, ...) run over the generic (``"*"``) agent
+    view — the baseline every agent shares; per-agent soft-lint refinement is a
+    follow-up. Hard **link errors** are surfaced for every named agent column too,
+    so a named-agent cell importing an unknown capability is visible on ``check``
+    (not just rejected at write time / silently fail-closed at serve time).
     """
     try:
-        result = resolve_for_project(
-            boundaries,
-            library,
-            roles,
-            agent_leaf=agent_leaf,
-            agent_boundaries=agent_boundaries,
-        )
+        result = resolve_for_project(boundaries, library, roles)
     except (LinkError, PolicySetError, ConstraintParseError) as exc:
         return [PolicyLint("link-error", "error", str(exc))]
-    return analyze_project(
-        result,
-        boundaries,
-        library,
-        roles,
-        agent_leaf=agent_leaf,
-        agent_boundaries=agent_boundaries,
-        manifest=manifest,
-    )
+    lints = analyze_project(result, boundaries, library, roles, manifest=manifest)
+    lints += _named_agent_link_errors(boundaries, library, roles)
+    return lints
+
+
+def _named_agent_link_errors(
+    boundaries: list[ModuleContent],
+    library: list[ModuleContent],
+    roles: RoleMatrix | None,
+) -> list[PolicyLint]:
+    """A ``link-error`` lint per named-agent column that doesn't resolve.
+
+    ``check_project`` resolves the ``"*"`` column for its soft lints; this covers
+    the hard-error case for named columns (an unknown-capability import in
+    ``roles: {member: {billing_bot: [nope]}}``), which ``"*"`` never touches."""
+    if not isinstance(roles, Mapping):
+        return []
+    named = {
+        agent
+        for cells in roles.values()
+        if isinstance(cells, Mapping)
+        for agent in cells
+    } - {DEFAULT_AGENT}
+    lints: list[PolicyLint] = []
+    for agent in sorted(named):
+        try:
+            resolve_for_project(boundaries, library, roles, agent=agent)
+        except (LinkError, PolicySetError, ConstraintParseError) as exc:
+            lints.append(PolicyLint("link-error", "error", f"agent {agent!r}: {exc}"))
+    return lints
 
 
 def analyze_project(
     result: ProjectLinkResult,
     boundaries: list[ModuleContent],
     library: list[ModuleContent],
-    roles: Mapping[str, Sequence[str]] | None,
+    roles: RoleMatrix | None,
     *,
-    agent_leaf: Sequence[ModuleContent] = (),
-    agent_boundaries: Sequence[ModuleContent] = (),
     manifest: AgentManifest | None = None,
 ) -> list[PolicyLint]:
     """Soft lints across every role, each tagged with the role it fired in.
 
     A grant dead under one role's ceiling can be alive under another, so the
-    per-capability lints run once per role over that role's imported set. Two
-    project-level lints span roles: ``unused-capability`` (a library pack no role
-    imports) and ``no-default-role`` (roles defined but no ``default``, so unroled
-    callers get fail-closed deny).
+    per-capability lints run once per role over that role's imported set (for the
+    generic ``"*"`` agent view). Two project-level lints span roles:
+    ``unused-capability`` (a library pack no role/agent imports) and
+    ``no-default-role`` (roles defined but no ``default``, so unroled callers get
+    fail-closed deny).
     """
     # Same expansion the resolver used, so the analyzer lints exactly the roles
     # that compiled. Raises LinkError on an unknown capability, matching
     # resolve_for_project — but check_project resolves first, so by the time we
     # get here the same input has already succeeded.
     resolved = resolve_role_map(roles, library)
-    fences = [*boundaries, *agent_boundaries]
 
     lints: list[PolicyLint] = []
     for role, caps in resolved.items():
         role_result = result.by_role.get(role)
         if role_result is None:
             continue
-        for lint in analyze(
-            role_result, fences, [*caps, *agent_leaf], manifest=manifest
-        ):
+        for lint in analyze(role_result, boundaries, caps, manifest=manifest):
             lints.append(replace(lint, role=role))
 
-    lints += _unused_capabilities(library, resolved)
+    lints += _unused_capabilities(library, _all_imported_names(roles, library))
     if roles and DEFAULT_ROLE_NAME not in roles:
         lints.append(
             PolicyLint(
@@ -199,11 +216,31 @@ def analyze_project(
     return sorted(lints, key=lambda lint: SEVERITY_RANK[lint.severity])
 
 
+def _all_imported_names(
+    roles: RoleMatrix | None, library: list[ModuleContent]
+) -> set[str]:
+    """Capability names imported by ANY ``(role, agent)`` cell.
+
+    Spans the whole matrix (every agent column, not just ``"*"``) so a capability
+    used only by a named agent isn't falsely flagged unused. ``roles is None`` is
+    the all-compose case: every library capability counts as imported.
+    """
+    if roles is None:
+        return {cap.name for cap in library}
+    names: set[str] = set()
+    for cells in roles.values():
+        if isinstance(cells, Mapping):  # the (role, agent) matrix
+            for binding in cells.values():
+                names.update(binding.capabilities)
+        else:  # legacy flat `role: [names]`
+            names.update(cells)
+    return names
+
+
 def _unused_capabilities(
-    library: list[ModuleContent], resolved: Mapping[str, Sequence[ModuleContent]]
+    library: list[ModuleContent], imported: set[str]
 ) -> list[PolicyLint]:
-    """A library capability that no role imports. An authoring dead-weight signal."""
-    imported = {cap.name for caps in resolved.values() for cap in caps}
+    """A library capability that no role/agent imports. Authoring dead-weight."""
     return [
         PolicyLint(
             code="unused-capability",
@@ -232,7 +269,11 @@ def _dead_grants(
     effective = result.effective[DEFAULT_ROLE_NAME]
     out: list[PolicyLint] = []
     for cap in capabilities:
-        for tool, tp in cap.policy.tools.items():
+        # effective_tools: composed agent-level grants (admission/reach lowered to
+        # agent.* keys) are linted like ordinary tools. A shadowed agent key stays
+        # in the resolved policy as an explicit deny (not GRANT_MODES), so it is
+        # correctly reported dead here.
+        for tool, tp in cap.policy.effective_tools.items():
             if tp.mode not in GRANT_MODES:
                 continue
             eff = effective.tools.get(tool)
@@ -267,7 +308,7 @@ def _redundant_grants(capabilities: list[ModuleContent]) -> list[PolicyLint]:
     out: list[PolicyLint] = []
     seen: dict[tuple[str, str, tuple[str, ...]], ModuleContent] = {}
     for cap in capabilities:
-        for tool, tp in cap.policy.tools.items():
+        for tool, tp in cap.policy.effective_tools.items():
             if tp.mode not in GRANT_MODES:
                 continue
             key = (tool, tp.mode, tuple(sorted(tp.constraints)))
@@ -301,7 +342,7 @@ def _constraint_erased(capabilities: list[ModuleContent]) -> list[PolicyLint]:
     """
     grants: dict[str, list[tuple[ModuleContent, Any]]] = {}
     for cap in capabilities:
-        for tool, tp in cap.policy.tools.items():
+        for tool, tp in cap.policy.effective_tools.items():
             if tp.mode in GRANT_MODES:
                 grants.setdefault(tool, []).append((cap, tp))
 

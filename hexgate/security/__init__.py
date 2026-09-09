@@ -19,6 +19,12 @@ from hexgate.security.bans import (
     get_ban_source,
     resolve_ban_gate,
 )
+from hexgate.security.agent_gate import (
+    AgentGate,
+    AgentNotAdmittedError,
+    resolve_agent_gate,
+    warn_if_admission_unenforced,
+)
 from hexgate.security.models import (
     AGENT_RUN_TOOL,
     AgentPolicy,
@@ -80,6 +86,7 @@ from hexgate.security.policy import (
 )
 from hexgate.security.policy_set import (
     DEFAULT_ROLE_NAME,
+    RESOLVED_POLICY_MARKER,
     PolicySet,
     PolicySetError,
     load_policy_map,
@@ -87,15 +94,23 @@ from hexgate.security.policy_set import (
     load_policy_set_from_dict,
 )
 from hexgate.security.modules import (
+    DEFAULT_AGENT,
+    AgentBinding,
     LayerKind,
     LinkError,
     LinkResult,
     ModuleContent,
     ProjectLinkResult,
     Provenance,
+    RoleMatrix,
     RuleTrace,
 )
-from hexgate.security.linker import link, link_policy_set, resolve_for_project
+from hexgate.security.linker import (
+    effective_policy_by_role,
+    link,
+    link_policy_set,
+    resolve_for_project,
+)
 from hexgate.security.analyzer import (
     PolicyLint,
     analyze,
@@ -134,15 +149,22 @@ from hexgate.security.testing import (
     assert_allows,
     assert_denies,
     assert_needs_approval,
+    run_namespace,
 )
 
 __all__ = [
     "AGENT_RUN_TOOL",
     "AgentBannedError",
+    "AgentGate",
+    "AgentNotAdmittedError",
     "AgentPolicy",
     "AgentTargetPolicy",
     "AgentVia",
     "agent_target_key",
+    "DEFAULT_AGENT",
+    "AgentBinding",
+    "RoleMatrix",
+    "resolve_agent_gate",
     "LayerKind",
     "LinkError",
     "LinkResult",
@@ -158,6 +180,7 @@ __all__ = [
     "check_project",
     "link",
     "link_policy_set",
+    "effective_policy_by_role",
     "load_local_modules",
     "load_roles",
     "resolve_for_project",
@@ -179,6 +202,7 @@ __all__ = [
     "assert_allows",
     "assert_denies",
     "assert_needs_approval",
+    "run_namespace",
     "BaseToolPolicy",
     "PolicyBinding",
     "PolicyBindingError",
@@ -189,6 +213,7 @@ __all__ = [
     "DEFAULT_ENTRYPOINT",
     "DEFAULT_ENTRYPOINTS",
     "DEFAULT_ROLE_NAME",
+    "RESOLVED_POLICY_MARKER",
     "Decision",
     "FileScope",
     "FileToolPolicy",
@@ -243,4 +268,5 @@ __all__ = [
     "load_policy_set",
     "load_policy_set_from_dict",
     "parse_constraint",
+    "warn_if_admission_unenforced",
 ]

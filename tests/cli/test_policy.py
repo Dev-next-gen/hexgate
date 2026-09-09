@@ -25,6 +25,7 @@ from hexgate.security.analyzer import PolicyLint
 from hexgate.cli.policy.main import (
     _main_build,
     _main_keygen,
+    _main_resolve,
     _main_show_rego,
     _main_test,
     _main_validate,
@@ -75,6 +76,58 @@ def policy_file(tmp_path: Path) -> Path:
 def _ns(**kwargs) -> argparse.Namespace:
     """Convenience for building an argparse.Namespace with sane defaults."""
     return argparse.Namespace(**kwargs)
+
+
+def test_resolve_file_uses_the_compose_grammar(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `policy resolve --file` resolves a single-file compose policy.yaml through
+    # the compose front-end and prints the effective policy (refund capped by the
+    # boundary ceiling; a tool the ceiling omits is shadowed away).
+    p = tmp_path / "policy.yaml"
+    p.write_text(
+        'boundary:\n  tools: { refund: { constraint: "args.amount <= 100" } }\n'
+        "tools: { refund: { mode: allow }, ghost: { mode: allow } }\n",
+        encoding="utf-8",
+    )
+    rc = _main_resolve(_ns(dir=".", file=str(p), agent="*", role=None, output=None))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "refund" in out
+    assert "args.amount <= 100" in out  # boundary ceiling folded in
+    assert "ghost" not in out  # not in the ceiling → shadowed away
+
+
+def test_resolve_file_generic_agent_hints_at_named_agents(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Resolving the generic "*" for a policy that names agents should nudge the
+    # user toward --agent, since roles live under a named agent.
+    p = tmp_path / "policy.yaml"
+    p.write_text(
+        "agents:\n  bot:\n    roles:\n      support: { tools: { a: { mode: allow } } }\n",
+        encoding="utf-8",
+    )
+    rc = _main_resolve(_ns(dir=".", file=str(p), agent="*", role=None, output=None))
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "--agent" in err and "bot" in err
+
+
+def test_resolve_file_unknown_agent_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A typo'd --agent resolves to the generic baseline (matching the SDK), but the
+    # CLI warns loudly so the user notices the agent isn't defined.
+    p = tmp_path / "policy.yaml"
+    p.write_text(
+        "agents:\n  bot:\n    roles:\n      support: { tools: { a: { mode: allow } } }\n",
+        encoding="utf-8",
+    )
+    rc = _main_resolve(_ns(dir=".", file=str(p), agent="bott", role=None, output=None))
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "bott" in err and "not defined" in err
 
 
 # ---------------------------------------------------------------------------
@@ -1143,3 +1196,172 @@ def test_validate_clean_role_policy_has_no_warning(
 
     assert rc == 0
     assert "permissive-default" not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# `policy test --run-facts` — dry-running a circuit breaker at its threshold
+# ---------------------------------------------------------------------------
+
+
+_RUN_GATED_POLICY = """\
+version: 1
+tools:
+  search:
+    mode: allow
+    constraints:
+      - run.elapsed_seconds < 300
+"""
+
+
+def _run_gated(tmp_path: Path) -> str:
+    p = tmp_path / "run.yaml"
+    p.write_text(_RUN_GATED_POLICY, encoding="utf-8")
+    return str(p)
+
+
+def test_test_defaults_to_a_started_run_rather_than_a_missing_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No --run-facts must not deny closed like a missing namespace would."""
+    rc = _main_test(
+        _ns(
+            source=_run_gated(tmp_path),
+            role="default",
+            tool="search",
+            args="{}",
+            engine="pydantic",
+        )
+    )
+    assert rc == 0
+    assert "ALLOW" in capsys.readouterr().out
+
+
+def test_test_run_facts_fires_the_cap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = _main_test(
+        _ns(
+            source=_run_gated(tmp_path),
+            role="default",
+            tool="search",
+            args="{}",
+            run_facts='{"elapsed_seconds": 400}',
+            engine="pydantic",
+        )
+    )
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "DENY" in out
+    assert "run.elapsed_seconds < 300" in out
+
+
+@needs_opa
+def test_test_run_facts_agrees_across_engines(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _run_gated(tmp_path)
+    codes = [
+        _main_test(
+            _ns(
+                source=source,
+                role="default",
+                tool="search",
+                args="{}",
+                run_facts='{"elapsed_seconds": 400}',
+                engine=engine,
+            )
+        )
+        for engine in ("pydantic", "wasm")
+    ]
+    assert codes == [1, 1]
+
+
+def test_test_rejects_non_json_run_facts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = _main_test(
+        _ns(
+            source=_run_gated(tmp_path),
+            role="default",
+            tool="search",
+            args="{}",
+            run_facts="not json",
+            engine="pydantic",
+        )
+    )
+    assert rc == 1
+    assert "--run-facts is not valid JSON" in capsys.readouterr().err
+
+
+def test_test_rejects_non_object_run_facts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = _main_test(
+        _ns(
+            source=_run_gated(tmp_path),
+            role="default",
+            tool="search",
+            args="{}",
+            run_facts="[1, 2]",
+            engine="pydantic",
+        )
+    )
+    assert rc == 1
+    assert "--run-facts must be a JSON object (dict)" in capsys.readouterr().err
+
+
+def test_test_rejects_unknown_run_fact_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = _main_test(
+        _ns(
+            source=_run_gated(tmp_path),
+            role="default",
+            tool="search",
+            args="{}",
+            run_facts='{"elapsed_secondz": 400}',
+            engine="pydantic",
+        )
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "unknown run.* path(s) ['elapsed_secondz']" in err
+    assert "elapsed_seconds" in err  # the registry, so the fix is visible
+
+
+@pytest.mark.parametrize("raw", ['{"elapsed_seconds": "400"}', '{"tool_calls": true}'])
+def test_test_rejects_a_wrong_typed_run_fact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], raw: str
+) -> None:
+    """A wrong-typed value used to fail the comparison closed and print the same
+    '✗ DENY … constraint failed' line as a real threshold trip."""
+    rc = _main_test(
+        _ns(
+            source=_run_gated(tmp_path),
+            role="default",
+            tool="search",
+            args="{}",
+            run_facts=raw,
+            engine="pydantic",
+        )
+    )
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert "--run-facts has a wrong-typed value" in err
+    assert "DENY" not in out
+
+
+def test_test_reports_an_unknown_run_path_in_the_policy_itself(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The load-time linter reaches the CLI, not just direct PolicySet use."""
+    p = tmp_path / "typo.yaml"
+    p.write_text(
+        _RUN_GATED_POLICY.replace("run.elapsed_seconds", "run.elapsed_secondz"),
+        encoding="utf-8",
+    )
+    rc = _main_test(
+        _ns(source=str(p), role="default", tool="search", args="{}", engine="pydantic")
+    )
+    assert rc == 1
+    assert "unknown run.* path 'elapsed_secondz'" in capsys.readouterr().err

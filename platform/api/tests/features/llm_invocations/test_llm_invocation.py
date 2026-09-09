@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from hexgate_api.core import keystore as keystore_mod
+from hexgate_api.core.clickhouse import SchemaOutOfDate
 from hexgate_api.core.db import get_session
 from hexgate_api.core.keystore import FileKeyStore
 from hexgate_api.deps.clickhouse import require_clickhouse
@@ -19,7 +20,9 @@ from hexgate_api.deps.org import require_org_member
 from hexgate_api.deps.tokens import require_project
 from hexgate_api.features.llm_invocations import service as llm_invocations
 from hexgate_api.features.llm_invocations.service import summarize_llm_invocations
+from hexgate_api.core.clickhouse import BatchItem
 from hexgate_api.main import app
+from hexgate_api.query_scope import RETENTION_WINDOW
 from hexgate_api.schemas import LlmInvocationEvent
 
 # ---------------------------------------------------------------------------
@@ -48,6 +51,70 @@ def _llm_event(**overrides) -> dict:
 # ---------------------------------------------------------------------------
 # Pydantic schema validation
 # ---------------------------------------------------------------------------
+
+
+def test_insert_llm_invocations_batch_happy_path() -> None:
+    """N per-item-resolved events become ONE insert call carrying N rows;
+    project_id/agent_version_id stay per item (a consumer batch can span
+    projects). See the audit tests for the shared batch-insert contract."""
+    from hexgate_api.features.llm_invocations.service import (
+        _LLM_INVOCATION_COLUMNS,
+        insert_llm_invocations_batch,
+    )
+
+    clickhouse_client = MagicMock()
+    items = [
+        BatchItem(
+            LlmInvocationEvent(**_llm_event()),
+            project_id=f"proj_{i}",
+            agent_version_id=f"ver_{i}",
+        )
+        for i in range(3)
+    ]
+
+    insert_llm_invocations_batch(clickhouse_client, items)
+
+    clickhouse_client.insert.assert_called_once()
+    args, kwargs = clickhouse_client.insert.call_args
+    assert args[0] == "llm_invocation"
+    rows = args[1]
+    assert len(rows) == 3
+    assert kwargs["column_names"] == _LLM_INVOCATION_COLUMNS
+    # No async_insert on the batch path (pinned to 0) — see the audit batch tests.
+    assert kwargs["settings"] == {"async_insert": 0}
+    project_index = _LLM_INVOCATION_COLUMNS.index("project_id")
+    assert [row[project_index] for row in rows] == ["proj_0", "proj_1", "proj_2"]
+
+
+def test_when_the_batch_is_empty_then_clickhouse_is_not_called() -> None:
+    from hexgate_api.features.llm_invocations.service import (
+        insert_llm_invocations_batch,
+    )
+
+    clickhouse_client = MagicMock()
+
+    insert_llm_invocations_batch(clickhouse_client, [])
+
+    clickhouse_client.insert.assert_not_called()
+
+
+def test_when_an_event_is_batched_then_its_row_matches_the_single_insert() -> None:
+    """Single-row and batch paths share the row builder; identical input must
+    produce identical rows so the two cannot drift."""
+    from hexgate_api.features.llm_invocations.service import (
+        insert_llm_invocation,
+        insert_llm_invocations_batch,
+    )
+
+    event = LlmInvocationEvent(**_llm_event())
+    single, batch = MagicMock(), MagicMock()
+
+    insert_llm_invocation(single, event=event, project_id="p", agent_version_id="v")
+    insert_llm_invocations_batch(
+        batch, [BatchItem(event, project_id="p", agent_version_id="v")]
+    )
+
+    assert batch.insert.call_args.args[1][0] == single.insert.call_args.args[1][0]
 
 
 def test_when_payload_is_minimal_then_defaults_are_applied() -> None:
@@ -177,7 +244,7 @@ def test_when_occurred_at_is_in_the_future_then_400_is_returned(
 
 
 def test_when_occurred_at_is_too_old_then_400_is_returned(client: TestClient) -> None:
-    too_old = (_now() - timedelta(days=91)).isoformat()
+    too_old = (_now() - RETENTION_WINDOW - timedelta(days=1)).isoformat()
     r = client.post("/v1/audit/llm-invocations", json=_llm_event(occurred_at=too_old))
     assert r.status_code == 400
     assert "retention" in r.json()["detail"]
@@ -619,3 +686,34 @@ def test_summarize_llm_invocations_happy_path() -> None:
             "ALTER TABLE llm_invocation DELETE WHERE project_id = {pid:String}",
             parameters={"pid": project_id},
         )
+
+
+# ---------------------------------------------------------------------------
+# verify_schema() — this feature's slice of the startup guard
+# ---------------------------------------------------------------------------
+
+
+def _describing(columns: list[str]) -> MagicMock:
+    """A client whose DESCRIBE returns the given columns for llm_invocation."""
+    client = MagicMock()
+    result = MagicMock()
+    result.column_names = ["name", "type"]
+    result.result_rows = [[c, "String"] for c in columns]
+    client.query.return_value = result
+    return client
+
+
+def test_verify_schema_passes_on_a_current_schema() -> None:
+    columns = list(llm_invocations._LLM_INVOCATION_COLUMNS)
+    llm_invocations.verify_schema(_describing(columns))  # no raise
+
+
+def test_when_a_written_column_is_missing_then_verify_schema_raises() -> None:
+    """The gap this closes: llm_invocation was never in the startup check, so a
+    stale volume surfaced as runtime insert failures instead of a boot error."""
+    columns = [
+        c for c in llm_invocations._LLM_INVOCATION_COLUMNS if c != "input_tokens"
+    ]
+    with pytest.raises(SchemaOutOfDate) as exc:
+        llm_invocations.verify_schema(_describing(columns))
+    assert exc.value.missing == {"llm_invocation": ["input_tokens"]}
