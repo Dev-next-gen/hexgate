@@ -29,8 +29,8 @@ install: ## Install runtime deps via uv (creates .venv if needed)
 	uv sync
 
 .PHONY: install-dev
-install-dev: ## Install with dev extras (pytest, ruff)
-	uv sync --extra dev
+install-dev: ## Install with dev extras (pytest, ruff) and evals (inspect-ai), as CI does
+	uv sync --extra dev --extra evals
 
 # -------- Dev loop --------
 
@@ -108,6 +108,13 @@ platform-api-check: ## Lint + test (with coverage) on the platform API
 .PHONY: policy-build
 policy-build: ## Compile examples/example_agent/policy.yaml to a bundle under /tmp/m2-bundle
 	$(UV) hexgate policy build examples/example_agent/policy.yaml --out /tmp/m2-bundle
+
+.PHONY: policy-eval-check
+policy-eval-check: ## Run the policy-writing eval on our own answers (reference, wrong_answers, noop) for `inspect view --log-dir evals/policy_writing/logs`; asserts nothing, the pass/fail assertions live in tests/evals/test_task.py
+	for agent in reference wrong_answers noop; do \
+	  $(UV) python -m inspect_ai eval evals/policy_writing/task.py --model none -T agent=$$agent \
+	    --log-dir evals/policy_writing/logs || exit 1; \
+	done
 
 .PHONY: policy-test-wasm
 policy-test-wasm: ## Smoke a wasm-engine decision on the example policy
