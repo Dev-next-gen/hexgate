@@ -9,7 +9,9 @@ answers (`solution/` or `wrong_answer/`) into a workspace in place of an agent.
 
 from __future__ import annotations
 
+import datetime
 import fnmatch
+import json
 import shutil
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -24,8 +26,21 @@ from pydantic import (
     model_validator,
 )
 
+from evals.policy_writing.calls import (
+    Known,
+    bad_values,
+    complete,
+    load_known,
+    unknown_names,
+)
 from evals.policy_writing.checks import is_module_tree, snapshot
-from evals.policy_writing.policy import CaseError, dump_json
+from evals.policy_writing.policy import (
+    CaseError,
+    complete_call,
+    dump_json,
+    manifest_can_call,
+)
+from evals.policy_writing.sources import SourceError
 
 HERE = Path(__file__).resolve().parent
 
@@ -172,6 +187,100 @@ def _project(root: Path, case_dir: Path, named: str | None) -> Path:
     return shared / named
 
 
+def _calls(expect: dict) -> list[dict]:
+    """Every dry-run call a case lists: its decisions and its superset probes."""
+    probes = [p for s in expect.get("superset", []) for p in s["probes"]]
+    return expect.get("decisions", []) + probes
+
+
+def _timestamps(value) -> list[str]:
+    """The unquoted YAML timestamps (not plain dates) anywhere in `value`."""
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _timestamps(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _timestamps(v)]
+    return [str(value)] if isinstance(value, datetime.datetime) else []
+
+
+def _complete_calls(path: Path, agent: str | None, calls: list[dict]) -> None:
+    """Complete each call as its gate sends it, refusing one no policy could
+    dry-run: egress calls by `calls.complete`, agent and skill gates by the
+    scorer's own `policy.complete_call`."""
+    for call in calls:
+        tool = call["tool"]
+        # As `policy test` reads them, so an unquoted YAML date is its string.
+        # A timestamp's string ("2026-01-01 08:00:00+00:00") isn't how a caller
+        # spells one, and compares wrongly with an ISO one, so it must be quoted.
+        for key in ("args", "attributes", "run_facts"):
+            if key in call:
+                if stamps := _timestamps(call[key]):
+                    raise CaseError(f"{path}: {tool}: quote the timestamps {stamps}")
+                call[key] = json.loads(dump_json(call[key]))
+        if bad := complete(call):
+            raise CaseError(f"{path}: {tool}: not what an agent sends: {bad}")
+        try:
+            complete_call(call, agent)
+        except CaseError as exc:
+            raise CaseError(f"{path}: {tool}: {exc}") from exc
+
+
+def _load_known(path: Path, case: dict) -> list[Known]:
+    try:
+        return load_known(case["project"], case["agent"])
+    except SourceError as exc:
+        raise CaseError(f"{path}: {exc}") from exc
+
+
+def _check_calls(
+    path: Path, agent: str | None, known: list[Known], calls: list[dict]
+) -> None:
+    """Each of `calls` uses only what the case's agent knows; with no agent (a
+    role-wide case), it is well formed for each agent the scorer may count.
+
+    A malformed call is denied, so it passes a check that accepts deny, and a
+    superset probe, whatever that agent's policy: then every agent that can
+    make the call must find it well formed. Otherwise (an expected allow or
+    approval) one agent that can make it is enough, as the scorer needs one."""
+    for call in calls:
+        found = [(k.agent, _problems(call, k)) for k in known]
+        able = [(a, p) for (a, p), k in zip(found, known) if _can_make(call, k)]
+        if _deny_counts(call):
+            if able and not any(p for _, p in able):
+                continue
+        elif not all(p for _, p in found):
+            continue
+        # An agent that can make the call says what is wrong with it; when none
+        # can, the call is unknown to every agent (or to the case's own).
+        who, (kind, bad) = next(
+            ((a, p) for a, p in able if p), (agent or "every agent", found[0][1])
+        )
+        if kind == "unknown":
+            raise CaseError(f"{path}: {call['tool']}: unknown to {who}: {bad}")
+        raise CaseError(f"{path}: {call['tool']}: not {who}'s schema: {bad}")
+
+
+def _can_make(call: dict, known: Known) -> bool:
+    return manifest_can_call(
+        known.manifest, known.agent, call["tool"], known.registered
+    )
+
+
+def _deny_counts(call: dict) -> bool:
+    """Whether a denied dry-run of `call` can pass its check: a probe (no
+    `expect`), or an expectation that accepts deny."""
+    expect = call.get("expect", "deny")
+    return "deny" in (expect if isinstance(expect, list) else [expect])
+
+
+def _problems(call: dict, known: Known) -> tuple[str, list[str]] | None:
+    """What is wrong with `call` for one agent, by kind, or None."""
+    if unknown := unknown_names(call, known):
+        return "unknown", unknown
+    if bad := bad_values(call, known):
+        return "schema", bad
+    return None
+
+
 def _check_entries(case_dir: Path) -> None:
     # A misnamed folder (`wrong_answers/`) would never be scored.
     stray = sorted(
@@ -212,8 +321,10 @@ def _protect(path: Path, expect: dict, files: dict[str, str]) -> None:
         expect["unchanged"] = unchanged
 
 
-def _load_preserved(project: Path, files: dict[str, str]) -> list[dict]:
-    """The project's `preserve.yaml` calls."""
+def _load_preserved(
+    project: Path, files: dict[str, str], agent: str | None
+) -> list[dict]:
+    """The project's `preserve.yaml` calls, completed like the case's own."""
     # A `preserve.yml` or `Preserve.yaml` would be skipped (or, on a
     # case-insensitive disk, read) and also handed to the agent as a project file.
     misnamed = sorted(
@@ -228,7 +339,9 @@ def _load_preserved(project: Path, files: dict[str, str]) -> list[dict]:
         decisions = _DECISIONS.validate_python(_read_yaml(preserve) or [])
     except ValidationError as exc:
         raise CaseError(f"{preserve}: {exc}") from exc
-    return _DECISIONS.dump_python(decisions, exclude_unset=True)
+    preserved = _DECISIONS.dump_python(decisions, exclude_unset=True)
+    _complete_calls(preserve, agent, preserved)
+    return preserved
 
 
 def _load_case(root: Path, case_dir: Path) -> dict:
@@ -250,7 +363,13 @@ def _load_case(root: Path, case_dir: Path) -> dict:
         # One policy.yaml is one agent's; the scorer would fail every name check.
         raise CaseError(f"{path}: a case without `agent` needs a module tree")
     _protect(path, expect, files)
-    preserved = _load_preserved(case["project"], files)
+    # Before the merge, so a preserved call and the case's own entry for it
+    # compare equal however much of the gate's arguments each spells out.
+    _complete_calls(path, case["agent"], _calls(expect))
+    known = _load_known(path, case)
+    _check_calls(path, case["agent"], known, _calls(expect))
+    preserved = _load_preserved(case["project"], files, case["agent"])
+    _check_calls(case["project"] / PRESERVE, case["agent"], known, preserved)
     if preserved:
         expect["decisions"] = _merge_preserved(expect.get("decisions", []), preserved)
     return case

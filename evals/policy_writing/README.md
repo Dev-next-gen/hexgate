@@ -7,7 +7,10 @@ product.
 - `cases/<category>/<name>/` holds one case each. The case's id is
   `<category>/<name>`, and the category is its scoring group.
 - `starting_projects/<name>/` holds the projects several cases start from.
-- `cases.py` loads the cases. `checks.py` scores what an agent left behind.
+- `cases.py` loads the cases, `calls.py` checks their dry-run calls against
+  the agent's names and completes egress calls, and `policy.py` completes the
+  agent and skill gate calls as the scorer sends them. `checks.py` scores what
+  an agent left behind.
 
 ## A case
 
@@ -32,12 +35,54 @@ cases/<category>/<name>/
 | `expect` | mapping | What the finished policy must do. The keys are below. |
 
 There is no `id` or `category` field: both come from the path. The loader
-rejects a malformed case, which would otherwise drop a check without a word:
+rejects anything that would otherwise drop a check without a word:
 
 - **The case file:** `id` or `category` set in it; a field, `expect` key or
-  decision key it doesn't know; a string where a list belongs.
+  decision key it doesn't know; a string where a list belongs; an `agent` with
+  no manifest in `agents.json`.
 - **Paths:** an `unchanged` path the starting project lacks; anything else in
   the case folder (a `wrong_answers/`); a `preserve.yml`.
+- **Names in a dry-run call** (`calls.py`, `unknown_names`): a tool, argument,
+  caller attribute, reached agent or skill the case's agent doesn't know (see
+  *A starting project*). A case without `agent` needs one agent that can
+  make the call as written, as the scorer needs one; when its check accepts
+  `deny` (or it is a `superset` probe), every agent that can make it must,
+  since a malformed call is denied whatever that agent's policy.
+- **Values in a dry-run call** (`calls.py`, `bad_values`):
+  - for one of the agent's tools, a missing required argument, or a value of
+    another type than its schema's: a quoted `"51"`, or a blank `amount:` on
+    a required argument, which YAML reads as null. A `string` in the manifest
+    checks nothing, since adapters write it for `int | None` too, so an
+    unquoted `order_id: 51` or YAML's `NO` (false) passes there;
+  - for a skill, a `content_hash` without the `sha256:` prefix (the adapters hash
+    the skill's body); no `file_path` on a `skill.resource:` or
+    `skill.script:` call, or on a LangChain agent's `skill:` call; or a
+    `file_path` spelled otherwise than the adapter sends it (LangChain's is
+    absolute, `/skills/pdf/forms.md`; a Google script's is under `scripts/`;
+    a Google `skill:` load sends none, which isn't checked);
+  - a caller attribute of another JSON type than its audit rows carry.
+
+  A call's values are read through JSON first, as `policy test` reads them,
+  so an unquoted YAML date is its string. A timestamp must be quoted: YAML's
+  own string for one isn't ISO, and would compare wrongly.
+- **Calls no policy could dry-run** (`policy.py`, `complete_call`, the
+  scorer's own input checks): run facts on `agent.run` or `net.*`, which are
+  decided outside any run; `run_facts.agent`, which is the case's agent;
+  `calls_of_this_tool` on a gate key, which is never counted; an unknown
+  `run.*` path or a value of the wrong type; an attribute of a type no caller
+  sends; an arg an agent or skill gate sets itself, given another value, or
+  any `args.agent` in a case without `agent`, where each agent sends its own.
+- **Egress calls** (`calls.py`, `complete`), which must match what the proxy
+  derives: `net.http_request` takes an upper-case `method` and an absolute
+  `http://` `url`, or `host` and `port` for `CONNECT`, the only way HTTPS
+  reaches the proxy; `net.tcp_connect` takes `host` and an int `port`. An
+  arg the proxy never sends is refused.
+
+The loader writes each call as its gate sends it, so a case can write just
+`{tool: "agent.tool:billing-bot"}`, `{tool: "skill:pdf", args: {file_path:
+/skills/pdf/SKILL.md, content_hash: "sha256:…"}}` (a script's own args are
+null when left out) or `{tool: net.http_request, args: {method: GET, url:
+"http://x.com/a"}}`.
 
 `expect` keys:
 
@@ -72,12 +117,14 @@ would return to a real agent:
 - `agents.json` (required): every agent in the project with its manifest, as
   `agents_list` (`GET /agents/manifest`) returns it. A case's agent knows only
   the tools, arguments and skills in its own manifest, plus the synthetic
-  `net.*`, `agent.run`, `agent.<via>:<target>` (a target must be an agent in
-  this list, or a sub-agent a manifest lists) and `skill:` /
-  `skill.resource:` / `skill.script:` calls.
+  `net.*`, `agent.run`, `agent.<via>:<target>` (a sub-agent its manifest
+  lists with that `via`; with none listed, a LangChain agent may reach any
+  other agent in this list as a tool, since LangGraph hides those edges) and
+  `skill:` / `skill.resource:` / `skill.script:` calls.
 - `audit.json` (optional): audit rows, as `audit_decisions` returns them. Caller
   attributes are set per request, not in the manifest, so the `ctx.*` names a
-  case's agent knows are the `attributes` keys of its own rows.
+  case's agent knows are the `attributes` keys of its own rows (any agent's,
+  for a case without `agent`).
 
 The scorer lints a module tree (`policies/` with a `roles.yaml`) against
 `agents.json` in every answer, including one that changes nothing, so a
