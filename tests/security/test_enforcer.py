@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from hexgate.runtime.roles import MAX_EVALUATED_ROLES
 from hexgate.security import (
     AgentPolicy,
     DecisionOutcome,
@@ -20,7 +21,6 @@ from hexgate.security import (
     evaluate_tool_call,
 )
 from hexgate.security.decision import Decision
-from hexgate.runtime.roles import MAX_EVALUATED_ROLES
 from hexgate.security.enforcer import PolicyEnforcer
 from hexgate.security.policy_set import PolicySet
 
@@ -43,6 +43,7 @@ class _RecordingEngine:
         args: Mapping[str, Any],
         attributes: Mapping[str, Any] | None = None,
         run: Mapping[str, Any] | None = None,
+        agent_usage: Mapping[str, Any] | None = None,
     ) -> Verdict:
         self.calls.append(
             {

@@ -10,7 +10,8 @@ must produce by them):
 
 - One event = one span. The instrumentation scope name selects the event
   type: ``SCOPE_AUDIT`` → DecisionEvent, ``SCOPE_USAGE`` → LlmInvocationEvent,
-  ``SCOPE_BANS`` → BanEnforcementEvent (platform schemas).
+  ``SCOPE_BANS`` → BanEnforcementEvent, ``SCOPE_MESSAGES`` → LlmMessageEvent,
+  ``SCOPE_RUNS`` → AgentRunEvent (platform schemas).
 - ``occurred_at`` travels as the span's ``start_time_unix_nano`` — the one
   field OTLP already types as a timestamp. No separate attribute: a duplicate
   would invite the two values disagreeing with no rule for which wins. These
@@ -33,6 +34,29 @@ must produce by them):
 - LLM usage reuses the official ``gen_ai.*`` names where they exist (model,
   token counts) and never invents new ``gen_ai.*`` names; everything
   Hexgate-specific lives under ``sec_ai.*``.
+- LLM message content (``SCOPE_MESSAGES``) is the official GenAI trio —
+  ``gen_ai.input.messages`` / ``gen_ai.output.messages`` /
+  ``gen_ai.system_instructions`` — each a JSON-string attribute (same rule as
+  the dict fields above: the platform caps are measured in serialized-JSON
+  bytes, and the SDK applies the same caps before export). One event per LLM
+  call carrying only the input messages *new to that call* plus its
+  completion, never a snapshot of the whole conversation. ``MESSAGE_SEQ``
+  counts events within one ``TURN_KEY`` (one framework message list — a
+  sub-agent or handoff has its own) so a reader can detect a missing row;
+  ``RESYNCED`` marks an event that restates the whole list because the
+  framework rewrote it rather than extending it. ``TRUNCATED`` is set by
+  the SDK when a cap cut any content field. ``RUN_ID`` rides along exactly as
+  on usage spans — present inside a run scope, absent outside it — so a
+  transcript joins to the decisions and token usage of the same run.
+- Run starts (``SCOPE_RUNS``) are one span per admitted run, emitted on
+  ``run_scope`` entry. The span carries the envelope plus ``RUN_ID``, and
+  ``RUN_ID`` is **required** on this scope, unlike every other: the span
+  only exists inside a run, so one without a run id is malformed.
+- ``USAGE_STATE`` is optional on ``SCOPE_AUDIT``: one of ``fresh``, ``stale``,
+  ``partial``, ``unavailable`` or ``local``, saying how the ``agent_usage.*``
+  values the decision read were built. Absent when the policy references no
+  ``agent_usage.*`` path or the decision was not built by
+  ``PolicyEnforcer.decide``. The enricher does not read it yet.
 """
 
 from __future__ import annotations
@@ -41,8 +65,10 @@ from __future__ import annotations
 SCOPE_AUDIT = "hexgate.audit"
 SCOPE_USAGE = "hexgate.usage"
 SCOPE_BANS = "hexgate.bans"
+SCOPE_MESSAGES = "hexgate.messages"
+SCOPE_RUNS = "hexgate.runs"
 
-# --- Envelope attributes (all three scopes) -----------------------------------
+# --- Envelope attributes (all five scopes) ------------------------------------
 EVENT_ID = "sec_ai.event_id"
 AGENT_NAME = "sec_ai.agent_name"
 SESSION_ID = "sec_ai.session_id"
@@ -59,6 +85,19 @@ VIOLATIONS = "sec_ai.violations"
 HINT = "sec_ai.hint"
 ARGUMENTS = "sec_ai.arguments"
 ATTRIBUTES = "sec_ai.attributes"
+USAGE_STATE = "sec_ai.usage_state"
+
+# --- Run attribution (SCOPE_AUDIT; RUN_ID also on SCOPE_USAGE, SCOPE_MESSAGES,
+# and required on SCOPE_RUNS) ---------------------------------------------------
+# Omitted entirely when the emitter has no run to attribute: OTLP attributes
+# cannot carry null, and the platform's run_id is ``UUID | None`` — an empty
+# string is a 422. An absent attribute decodes to None; "" would not.
+RUN_ID = "sec_ai.run_id"
+RUN_TOOL_CALLS = "sec_ai.run_tool_calls"
+RUN_LLM_CALLS = "sec_ai.run_llm_calls"
+RUN_DENIALS = "sec_ai.run_denials"
+RUN_TOTAL_TOKENS = "sec_ai.run_total_tokens"
+RUN_ELAPSED_MS = "sec_ai.run_elapsed_ms"
 
 # --- LLM usage spans (SCOPE_USAGE) ----------------------------------------------
 # Official OTel GenAI semconv names — never coin new gen_ai.* names ourselves.
@@ -73,3 +112,14 @@ ERROR_CODE = "sec_ai.error_code"
 # --- Ban enforcement spans (SCOPE_BANS) ------------------------------------------
 BAN_TYPE = "sec_ai.ban_type"
 BAN_ID = "sec_ai.ban_id"
+
+# --- LLM message spans (SCOPE_MESSAGES) -------------------------------------------
+# Official OTel GenAI semconv names for prompt/completion content — verbatim.
+GEN_AI_INPUT_MESSAGES = "gen_ai.input.messages"
+GEN_AI_OUTPUT_MESSAGES = "gen_ai.output.messages"
+GEN_AI_SYSTEM_INSTRUCTIONS = "gen_ai.system_instructions"
+# Hexgate-specific message fields (see the wire contract above).
+MESSAGE_SEQ = "sec_ai.message_seq"
+TURN_KEY = "sec_ai.turn_key"
+RESYNCED = "sec_ai.resynced"
+TRUNCATED = "sec_ai.truncated"

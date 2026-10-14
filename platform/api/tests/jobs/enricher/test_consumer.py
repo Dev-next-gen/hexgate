@@ -20,6 +20,8 @@ from tests.jobs.enricher.conftest import (
     decision_attrs,
     make_request_bytes,
     make_span,
+    message_attrs,
+    run_attrs,
     usage_attrs,
 )
 
@@ -29,7 +31,7 @@ def _record(groups, key: bytes | None = b"proj_1", offset: int = 0) -> FakeRecor
 
 
 async def test_process_poll_happy_path_inserts_then_commits(make_job) -> None:
-    """All three event types in one poll → three batch inserts, no DLQ,
+    """All five event types in one poll → five batch inserts, no DLQ,
     one commit, strictly after the inserts."""
     job, clickhouse, consumer, producer, calls = make_job()
     records = [
@@ -38,20 +40,100 @@ async def test_process_poll_happy_path_inserts_then_commits(make_job) -> None:
                 (semconv.SCOPE_AUDIT, [make_span(decision_attrs())]),
                 (semconv.SCOPE_USAGE, [make_span(usage_attrs())]),
                 (semconv.SCOPE_BANS, [make_span(ban_attrs())]),
+                (semconv.SCOPE_MESSAGES, [make_span(message_attrs())]),
+                (semconv.SCOPE_RUNS, [make_span(run_attrs())]),
             ]
         )
     ]
 
     await job._process_poll(records)
 
-    assert calls == ["insert", "insert", "insert", "commit"]
+    assert calls == ["insert"] * 5 + ["commit"]
     tables = [c.args[0] for c in clickhouse.insert.call_args_list]
-    assert tables == ["policy_decision", "llm_invocation", "ban_enforcement"]
+    assert tables == [
+        "policy_decision",
+        "llm_invocation",
+        "ban_enforcement",
+        "llm_message",
+        "agent_run",
+    ]
     assert producer.sent == []
     # project_id from the record key, agent_version_id from the resolver.
     decision_rows = clickhouse.insert.call_args_list[0].args[1]
     assert decision_rows[0][2] == "proj_1"
     assert decision_rows[0][4] == "ver_researcher"
+    # The message bucket resolves the same ids the same way.
+    message_rows = clickhouse.insert.call_args_list[3].args[1]
+    assert message_rows[0][2] == "proj_1"
+    assert message_rows[0][4] == "ver_researcher"
+    run_rows = clickhouse.insert.call_args_list[4].args[1]
+    assert run_rows[0][2] == "proj_1"
+    assert run_rows[0][4] == "ver_researcher"
+
+
+async def test_when_a_poll_holds_only_message_spans_then_one_insert_and_a_commit(
+    make_job,
+) -> None:
+    """The empty decision/usage/ban batches never touch the client, so a
+    message-only poll is exactly one insert into llm_message."""
+    job, clickhouse, consumer, producer, calls = make_job()
+    records = [
+        _record(
+            [
+                (
+                    semconv.SCOPE_MESSAGES,
+                    [
+                        make_span(message_attrs(**{semconv.MESSAGE_SEQ: 0})),
+                        make_span(message_attrs(**{semconv.MESSAGE_SEQ: 1})),
+                    ],
+                )
+            ]
+        )
+    ]
+
+    await job._process_poll(records)
+
+    assert calls == ["insert", "commit"]
+    args = clickhouse.insert.call_args
+    assert args.args[0] == "llm_message"
+    assert len(args.args[1]) == 2
+    assert consumer.commits == 1
+
+
+async def test_when_the_message_insert_fails_then_only_the_unacked_inserts_are_retried(
+    make_job,
+) -> None:
+    """A ClickHouse failure on the fourth insert re-runs only that one: the
+    three acked tables are not re-inserted, since usage_minute's views would
+    sum a repeated decision twice. The offset commits once."""
+    job, clickhouse, consumer, producer, calls = make_job(
+        # The first three inserts succeed; the fourth (llm_message) fails once.
+        insert_side_effect=[None, None, None, OperationalError("clickhouse blip")]
+    )
+    records = [
+        _record(
+            [
+                (semconv.SCOPE_AUDIT, [make_span(decision_attrs())]),
+                (semconv.SCOPE_USAGE, [make_span(usage_attrs())]),
+                (semconv.SCOPE_BANS, [make_span(ban_attrs())]),
+                (semconv.SCOPE_MESSAGES, [make_span(message_attrs())]),
+            ]
+        )
+    ]
+
+    await job._process_poll(records)
+
+    # The empty agent_run batch makes no call.
+    assert calls == ["insert"] * 4 + ["insert"] + ["commit"]
+    tables = [call.args[0] for call in clickhouse.insert.call_args_list]
+    assert tables == [
+        "policy_decision",
+        "llm_invocation",
+        "ban_enforcement",
+        "llm_message",
+        "llm_message",
+    ]
+    assert consumer.commits == 1
 
 
 async def test_when_the_same_event_id_arrives_twice_in_one_poll_then_inserted_once(
@@ -75,6 +157,25 @@ async def test_when_the_same_event_id_arrives_twice_in_one_poll_then_inserted_on
     assert consumer.commits == 1
 
 
+async def test_when_a_run_span_arrives_twice_in_one_poll_then_inserted_once(
+    make_job,
+) -> None:
+    """The per-poll dedup is generic, so the new bucket inherits it."""
+    job, clickhouse, consumer, producer, calls = make_job()
+    attrs = run_attrs()
+    records = [
+        _record([(semconv.SCOPE_RUNS, [make_span(attrs)])], offset=0),
+        _record([(semconv.SCOPE_RUNS, [make_span(attrs)])], offset=1),
+    ]
+
+    await job._process_poll(records)
+
+    assert calls == ["insert", "commit"]
+    args = clickhouse.insert.call_args
+    assert args.args[0] == "agent_run"
+    assert len(args.args[1]) == 1
+
+
 async def test_when_two_projects_share_an_event_id_then_both_are_inserted(
     make_job,
 ) -> None:
@@ -93,7 +194,77 @@ async def test_when_two_projects_share_an_event_id_then_both_are_inserted(
     assert sorted(row[2] for row in decision_rows) == ["proj_1", "proj_2"]
 
 
-async def test_when_an_insert_fails_then_whole_batch_retried_and_committed_once(
+async def test_when_a_span_is_redelivered_in_a_later_poll_then_inserted_once(
+    make_job,
+) -> None:
+    """F1's main source: a produce retry lands the copy in a later poll, where
+    the per-poll set can't see it. The cross-poll cache must."""
+    job, clickhouse, consumer, producer, calls = make_job()
+    attrs = decision_attrs()
+
+    await job._process_poll([_record([(semconv.SCOPE_AUDIT, [make_span(attrs)])])])
+    await job._process_poll(
+        [_record([(semconv.SCOPE_AUDIT, [make_span(attrs)])], offset=1)]
+    )
+
+    assert calls == ["insert", "commit", "commit"]
+    assert producer.sent == []
+
+
+async def test_when_two_projects_share_an_event_id_across_polls_then_both_are_inserted(
+    make_job,
+) -> None:
+    job, clickhouse, consumer, producer, calls = make_job()
+    attrs = decision_attrs()
+
+    await job._process_poll(
+        [_record([(semconv.SCOPE_AUDIT, [make_span(attrs)])], key=b"proj_1")]
+    )
+    await job._process_poll(
+        [_record([(semconv.SCOPE_AUDIT, [make_span(attrs)])], key=b"proj_2")]
+    )
+
+    assert calls == ["insert", "commit", "insert", "commit"]
+
+
+async def test_when_a_poll_stops_before_its_insert_acks_then_its_ids_are_not_remembered(
+    monkeypatch, make_job
+) -> None:
+    """Remembering before the ack would make the replayed poll skip rows that
+    were never stored."""
+    import hexgate_api.jobs.enricher.consumer as consumer_mod
+
+    job, clickhouse, consumer, producer, calls = make_job(
+        insert_side_effect=[OperationalError("down"), OperationalError("still down")]
+    )
+    records = [_record([(semconv.SCOPE_AUDIT, [make_span(decision_attrs())])])]
+
+    async def _stop_instead_of_sleeping(_delay):
+        job.request_stop()
+
+    monkeypatch.setattr(consumer_mod.asyncio, "sleep", _stop_instead_of_sleeping)
+    await job._process_poll(records)
+    assert consumer.commits == 0
+
+    job._stop.clear()
+    await job._process_poll(records)
+
+    assert calls == ["insert", "insert", "insert", "commit"]
+
+
+def test_every_mapped_event_type_has_exactly_one_sink() -> None:
+    """A scope mapped to an Event but missing here would be committed and lost."""
+    from typing import get_args
+
+    from hexgate_api.jobs.enricher.consumer import _SINKS
+    from hexgate_api.jobs.enricher.mapping import Event
+
+    sink_types = [event_type for event_type, _insert in _SINKS]
+    assert len(sink_types) == len(set(sink_types))
+    assert set(sink_types) == set(get_args(Event))
+
+
+async def test_when_an_insert_fails_then_it_is_retried_and_committed_once(
     make_job,
 ) -> None:
     job, clickhouse, consumer, producer, calls = make_job(
@@ -308,6 +479,12 @@ def _lifecycle_job(monkeypatch, make_job, *, records, topics):
         "hexgate_api.jobs.enricher.consumer.verify_llm_schema", lambda c: None
     )
     monkeypatch.setattr(
+        "hexgate_api.jobs.enricher.consumer.verify_messages_schema", lambda c: None
+    )
+    monkeypatch.setattr(
+        "hexgate_api.jobs.enricher.consumer.verify_agent_runs_schema", lambda c: None
+    )
+    monkeypatch.setattr(
         "hexgate_api.jobs.enricher.consumer.engine", SimpleNamespace(dispose=_noop)
     )
     return job, clickhouse, consumer, calls
@@ -330,6 +507,53 @@ async def test_run_happy_path_processes_a_poll_then_stops_cleanly(
     assert calls == ["insert", "commit"]
 
 
+async def test_when_run_builds_the_kafka_clients_then_both_are_sized_for_the_topic_limit(
+    monkeypatch, make_job
+) -> None:
+    """aiokafka defaults the consumer's per-partition fetch and the producer's
+    request size to 1 MiB each, under the topics' 8 MiB max.message.bytes. A
+    record the broker accepted but the consumer cannot fetch stalls that
+    partition permanently, so these kwargs are load-bearing, not tuning — and
+    the fakes the other lifecycle tests inject would hide their absence.
+
+    This pins the kwargs to the constant, not the constant to the broker: the
+    8 MiB itself lives in platform/redpanda/init/create-topics.sh, and no test
+    reads that script, so the two staying equal is a comment-level invariant."""
+    from hexgate_api.jobs.enricher.consumer import _MAX_RECORD_BYTES
+
+    job, _clickhouse, consumer, calls = _lifecycle_job(
+        monkeypatch,
+        make_job,
+        records=[],
+        topics={"hexgate.otlp.raw", "hexgate.otlp.dlq"},
+    )
+    producer = job._producer
+    # Drop the injected clients so run() builds real ones through the patched
+    # constructors below, which record the kwargs and hand back the fakes.
+    job._consumer = job._producer = None
+    seen: dict[str, dict] = {}
+
+    def _fake_consumer(*_args, **kwargs):
+        seen["consumer"] = kwargs
+        return consumer
+
+    def _fake_producer(*_args, **kwargs):
+        seen["producer"] = kwargs
+        return producer
+
+    monkeypatch.setattr(
+        "hexgate_api.jobs.enricher.consumer.AIOKafkaConsumer", _fake_consumer
+    )
+    monkeypatch.setattr(
+        "hexgate_api.jobs.enricher.consumer.AIOKafkaProducer", _fake_producer
+    )
+
+    await job.run()
+
+    assert seen["consumer"]["max_partition_fetch_bytes"] == _MAX_RECORD_BYTES
+    assert seen["producer"]["max_request_size"] == _MAX_RECORD_BYTES
+
+
 async def test_when_a_topic_is_missing_then_run_fails_fast(
     monkeypatch, make_job
 ) -> None:
@@ -350,7 +574,7 @@ async def test_when_a_topic_is_missing_then_run_fails_fast(
 async def test_when_two_tables_are_stale_then_run_reports_both_gaps_at_once(
     monkeypatch, make_job
 ) -> None:
-    # The two per-feature checks are aggregated: a volume behind on both
+    # The per-feature checks are aggregated: a volume behind on both
     # policy_decision and llm_invocation must name both in one boot, not one
     # per restart.
     from hexgate_api.core.clickhouse import SchemaOutOfDate
@@ -383,6 +607,61 @@ async def test_when_two_tables_are_stale_then_run_reports_both_gaps_at_once(
         "llm_invocation": ["latency_ms"],
     }
     assert not consumer.started  # the check runs before any broker connect
+
+
+async def test_when_the_llm_message_table_is_missing_then_run_refuses_to_start(
+    monkeypatch, make_job
+) -> None:
+    """The table ships as a hand-applied migration; a stage that skipped it
+    must fail at boot, not halt its partition on the first message span."""
+    from hexgate_api.core.clickhouse import SchemaOutOfDate
+
+    job, clickhouse, consumer, calls = _lifecycle_job(
+        monkeypatch,
+        make_job,
+        records=[],
+        topics={"hexgate.otlp.raw", "hexgate.otlp.dlq"},
+    )
+
+    def _table_absent(_client):
+        raise SchemaOutOfDate({"llm_message": ["event_id", "input_messages"]})
+
+    monkeypatch.setattr(
+        "hexgate_api.jobs.enricher.consumer.verify_messages_schema", _table_absent
+    )
+
+    with pytest.raises(SchemaOutOfDate) as exc:
+        await job.run()
+
+    assert exc.value.missing == {"llm_message": ["event_id", "input_messages"]}
+    assert not consumer.started
+
+
+async def test_when_the_agent_run_table_is_missing_then_run_refuses_to_start(
+    monkeypatch, make_job
+) -> None:
+    """Migration 0004 is hand-applied too; skipping it must fail at boot."""
+    from hexgate_api.core.clickhouse import SchemaOutOfDate
+
+    job, clickhouse, consumer, calls = _lifecycle_job(
+        monkeypatch,
+        make_job,
+        records=[],
+        topics={"hexgate.otlp.raw", "hexgate.otlp.dlq"},
+    )
+
+    def _table_absent(_client):
+        raise SchemaOutOfDate({"agent_run": ["event_id", "run_id"]})
+
+    monkeypatch.setattr(
+        "hexgate_api.jobs.enricher.consumer.verify_agent_runs_schema", _table_absent
+    )
+
+    with pytest.raises(SchemaOutOfDate) as exc:
+        await job.run()
+
+    assert exc.value.missing == {"agent_run": ["event_id", "run_id"]}
+    assert not consumer.started
 
 
 async def test_when_the_producer_fails_to_start_then_the_consumer_still_stops(

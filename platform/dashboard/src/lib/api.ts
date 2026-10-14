@@ -60,7 +60,11 @@ function messageFromDetail(detail: unknown): string | null {
   return null;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** Shared transport: fires the request, applies the global 401 redirect and
+ * turns every other non-2xx into an ``ApiError``. Returns the raw Response so
+ * the JSON callers and the binary ones (the AI Act annex / PDF downloads)
+ * go through one auth and error path. */
+async function send(path: string, init?: RequestInit): Promise<Response> {
   const res = await fetch(path, {
     ...init,
     // ``include`` so the hexgate_session cookie rides on cross-origin
@@ -97,10 +101,25 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       messageFromDetail(detail) ?? `${res.status} ${res.statusText}`;
     throw new ApiError(res.status, detail, message);
   }
+  return res;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await send(path, init);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
 
+/** Binary GET. Same auth and error handling as ``request``; hands the body
+ * back as a Blob for the caller to save to disk. */
+async function requestBlob(path: string): Promise<Blob> {
+  const res = await send(path);
+  return await res.blob();
+}
+
+/** Mirror of platform/api/schemas.py:TokenListItem. Actor emails are resolved
+ * server-side, so this never looks users up. ``created_by_*`` minted the key,
+ * ``owner_*`` owns it; all four are null for a pre-actor-columns key. */
 export interface TokenListItem {
   id: string;
   name: string;
@@ -108,6 +127,10 @@ export interface TokenListItem {
   scopes: string[];
   created_at: string;
   last_used_at: string | null;
+  created_by_user_id: string | null;
+  created_by_email: string | null;
+  owner_user_id: string | null;
+  owner_email: string | null;
 }
 
 export interface TokenMintResponse extends TokenListItem {
@@ -118,6 +141,9 @@ export interface TokenMintRequest {
   name: string;
   scopes?: string[];
   env?: "test" | "live";
+  /** Whose key this is; omit for your own. Admins/owners only, and the target
+   * must be in the project's org — 403 otherwise. */
+  owner_user_id?: string;
 }
 
 export interface AgentRead {
@@ -168,6 +194,46 @@ export interface ToolDefinition {
   input_schema: InputSchema;
 }
 
+/** L3 contents of a skill, by name. */
+export interface SkillResources {
+  references: string[];
+  assets: string[];
+  scripts: string[];
+}
+
+/**
+ * One skill on a registered manifest, mirroring SkillDefinition in
+ * platform/api/schemas.py.
+ *
+ * ``resources`` is null when the agent's framework does not enumerate them
+ * (deepagents discovers frontmatter only) — distinct from an object with empty
+ * arrays, which means it does enumerate and the skill ships none.
+ */
+export interface SkillDefinition {
+  name: string;
+  description: string;
+  source: string | null;
+  resources: SkillResources | null;
+  allowed_tools: string[];
+  additional_tools: string[];
+  content_hash: string | null;
+}
+
+/**
+ * One guard declared on a registered manifest, mirroring GuardDefinition in
+ * platform/api/schemas.py. ``kind`` is a display hint (built-in plugin vs the
+ * developer's own code); a policy governs a guard by its ``name``.
+ */
+export interface GuardDefinition {
+  name: string;
+  position: "before" | "after";
+  /** Tools it is scoped to; null means every tool. */
+  tool_names: string[] | null;
+  observe: boolean;
+  kind: "official" | "custom";
+  plugin_id: string | null;
+}
+
 /**
  * Registered manifest body, mirroring AgentManifest in platform/api/schemas.py.
  */
@@ -178,6 +244,10 @@ export interface AgentManifest {
   model: string | null;
   system_prompt: string | null;
   tools: ToolDefinition[];
+  /** Null for frameworks with no skill concept, and for pre-skills manifests. */
+  skills: SkillDefinition[] | null;
+  /** Null when the agent declares no guards, and for pre-guards manifests. */
+  guards: GuardDefinition[] | null;
 }
 
 /**
@@ -210,6 +280,105 @@ export interface ValidatePolicyResponse {
   errors: PolicyValidationError[];
   /** Authoring lints. Never affect `ok`, so they can't block a save. */
   warnings: PolicyValidationError[];
+}
+
+// --- Compose policy files (multi-file editor; mirrors platform/api/schemas.py)
+//
+// A project's compose policy is a set of named files (a small in-DB
+// filesystem). The entry file is `policy.yaml`; others are pulled in via
+// `import:`. Files carry no tier — roles/imports live inside the content.
+
+/** One stored compose file. `name` may contain slashes (e.g. `caps/refunds.yaml`). */
+export interface PolicyFileRead {
+  name: string;
+  content: string;
+  content_hash: string;
+  updated_at: string;
+}
+
+/** One analyzer lint over the composed project. `source`/`tier`/`tool`/`role`
+ * locate it; a null `role` is a project-wide concern. */
+export interface PolicyLint {
+  code: string;
+  severity: "error" | "warning" | "info";
+  message: string;
+  source: string | null;
+  tier: string | null;
+  tool: string | null;
+  role: string | null;
+}
+
+/** The effective policy for one role: a tool map plus the catch-all default.
+ * Loosely typed — it's an AgentPolicy dump the editor only renders. */
+export interface ResolvedRolePolicy {
+  default_policy?: { mode?: string } | null;
+  tools?: Record<
+    string,
+    { mode?: string; constraints?: string[] | null } | null
+  >;
+  [key: string]: unknown;
+}
+
+export type ResolvedPolicy = Record<string, ResolvedRolePolicy>;
+
+/** A node in the resolved-policy graph: an agent, a tool, an MCP tool, or a
+ * role (admission source). */
+export interface PolicyGraphNode {
+  id: string;
+  kind: "agent" | "tool" | "mcp" | "role";
+  label: string;
+}
+
+/** A directed edge: a tool `call`, an agent→agent `reach` (`via` tool/handoff),
+ * or a role→agent `admission`. `verdict` is the composed mode; `constraints`
+ * and `roles` feed the per-edge card. */
+export interface PolicyGraphEdge {
+  source: string;
+  target: string;
+  kind: "call" | "reach" | "admission";
+  via?: "tool" | "handoff" | null;
+  verdict: PolicyTestOutcome;
+  constraints: string[];
+  roles: string[];
+}
+
+export interface PolicyGraph {
+  nodes: PolicyGraphNode[];
+  edges: PolicyGraphEdge[];
+  /** Every role across all agents (the role picker's options) — independent of
+   * any role filter applied to the edges. */
+  roles: string[];
+}
+
+/** The editor's unsaved edit of one file, overlaid before preview/test. */
+export interface PolicyFileDraft {
+  name: string;
+  content: string;
+}
+
+export interface PolicyPreviewResponse {
+  /** The effective policy per role, or null when the draft doesn't compose. */
+  resolved: ResolvedPolicy | null;
+  lints: PolicyLint[];
+}
+
+export type PolicyTestOutcome = "allow" | "deny" | "approval_required";
+
+export interface PolicyTestRequest {
+  role: string;
+  /** The executing agent whose column to test against; defaults to "*". */
+  agent?: string;
+  tool: string;
+  args?: Record<string, unknown>;
+  attributes?: Record<string, unknown> | null;
+  draft?: PolicyFileDraft | null;
+}
+
+export interface PolicyTestResponse {
+  outcome: PolicyTestOutcome;
+  reason: string | null;
+  violations: string[];
+  hint: string | null;
 }
 
 // --- Audit dashboard (mirrors platform/api/schemas.py) ----------------------
@@ -272,6 +441,11 @@ export interface AuditDecisionRow {
   hint: unknown;
   arguments: unknown;
   attributes: unknown;
+  /** Run this decision belongs to; `null` outside any run scope. Pass it, and
+   * `session_id`, to `GET /projects/{id}/audit/llm-messages` to scope this
+   * decision's transcript — forward both verbatim, blanks included. See
+   * `listLlmMessages`. */
+  run_id: string | null;
 }
 
 export interface AuditDecisionPage {
@@ -413,6 +587,193 @@ export interface LlmUsageScope {
   end_date?: string;
 }
 
+// --- LLM message transcripts (mirrors schemas.py LlmMessageRow/Page) -------
+
+/** One GenAI content part. `type` names it; the rest is shape-specific, so
+ * the renderer reads what it knows and falls back to the raw object.
+ *
+ * Reasoning is the part to expect nothing about: the OpenAI Agents adapter
+ * drops it from `output_messages` and keeps it on the input side as a whole
+ * carried-through item, and whether the other adapters do the same is still
+ * open (issue #221). The renderer prints any part it does not recognise,
+ * which is what makes either answer safe. */
+export interface LlmMessagePart {
+  type?: string;
+  [key: string]: unknown;
+}
+
+/** One GenAI message: a role plus its parts. */
+export interface LlmMessage {
+  role?: string;
+  parts?: LlmMessagePart[];
+  [key: string]: unknown;
+}
+
+/** One row of a session transcript. The three content fields are decoded
+ * server-side from their stored JSON, so they arrive as the `gen_ai.*`
+ * structures — except when the stored text no longer parses, in which case
+ * the raw string comes back instead. Hence `unknown`. */
+export interface LlmMessageRow {
+  event_id: string;
+  occurred_at: string;
+  received_at: string;
+  agent_name: string;
+  agent_version_id: string;
+  session_id: string;
+  user_id: string;
+  model: string;
+  /** Which message list this event extends. One session holds several — the
+   * main run, each sub-agent, each handoff — and `message_seq` restarts at 0
+   * in each, so a gap is only a gap within one `turn_key`. */
+  turn_key: string;
+  message_seq: number;
+  /** The event restated the whole list instead of extending it. */
+  resynced: boolean;
+  /** A content field was cut to its byte cap, by the SDK or the enricher. */
+  truncated: boolean;
+  input_messages: unknown;
+  output_messages: unknown;
+  system_instructions: unknown;
+  run_id: string | null;
+}
+
+export interface LlmMessagePage {
+  rows: LlmMessageRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** Rows per transcript window. See `listLlmMessages` for why it is not the
+ * server's `MAX_PAGE_SIZE` of 100. */
+export const LLM_MESSAGE_PAGE = 50;
+
+// --- AI Act evidence report -------------------------------------------------
+//
+// Wire shapes for the two slices the tab talks to, pinned field-for-field to
+// what the endpoints serve rather than to the spec's prose, which is looser
+// than both:
+//
+//   classification  hexgate_api/schemas.py: AgentClassificationRead/Write
+//   report          hexgate_api/schemas.py: AiActReportCreate/Summary/Read
+//   render          features/ai_act/render/router.py (the `.pdf` route)
+
+/** What the history read asks for. The endpoint clamps to its own
+ * `MAX_HISTORY_LIMIT`, so this is the most it will ever serve in one page. */
+export const AI_ACT_HISTORY_LIMIT = 200;
+
+export type OperatorRole = "provider" | "deployer";
+
+export type RiskTier = "high_risk" | "not_high_risk" | "prohibited" | "minimal";
+
+/**
+ * The operator's own Article 6 / Annex III assertion about one agent, as
+ * `GET …/agents/{name}/classification` returns it.
+ *
+ * An agent with no entry gets 200 rather than 404: the endpoint serves an
+ * empty entry with `recorded: false` and `intended_purpose` prefilled from
+ * the registered manifest description, so the form has something to open on.
+ * Nothing counts as recorded until the operator PUTs it. (An agent the
+ * project does not have is still a 404.)
+ *
+ * `complete` and `missing_fields` are the server's, not re-derived here — the
+ * endpoint computes them so the report and this tab can never disagree about
+ * whether an entry counts. `missing_fields` carries wire field names in a
+ * fixed order (`intended_purpose`, `operator_role`, `risk_tier`,
+ * `annex_iii_point` when the tier is high-risk, `oversight_owner_name`);
+ * `CLASSIFICATION_FIELD_LABELS` in lib/ai-act.ts turns them into display copy.
+ */
+export interface AgentClassificationRead {
+  agent_name: string;
+  intended_purpose: string | null;
+  operator_role: OperatorRole | null;
+  risk_tier: RiskTier | null;
+  /** Annex III reference, e.g. `"5(b)"`. Required only for a high-risk tier. */
+  annex_iii_point: string | null;
+  oversight_owner_name: string | null;
+  oversight_owner_contact: string | null;
+  /** `last_update_date` (ISO `YYYY-MM-DD`) of the compliance checker the
+   * operator relied on when recording the entry. */
+  checker_last_update_date: string | null;
+  /** False until the operator has saved an entry. */
+  recorded: boolean;
+  recorded_by_user_id: string | null;
+  recorded_at: string | null;
+  complete: boolean;
+  missing_fields: string[];
+}
+
+/**
+ * PUT body — the assertion fields only. Provenance (`recorded_by_user_id`,
+ * `recorded_at`) is stamped server-side from the session.
+ *
+ * A full replace, not a patch: an omitted field means the operator cleared
+ * it. The endpoint sets `extra="forbid"`, so an unknown key is a 422 rather
+ * than a silently ignored one, and rejects a body that asserts nothing at all
+ * — `assertsSomething` in lib/ai-act.ts is the client-side half of that rule.
+ */
+export interface AgentClassificationUpdate {
+  intended_purpose: string | null;
+  operator_role: OperatorRole | null;
+  risk_tier: RiskTier | null;
+  annex_iii_point: string | null;
+  oversight_owner_name: string | null;
+  oversight_owner_contact: string | null;
+  checker_last_update_date: string | null;
+}
+
+/**
+ * One generated evidence report, as `GET …/ai-act/reports` lists it (newest
+ * first).
+ *
+ * `annex_json` — the signed bytes — is not carried here: the annex is
+ * downloaded on demand so the history list stays small. What it does carry is
+ * everything a verifier needs to check those bytes once downloaded: the
+ * digest, the byte length they should have, the signing key id and the
+ * base64 signature.
+ */
+export interface AiActReport {
+  id: string;
+  project_id: string;
+  period_start: string;
+  period_end: string;
+  generated_at: string;
+  /** Both nullable: the row's actor FK degrades to NULL when the account is
+   * erased. The annex keeps the attribution inside the signed bytes, so only
+   * this convenience view loses it. */
+  generated_by_user_id: string | null;
+  /** Resolved server-side for display; null when the account is gone. */
+  generated_by_email: string | null;
+  annex_sha256: string;
+  /** Length of the signed annex in bytes. */
+  annex_bytes: number;
+  /** Download name the annex endpoint also sets in Content-Disposition. */
+  annex_filename: string;
+  signing_kid: string;
+  /** Ed25519 signature over the digest, base64. */
+  signature_b64: string;
+}
+
+/** What `POST …/ai-act/report` returns (201): the history row plus the parsed
+ * annex. The parsed object is a convenience for a renderer — the signature
+ * covers the bytes the annex download serves, not a re-serialization of it. */
+export interface AiActReportRead extends AiActReport {
+  annex: unknown;
+}
+
+/** POST body. Both bounds are optional; omitting them asks the server for
+ * the full retention window ending now. */
+export interface AiActReportCreateBody {
+  from?: string;
+  to?: string;
+}
+
+/** Percent-encode each path segment but keep the slashes, so a name like
+ * `caps/refunds.yaml` reaches the server's `{name:path}` converter intact. */
+function encodePath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
 function qs(params: Record<string, string | number | undefined>): string {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
@@ -513,4 +874,132 @@ export const api = {
     request<LlmInvocationSummary>(
       `/v1/projects/${projectId}/llm/summary${qs({ ...scope })}`,
     ),
+
+  /**
+   * One decision's transcript, scoped by session and/or run.
+   *
+   * Both scopes go out exactly as the decision row held them, blanks
+   * included: `?session_id=&run_id=…` is the intended request, not a
+   * malformed one. `session_id` is the second column of the storage sort
+   * key, so pinning it — even to `""` — keeps the scan inside one
+   * contiguous block; omitting it means "I do not know the session" and
+   * makes a run-scoped read scan every session in the project. A null
+   * `run_id` goes out blank, which the server reads as absent.
+   *
+   * The caller must not send two blanks: that names no transcript and is a
+   * 422 by design.
+   *
+   * Rows come back oldest-first, so a page is a *window* on the transcript
+   * and `offset` chooses which. The default is the server's own default,
+   * half its `MAX_PAGE_SIZE` ceiling: one row carries up to ~272 KiB of
+   * capped content, so asking for the ceiling would put ~27 MiB on the wire
+   * (uncompressed — the API installs no gzip) to render the few turns the
+   * drawer expands.
+   */
+  listLlmMessages: (
+    projectId: string,
+    sessionId: string,
+    runId: string | null,
+    limit = LLM_MESSAGE_PAGE,
+    offset = 0,
+  ) =>
+    request<LlmMessagePage>(
+      `/v1/projects/${projectId}/audit/llm-messages${qs({
+        session_id: sessionId,
+        run_id: runId ?? "",
+        limit,
+        offset,
+      })}`,
+    ),
+
+  // --- Compose policy files ---
+
+  listPolicyFiles: (projectId: string) =>
+    request<PolicyFileRead[]>(`/v1/projects/${projectId}/policy-files`),
+
+  upsertPolicyFile: (projectId: string, name: string, content: string) =>
+    request<PolicyFileRead>(
+      `/v1/projects/${projectId}/policy-files/${encodePath(name)}`,
+      { method: "PUT", body: JSON.stringify({ content }) },
+    ),
+
+  deletePolicyFile: (projectId: string, name: string) =>
+    request<void>(
+      `/v1/projects/${projectId}/policy-files/${encodePath(name)}`,
+      { method: "DELETE" },
+    ),
+
+  resolvePolicy: (projectId: string, role?: string, agent?: string) =>
+    request<{ roles: ResolvedPolicy }>(
+      `/v1/projects/${projectId}/policy/resolve${qs({ role, agent })}`,
+    ).then((r) => r.roles),
+
+  checkPolicy: (projectId: string) =>
+    request<{ ok: boolean; lints: PolicyLint[] }>(
+      `/v1/projects/${projectId}/policy/check`,
+    ),
+
+  policyGraph: (projectId: string, role?: string) =>
+    request<PolicyGraph>(
+      `/v1/projects/${projectId}/policy/graph${qs({ role })}`,
+    ),
+
+  previewPolicy: (projectId: string, draft: PolicyFileDraft, agent?: string) =>
+    request<PolicyPreviewResponse>(`/v1/projects/${projectId}/policy/preview`, {
+      method: "POST",
+      body: JSON.stringify({ ...draft, agent: agent ?? "*" }),
+    }),
+
+  testPolicy: (projectId: string, body: PolicyTestRequest) =>
+    request<PolicyTestResponse>(`/v1/projects/${projectId}/policy/test`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // --- AI Act evidence report ---
+
+  // `encodeURIComponent`, not the `encodePath` the policy-file routes use:
+  // that one keeps slashes for the server's `{name:path}` converter, while
+  // this route's `{name}` is a single segment. A name holding a slash or a
+  // `#` would otherwise address a different route, and that agent could
+  // never be classified — a permanent gap in the report.
+  getAgentClassification: (name: string, projectId: string) =>
+    request<AgentClassificationRead>(
+      `/v1/projects/${projectId}/agents/${encodeURIComponent(name)}/classification`,
+    ),
+
+  putAgentClassification: (
+    name: string,
+    body: AgentClassificationUpdate,
+    projectId: string,
+  ) =>
+    request<AgentClassificationRead>(
+      `/v1/projects/${projectId}/agents/${encodeURIComponent(name)}/classification`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+
+  generateAiActReport: (body: AiActReportCreateBody, projectId: string) =>
+    request<AiActReportRead>(`/v1/projects/${projectId}/ai-act/report`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  /** Newest first. The endpoint's own default is 25 and it answers with a bare
+   * array carrying no total, so a short read is indistinguishable from the
+   * whole history: ask for its maximum (`MAX_HISTORY_LIMIT`, service.py) so
+   * the list is complete for any project that has not passed it, and let the
+   * caller say so when a full page comes back. */
+  listAiActReports: (projectId: string) =>
+    request<AiActReport[]>(
+      `/v1/projects/${projectId}/ai-act/reports${qs({ limit: AI_ACT_HISTORY_LIMIT })}`,
+    ),
+
+  /** The signed annex — the canonical artifact the signature covers. */
+  downloadAiActAnnex: (reportId: string, projectId: string) =>
+    requestBlob(`/v1/projects/${projectId}/ai-act/reports/${reportId}/annex`),
+
+  /** The PDF rendering of the same annex. Renders from the stored annex, so a
+   * render failure is a 502 and leaves the signed bytes untouched. */
+  downloadAiActReportPdf: (reportId: string, projectId: string) =>
+    requestBlob(`/v1/projects/${projectId}/ai-act/reports/${reportId}.pdf`),
 };

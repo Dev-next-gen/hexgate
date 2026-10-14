@@ -2,26 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 import pytest
-from agents import Agent, FunctionTool, RunHooks
+from agents import Agent, FunctionTool, RunConfig, RunHooks, Runner
 from agents.items import ModelResponse
 from agents.usage import Usage
 
 from hexgate.adapters.openai import runner as runner_mod
-from hexgate.adapters.openai.runner import HexgateRunner
+from hexgate.adapters.openai.runner import (
+    _SERVER_CONVERSATION_KWARGS,
+    HexgateRunner,
+    _CompositeRunHooks,
+    _HexgateReachHooks,
+)
 from hexgate.adapters.openai.usage import HexgateUsageHooks
 from hexgate.runtime import HexgateContext
+from hexgate.runtime import run_facts as run_facts_mod
 from hexgate.runtime.context import get_current_context
+from hexgate.runtime.run_facts import get_run_facts
 from hexgate.security import AgentPolicy, BaseToolPolicy, PolicySet, ResolvedPolicy
-from hexgate.security.bans import BanEntry, BanGate, BanSet
+from hexgate.security.bans import EMPTY_BAN_SET, BanEntry, BanGate, BanSet
 from hexgate.security.enforcer import PolicyEnforcer
 from hexgate.security.errors import AgentBannedError
-from hexgate.tracing import usage as tracing_usage_mod
 from hexgate.security.policy_set import DEFAULT_ROLE_NAME
+from hexgate.tracing import usage as tracing_usage_mod
+
+_CANONICAL_NAME = "billing"
 
 
 class _StaticBanSource:
@@ -137,7 +149,142 @@ def test_run_hooks_rejects_a_guard_list_with_a_clear_error() -> None:
     runner = HexgateRunner(api_key="k")
 
     with pytest.raises(TypeError, match="guards go on the constructor"):
-        runner._merge_hooks([lambda call: None])
+        runner._merge_hooks([lambda call: None], kwargs={})
+
+
+def _usage_hook(hooks: RunHooks) -> HexgateUsageHooks:
+    """The HexgateUsageHooks inside the composite _merge_hooks returns."""
+    return next(h for h in hooks._hooks if isinstance(h, HexgateUsageHooks))
+
+
+@pytest.mark.parametrize(
+    "kwarg",
+    ["conversation_id", "previous_response_id", "auto_previous_response_id"],
+)
+def test_server_conversation_kwargs_put_the_usage_hook_in_delta_mode(
+    kwarg: str,
+) -> None:
+    """Each of these makes the SDK send only un-sent items to the model — and
+    to the hook. The hook cannot see the tracker that decides it, so the runner
+    reads the kwargs and tells it."""
+    runner = HexgateRunner(api_key="k")
+
+    hooks = runner._merge_hooks(None, kwargs={kwarg: "x"})
+
+    assert _usage_hook(hooks)._framework_sends_deltas is True
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"max_turns": 3},
+        # Passed but falsy: no tracker is built, so the hook still gets the
+        # whole conversation.
+        {"conversation_id": None},
+        {"auto_previous_response_id": False},
+    ],
+)
+def test_without_a_server_conversation_the_usage_hook_diffs_as_before(
+    kwargs: dict[str, Any],
+) -> None:
+    """The default path is untouched: the SDK re-sends the whole history, so
+    the cursor must keep working out what is new."""
+    runner = HexgateRunner(api_key="k")
+
+    hooks = runner._merge_hooks(None, kwargs=kwargs)
+
+    assert _usage_hook(hooks)._framework_sends_deltas is False
+
+
+def test_merge_hooks_hands_the_run_config_to_the_usage_hook() -> None:
+    """``run_config.model`` overrides the agent's, and RunContextWrapper does
+    not carry the config — so the runner has to pass it or the hook reports a
+    model that never served the call."""
+    runner = HexgateRunner(api_key="k")
+    run_config = RunConfig(model="gpt-4o-mini")
+
+    hooks = runner._merge_hooks(None, kwargs={}, run_config=run_config)
+
+    assert _usage_hook(hooks)._run_config is run_config
+
+
+def _server_conversation_kwargs_in(func: Any) -> set[str]:
+    """The names from ``_SERVER_CONVERSATION_KWARGS`` that ``func`` declares."""
+    return set(inspect.signature(func).parameters) & _SERVER_CONVERSATION_KWARGS
+
+
+def test_server_conversation_kwargs_are_still_the_sdk_parameter_names() -> None:
+    """Delta detection matches these names against the caller's kwargs, so it
+    is only as correct as the SDK's own parameter names.
+
+    A rename upstream breaks the match silently: nothing raises, the cursor
+    diffs a list that is already a delta, and every message event under a
+    server-managed conversation goes out ``resynced`` — the bug this detection
+    exists to prevent. Fail on the SDK bump instead, where the names are
+    visible next to the change that moved them.
+
+    **If this test fails, read the SDK before touching the constant.** The
+    failure says a name is gone, not what replaced it, and the two cases need
+    different fixes:
+
+    * *Renamed.* Put the new name in ``_SERVER_CONVERSATION_KWARGS`` and the
+      detection works again.
+    * *Removed, or the whole mechanism reworked.* The constant is the wrong
+      shape and ``framework_sends_deltas`` needs rederiving from whatever now
+      decides it. Start at ``OpenAIServerConversationTracker`` in
+      ``agents/run_internal/oai_conversation.py`` and the branch that builds it
+      in ``agents/run_internal/run_loop.py``; what matters is which condition
+      makes the SDK pass ``on_llm_start`` un-sent items instead of the whole
+      conversation.
+
+    Note what this test cannot see: it checks that the names still *exist*,
+    never that passing them still produces deltas. Upstream keeping the names
+    and changing the behaviour leaves this green and the detection wrong —
+    only a real run against a server-managed conversation catches that.
+    """
+    missing = _SERVER_CONVERSATION_KWARGS - set(
+        inspect.signature(Runner.run).parameters
+    )
+
+    assert not missing, (
+        f"Runner.run no longer declares {sorted(missing)}. Check what the SDK "
+        "did with them before editing: a rename just needs the new name in "
+        "_SERVER_CONVERSATION_KWARGS (hexgate/adapters/openai/runner.py); a "
+        "reworked mechanism needs framework_sends_deltas rederived from "
+        "whatever now builds OpenAIServerConversationTracker. Until then, "
+        "delta detection is silently off and every message event under a "
+        "server-managed conversation goes out resynced."
+    )
+
+
+def test_the_kwarg_guard_fails_when_the_sdk_renames_a_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard above only helps if it actually notices a rename — a check
+    that passes against anything is worse than none. Stand in a Runner.run
+    whose ``conversation_id`` has been renamed and confirm the lookup misses
+    it."""
+
+    async def renamed_run(
+        starting_agent: Agent,
+        input: Any,
+        *,
+        server_conversation_id: str | None = None,  # was conversation_id
+        previous_response_id: str | None = None,
+        auto_previous_response_id: bool = False,
+        **kwargs: Any,
+    ) -> str:
+        return "unused"
+
+    monkeypatch.setattr(
+        "hexgate.adapters.openai.runner.Runner.run", staticmethod(renamed_run)
+    )
+
+    found = _server_conversation_kwargs_in(runner_mod.Runner.run)
+
+    assert "conversation_id" not in found
+    assert _SERVER_CONVERSATION_KWARGS - found == {"conversation_id"}
 
 
 def test_constructor_falls_back_to_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,7 +348,10 @@ async def test_run_wraps_agent_opens_user_scope_and_calls_runner_run(
     assert captured["agent"].name == agent.name
     assert captured["input"] == "hello"
     assert captured["kwargs"]["run_config"] is None
-    assert isinstance(captured["kwargs"]["hooks"], HexgateUsageHooks)
+    hooks = captured["kwargs"]["hooks"]
+    assert isinstance(hooks, _CompositeRunHooks)
+    assert any(isinstance(h, HexgateUsageHooks) for h in hooks._hooks)
+    assert any(isinstance(h, _HexgateReachHooks) for h in hooks._hooks)
     # HexgateContext scope was live for the duration of Runner.run.
     assert captured["active_user"] is context
     # Scope unwound on exit — no leak.
@@ -238,6 +388,44 @@ def test_run_sync_opens_user_scope_and_calls_runner_run_sync(
     assert captured["input"] == "hello"
     assert captured["active_user"] is context
     assert get_current_context() is None
+
+
+@pytest.mark.asyncio
+async def test_run_scope_uses_the_canonical_agent_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run's facts and its run_start row key the agent like its decisions
+    do, so a padded name still joins its policy_decision rows."""
+    _silence_observability(monkeypatch)
+    seen_agents: list[str] = []
+    reported_agents: list[str] = []
+
+    async def fake_run(starting_agent: Agent, input: Any, **kwargs: Any) -> str:
+        seen_agents.append(get_run_facts().agent)
+        return "run-result"
+
+    def fake_run_sync(starting_agent: Agent, input: Any, **kwargs: Any) -> str:
+        seen_agents.append(get_run_facts().agent)
+        return "run-sync-result"
+
+    def capture_run_start(agent: str, run_id: str, **_: Any) -> None:
+        reported_agents.append(agent)
+
+    monkeypatch.setattr(
+        "hexgate.adapters.openai.runner.Runner.run", staticmethod(fake_run)
+    )
+    monkeypatch.setattr(
+        "hexgate.adapters.openai.runner.Runner.run_sync", staticmethod(fake_run_sync)
+    )
+    monkeypatch.setattr(run_facts_mod, "emit_run_start", capture_run_start)
+    runner = HexgateRunner(api_key="k")
+    agent = _make_agent(f" {_CANONICAL_NAME} ")
+
+    await runner.run(agent, "hello", hexgate_context=_user())
+    runner.run_sync(agent, "hello", hexgate_context=_user())
+
+    assert seen_agents == [_CANONICAL_NAME, _CANONICAL_NAME]
+    assert reported_agents == [_CANONICAL_NAME, _CANONICAL_NAME]
 
 
 @pytest.mark.asyncio
@@ -632,11 +820,75 @@ async def test_arun_streamed_refreshes_async_before_run_streamed(
     assert order == ["refresh_async", "run_streamed"]
 
 
+# A sequential regression leaves the first party waiting alone until this
+# breaks the barrier; a concurrent fetch meets it immediately.
+_BARRIER_TIMEOUT_S = 2.0
+
+
+class _BarrierBanSource:
+    def __init__(self, barrier: threading.Barrier) -> None:
+        self._barrier = barrier
+
+    def fetch(self) -> BanSet:
+        self._barrier.wait()
+        return EMPTY_BAN_SET
+
+
+class _BarrierBinding(_CountingBinding):
+    def __init__(self, barrier: threading.Barrier) -> None:
+        super().__init__()
+        self._barrier = barrier
+
+    def refresh(self) -> None:
+        self._barrier.wait()
+        super().refresh()
+
+    async def refresh_async(self) -> None:
+        await asyncio.to_thread(self.refresh)
+
+
+def _concurrent_runner() -> tuple[HexgateRunner, _BarrierBinding]:
+    barrier = threading.Barrier(2, timeout=_BARRIER_TIMEOUT_S)
+    runner = HexgateRunner(api_key="k")
+    binding = _BarrierBinding(barrier)
+    runner._bindings["my-agent"] = binding  # type: ignore[assignment]
+    runner._ban_gates["my-agent"] = BanGate("my-agent", _BarrierBanSource(barrier))
+    return runner, binding
+
+
+@pytest.mark.asyncio
+async def test_run_fetches_policy_and_bans_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _silence_observability(monkeypatch)
+    _patch_runner_run(monkeypatch)
+    runner, binding = _concurrent_runner()
+
+    await runner.run(_make_agent("my-agent"), "hi", hexgate_context=_user())
+
+    assert binding.refreshes == 1
+
+
+def test_run_streamed_fetches_policy_and_bans_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _silence_observability(monkeypatch)
+    monkeypatch.setattr(
+        "hexgate.adapters.openai.runner.Runner.run_streamed",
+        staticmethod(lambda *_a, **_kw: _FakeStreamingResult()),
+    )
+    runner, binding = _concurrent_runner()
+
+    runner.run_streamed(_make_agent("my-agent"), "hi", hexgate_context=_user())
+
+    assert binding.refreshes == 1
+
+
 @pytest.mark.asyncio
 async def test_arun_streamed_refused_before_task_spawns_when_banned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The ban gate is awaited (check_async) before Runner.run_streamed spawns
+    """The ban gate is enforced (via aprepare_run) before Runner.run_streamed spawns
     its background task, so a banned stream never starts on the serve path."""
     _silence_observability(monkeypatch)
     called: list[str] = []
@@ -697,7 +949,7 @@ def _fake_llm_response(
 
 
 @pytest.mark.asyncio
-async def test_run_passes_a_usage_hooks_instance_when_caller_passes_none(
+async def test_run_installs_usage_and_reach_hooks_when_caller_passes_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _silence_observability(monkeypatch)
@@ -714,7 +966,10 @@ async def test_run_passes_a_usage_hooks_instance_when_caller_passes_none(
     runner = HexgateRunner(api_key="k")
     await runner.run(_make_agent(), "hi", hexgate_context=_user())
 
-    assert isinstance(captured["hooks"], HexgateUsageHooks)
+    hooks = captured["hooks"]
+    assert isinstance(hooks, _CompositeRunHooks)
+    assert any(isinstance(h, HexgateUsageHooks) for h in hooks._hooks)
+    assert any(isinstance(h, _HexgateReachHooks) for h in hooks._hooks)
 
 
 @pytest.mark.asyncio
@@ -778,3 +1033,61 @@ async def test_usage_hook_context_propagates_through_run(
     assert event.session_id == "s-1"
     assert event.input_tokens == 10
     assert event.output_tokens == 20
+
+
+# --- R-GUARD-007: the closed-world guard check runs ONCE, at resolution ---------
+
+
+def test_binding_for_validates_guard_stance_once_at_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The closed-world guard check fires when the binding is first resolved — a
+    policy naming an undeclared guard stops the agent cold there (review #2)."""
+    from hexgate.adapters.openai import runner as runner_mod
+    from hexgate.guards.stance import GuardClosedWorldError
+    from hexgate.security.policy_set import load_policy_set_from_dict
+
+    engine = load_policy_set_from_dict(
+        {"roles": {"default": {"guards": {"ghost_guard": {"enabled": False}}}}}
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "resolve_policy",
+        lambda name, *, api_key, client=None: ResolvedPolicy(engine, None),
+    )
+    runner = HexgateRunner(api_key="k")
+
+    with pytest.raises(GuardClosedWorldError, match="ghost_guard"):
+        runner._binding_for(_make_agent("my-agent"))
+
+
+def test_refresh_to_unknown_guard_does_not_crash_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh that swaps in a policy naming an unknown guard must degrade to a
+    no-op run, not raise: the check is construction-time only, never on the per-run
+    wrap (review #2). Before the fix, wrap_openai_agent revalidated every run."""
+    _silence_observability(monkeypatch)
+    monkeypatch.setattr(
+        "hexgate.adapters.openai.runner.Runner.run_sync",
+        staticmethod(lambda *a, **k: "ok"),
+    )
+    from hexgate.security.policy_set import load_policy_set_from_dict
+
+    bad_engine = load_policy_set_from_dict(
+        {"roles": {"default": {"guards": {"ghost_guard": {"enabled": False}}}}}
+    )
+
+    class _BadBinding:
+        def __init__(self) -> None:
+            self.enforcer = PolicyEnforcer(bad_engine, agent_name="my-agent")
+
+        def refresh(self) -> None:  # a refresh already swapped in the bad policy
+            pass
+
+    runner = HexgateRunner(api_key="k")
+    runner._bindings["my-agent"] = _BadBinding()  # type: ignore[assignment]
+
+    result = runner.run_sync(_make_agent("my-agent"), "hi", hexgate_context=_user())
+
+    assert result == "ok"

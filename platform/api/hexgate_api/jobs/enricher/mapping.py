@@ -2,8 +2,9 @@
 
 The wire contract lives in hexgate.tracing.semconv (shared with the future
 SDK emitter). Dispatch is by instrumentation scope name; the platform's
-Pydantic models (schemas.py) are the validation layer, so the enricher
-accepts exactly what the HTTP ingest accepts. Type coercion lives in
+Pydantic models (schemas.py) are the validation layer, so for the scopes that
+also have an HTTP ingest the enricher accepts exactly what that ingest accepts
+(messages have no HTTP path — OTLP is their only way in). Type coercion lives in
 coerce.py; redaction/byte caps in enforcement.py — this module is only the
 attribute→field contract for each scope.
 """
@@ -22,6 +23,7 @@ from hexgate_api.jobs.enricher.coerce import (
     SpanRejected,
     as_int,
     as_json_dict,
+    as_json_value,
     as_str,
     as_str_list,
     required,
@@ -31,24 +33,49 @@ from hexgate_api.jobs.enricher.enforcement import (
     capped_arguments,
     capped_attributes,
     capped_hint,
+    capped_input_messages,
+    capped_output_messages,
+    capped_system_instructions,
     capped_violations,
 )
 from hexgate_api.query_scope import EventOutOfWindow, validate_event_window
-from hexgate_api.schemas import BanEnforcementEvent, DecisionEvent, LlmInvocationEvent
+from hexgate_api.schemas import (
+    AgentRunEvent,
+    BanEnforcementEvent,
+    DecisionEvent,
+    LlmInvocationEvent,
+    LlmMessageEvent,
+)
 
 _log = logging.getLogger(__name__)
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-KNOWN_SCOPES = (semconv.SCOPE_AUDIT, semconv.SCOPE_USAGE, semconv.SCOPE_BANS)
+# A scope belongs here only once the consumer has a bucket and an insert for
+# its event type: consumer.py buckets by exact type and commits the offset
+# after the inserts, so a scope accepted before that would be validated and
+# then dropped with no DLQ record. Anything not listed is a loud unknown_scope.
+KNOWN_SCOPES = (
+    semconv.SCOPE_AUDIT,
+    semconv.SCOPE_USAGE,
+    semconv.SCOPE_BANS,
+    semconv.SCOPE_MESSAGES,
+    semconv.SCOPE_RUNS,
+)
 
-Event = DecisionEvent | LlmInvocationEvent | BanEnforcementEvent
+Event = (
+    DecisionEvent
+    | LlmInvocationEvent
+    | BanEnforcementEvent
+    | LlmMessageEvent
+    | AgentRunEvent
+)
 
 
 def _envelope(
     span: Span, attrs: dict[str, Any], resource_attrs: dict[str, Any], scope: str
 ) -> dict[str, Any]:
-    """The AuditEnvelope fields shared by all three event types."""
+    """The AuditEnvelope fields shared by every event type."""
     if span.start_time_unix_nano <= 0:
         raise SpanRejected(
             "span start_time_unix_nano is unset", error_class="validation", scope=scope
@@ -107,7 +134,36 @@ def _decision_fields(attrs: dict[str, Any], scope: str) -> dict[str, Any]:
                 attrs.get(semconv.ATTRIBUTES), key=semconv.ATTRIBUTES, scope=scope
             )
         ),
+        **_run_fields(attrs, scope),
     }
+
+
+# Counter attribute → DecisionEvent field. run_id is handled apart: it is the
+# one nullable field of the group, and the only one a foreign emitter is likely
+# to omit wholesale.
+_RUN_COUNTERS = {
+    semconv.RUN_TOOL_CALLS: "run_tool_calls",
+    semconv.RUN_LLM_CALLS: "run_llm_calls",
+    semconv.RUN_DENIALS: "run_denials",
+    semconv.RUN_TOTAL_TOKENS: "run_total_tokens",
+    semconv.RUN_ELAPSED_MS: "run_elapsed_ms",
+}
+
+
+def _run_fields(attrs: dict[str, Any], scope: str) -> dict[str, Any]:
+    """Run attribution, absent-tolerant: a span from an emitter that predates
+    the run namespace maps to the model's zero defaults rather than a rejection.
+
+    ``run_id`` stays ``None`` when the attribute is missing — the SDK omits it
+    outside a run scope, and the platform substitutes the zero UUID at insert.
+    """
+    fields: dict[str, Any] = {
+        field: as_int(attrs[key], key=key, scope=scope)
+        for key, field in _RUN_COUNTERS.items()
+        if key in attrs
+    }
+    fields["run_id"] = as_str(attrs.get(semconv.RUN_ID)) or None
+    return fields
 
 
 def _usage_fields(attrs: dict[str, Any], span: Span, scope: str) -> dict[str, Any]:
@@ -131,11 +187,68 @@ def _usage_fields(attrs: dict[str, Any], span: Span, scope: str) -> dict[str, An
         ),
         "latency_ms": as_int(latency, key=semconv.LATENCY_MS, scope=scope),
         "error_code": as_str(attrs.get(semconv.ERROR_CODE)),
+        # Same nullable contract as the decision scope: absent, never "".
+        "run_id": as_str(attrs.get(semconv.RUN_ID)) or None,
     }
     status = attrs.get(semconv.STATUS)
     if status is not None:  # absent → the model's "success" default
         fields["status"] = as_str(status)
     return fields
+
+
+def _message_fields(attrs: dict[str, Any], scope: str) -> dict[str, Any]:
+    """LLM message content: the ``gen_ai.*`` trio as JSON, capped here before
+    validation so an over-cap prompt is stored short rather than rejected.
+
+    ``truncated`` is the SDK's flag OR'd with this side's own cuts — a row
+    marked untouched must really be the whole message. The two bool flags are
+    handed to the model raw: Pydantic already coerces a bool attribute, and an
+    absent one takes the model's False default.
+    """
+    input_messages, input_cut = capped_input_messages(
+        as_json_value(
+            required(attrs, semconv.GEN_AI_INPUT_MESSAGES, scope=scope),
+            key=semconv.GEN_AI_INPUT_MESSAGES,
+            scope=scope,
+        )
+    )
+    output_messages, output_cut = capped_output_messages(
+        as_json_value(
+            required(attrs, semconv.GEN_AI_OUTPUT_MESSAGES, scope=scope),
+            key=semconv.GEN_AI_OUTPUT_MESSAGES,
+            scope=scope,
+        )
+    )
+    system_instructions, system_cut = capped_system_instructions(
+        as_json_value(
+            attrs.get(semconv.GEN_AI_SYSTEM_INSTRUCTIONS),
+            key=semconv.GEN_AI_SYSTEM_INSTRUCTIONS,
+            scope=scope,
+        )
+    )
+    return {
+        "model": as_str(required(attrs, semconv.GEN_AI_REQUEST_MODEL, scope=scope)),
+        "turn_key": as_str(required(attrs, semconv.TURN_KEY, scope=scope)),
+        "message_seq": as_int(
+            required(attrs, semconv.MESSAGE_SEQ, scope=scope),
+            key=semconv.MESSAGE_SEQ,
+            scope=scope,
+        ),
+        "resynced": attrs.get(semconv.RESYNCED, False),
+        "truncated": True
+        if input_cut or output_cut or system_cut
+        else attrs.get(semconv.TRUNCATED, False),
+        "input_messages": input_messages,
+        "output_messages": output_messages,
+        "system_instructions": system_instructions,
+        # Same nullable contract as the other scopes: absent, never "".
+        "run_id": as_str(attrs.get(semconv.RUN_ID)) or None,
+    }
+
+
+def _run_start_fields(attrs: dict[str, Any], scope: str) -> dict[str, Any]:
+    # Required here, unlike _run_fields: a run-start span outside a run is malformed.
+    return {"run_id": as_str(required(attrs, semconv.RUN_ID, scope=scope))}
 
 
 def _ban_fields(attrs: dict[str, Any], scope: str) -> dict[str, Any]:
@@ -162,6 +275,12 @@ def map_span(scope_name: str, span: Span, resource_attrs: dict[str, Any]) -> Eve
     elif scope_name == semconv.SCOPE_USAGE:
         model = LlmInvocationEvent
         payload |= _usage_fields(attrs, span, scope_name)
+    elif scope_name == semconv.SCOPE_MESSAGES:
+        model = LlmMessageEvent
+        payload |= _message_fields(attrs, scope_name)
+    elif scope_name == semconv.SCOPE_RUNS:
+        model = AgentRunEvent
+        payload |= _run_start_fields(attrs, scope_name)
     else:
         model = BanEnforcementEvent
         payload |= _ban_fields(attrs, scope_name)

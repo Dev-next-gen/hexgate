@@ -1,28 +1,48 @@
-import { useEffect } from "react";
-import { useNavigate, NavLink, Outlet } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { useLocation, useNavigate, NavLink, Outlet } from "react-router-dom";
 import {
+  ArrowLeft,
   Ban,
   BarChart3,
   Building2,
-  FileCode,
+  Bot,
+  CircleUser,
   KeyRound,
   LogOut,
   MessageSquareCode,
+  Monitor,
+  Moon,
   Network,
+  PanelLeft,
+  Scale,
   ScrollText,
   Settings2,
-  ShieldCheck,
+  Files,
+  Sun,
+  Users,
   type LucideIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { OrgProjectSwitcher } from "@/components/OrgProjectSwitcher";
+import { CreateOrgDialog } from "@/components/CreateOrgDialog";
+import { CreateProjectDialog } from "@/components/CreateProjectDialog";
 import { PreviewBanner } from "@/components/PreviewBanner";
 import { VerifyEmailBanner } from "@/components/VerifyEmailBanner";
 import { useActive } from "@/lib/active";
 import { useLogout, useUser } from "@/lib/auth";
 import { useOrgs } from "@/lib/orgs";
 import { useProjects } from "@/lib/projects";
+import { useUi } from "@/lib/ui";
+import { useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 
 /**
@@ -84,18 +104,66 @@ function useActiveBootstrap(): void {
   ]);
 }
 
+// The core product features. Org/account admin lives in the settings space
+// (see `settingsLinks`), reached from the account menu — not this sidebar.
 const workspaceLinks = [
-  { to: "/agents", label: "Agents", icon: FileCode },
-  { to: "/policies", label: "Policies", icon: ShieldCheck },
+  { to: "/agents", label: "Agents", icon: Bot },
+  { to: "/policies", label: "Policies", icon: Files },
   { to: "/graph", label: "Graph", icon: Network },
   { to: "/playground", label: "Playground", icon: MessageSquareCode },
   { to: "/audit", label: "Audit", icon: ScrollText },
   { to: "/usage", label: "Usage", icon: BarChart3 },
   { to: "/bans", label: "Bans", icon: Ban },
+  // One word, like every other entry here.
+  { to: "/ai-act", label: "Governance", icon: Scale },
   { to: "/tokens", label: "API keys", icon: KeyRound },
-  { to: "/orgs", label: "Organizations", icon: Building2 },
-  { to: "/settings", label: "Settings", icon: Settings2 },
 ];
+
+/** Whether a path belongs to the settings space (its own sidebar). Uses a
+ * segment boundary so a future sibling like `/orgstats` isn't misread. */
+function isSettingsPath(pathname: string): boolean {
+  return (
+    pathname === "/settings" ||
+    pathname === "/orgs" ||
+    pathname.startsWith("/orgs/")
+  );
+}
+
+/** The org the settings sidebar should scope its org links to: the one in the
+ * URL (`/orgs/:id/...`) when present, else the active org — so a deep-link or
+ * refresh keeps the sidebar pointed at the org being viewed. On the pure
+ * account page (`/settings`) there's no org in play, so we return null and the
+ * org-scoped links drop out. */
+function settingsOrgId(
+  pathname: string,
+  activeOrgId: string | null,
+): string | null {
+  if (pathname === "/settings") return null;
+  return pathname.match(/^\/orgs\/([^/]+)(?:\/|$)/)?.[1] ?? activeOrgId;
+}
+
+/** The settings-space sidebar. Member/settings links need the active org, so
+ * they're built per-render; omitted when no org is selected. */
+function settingsLinks(activeOrgId: string | null) {
+  return [
+    { to: "/orgs", label: "Organizations", icon: Building2, end: true },
+    ...(activeOrgId
+      ? [
+          {
+            to: `/orgs/${activeOrgId}/members`,
+            label: "Members",
+            icon: Users,
+          },
+          {
+            to: `/orgs/${activeOrgId}/settings`,
+            label: "Organization settings",
+            icon: Settings2,
+          },
+        ]
+      : []),
+    { to: "/settings", label: "Account", icon: CircleUser },
+  ];
+}
 
 function NavItem({
   to,
@@ -104,6 +172,7 @@ function NavItem({
   end,
   badge,
   status,
+  collapsed,
 }: {
   to: string;
   label: string;
@@ -111,14 +180,17 @@ function NavItem({
   end?: boolean;
   badge?: string;
   status?: string;
+  collapsed?: boolean;
 }) {
   return (
     <NavLink
       to={to}
       end={end}
+      title={collapsed ? label : undefined}
       className={({ isActive }) =>
         cn(
-          "flex h-9 items-center justify-between rounded-md px-3 text-sm transition-colors",
+          "flex h-9 items-center rounded-md text-sm transition-colors",
+          collapsed ? "justify-center px-0" : "justify-between px-2",
           isActive
             ? "bg-primary/15 text-primary font-medium"
             : "text-muted-foreground hover:bg-accent hover:text-foreground",
@@ -126,13 +198,13 @@ function NavItem({
       }
     >
       <span className="flex items-center gap-2.5">
-        <Icon className="size-4" />
-        {label}
+        <Icon className="size-4 shrink-0" />
+        {!collapsed && label}
       </span>
-      {badge && (
+      {!collapsed && badge && (
         <span className="text-[11px] text-muted-foreground">{badge}</span>
       )}
-      {status && (
+      {!collapsed && status && (
         <span className="rounded-full bg-allow/15 px-1.5 py-0.5 text-[10px] font-medium text-allow">
           {status}
         </span>
@@ -146,49 +218,125 @@ export function AppShell() {
   // shows something usable instead of "Pick an organization" empty
   // state. Idempotent — won't overwrite an existing valid selection.
   useActiveBootstrap();
+  const { sidebarCollapsed, toggleSidebar } = useUi();
+  const navigate = useNavigate();
+
+  // Two sidebar "spaces" share this one shell frame: the product features, and
+  // an org/account settings space (its own nav), entered from the account menu.
+  const { pathname } = useLocation();
+  const inSettings = isSettingsPath(pathname);
+  const activeOrgId = useActive((s) => s.activeOrgId);
+  // Scope the settings links to the URL's org (falling back to the active one)
+  // so a refresh/deep-link to /orgs/:id/... keeps the sidebar on that org.
+  const links = inSettings
+    ? settingsLinks(settingsOrgId(pathname, activeOrgId))
+    : workspaceLinks;
+
+  // The workspace create-dialogs live here, not in OrgProjectSwitcher, so
+  // collapsing the sidebar (which unmounts the switcher trigger) can't unmount
+  // an open dialog and drop the user's half-typed form.
+  const [createOrgOpen, setCreateOrgOpen] = useState(false);
+  const [createProjectOpen, setCreateProjectOpen] = useState(false);
+
+  // Cmd/Ctrl-B toggles the sidebar (standard editor shortcut). toggleSidebar is
+  // a stable zustand action, so this binds once. Guard the match: ignore key
+  // repeat and extra modifiers, and — crucially — presses inside an editable
+  // target (an input, or the CodeMirror policy editor, which binds Ctrl-B to
+  // move-cursor-left) so the shortcut never hijacks typing.
+  useEffect(() => {
+    const isEditable = (t: EventTarget | null): boolean =>
+      t instanceof HTMLElement &&
+      (t.isContentEditable ||
+        ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName) ||
+        t.closest(".cm-editor") !== null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.repeat || e.altKey || e.shiftKey) return;
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "b") return;
+      if (isEditable(e.target)) return;
+      e.preventDefault();
+      toggleSidebar();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleSidebar]);
 
   return (
     <div className="flex h-screen bg-background text-foreground">
-      <aside className="flex w-[220px] flex-col border-r border-border bg-card">
-        <div className="flex h-14 items-center gap-2 px-4 border-b border-border">
-          <img src="/icon.svg" alt="" className="size-7" />
-          <span className="text-sm font-semibold">Hexgate</span>
+      <aside
+        className={cn(
+          // No hard right border — the card-vs-background shade separates the
+          // sidebar from the content (VSCode "shades, not rules"). The whole
+          // shell lives in the sidebar (switcher on top, account on the
+          // bottom) so the content column reclaims the old header's height.
+          "flex flex-col bg-card transition-[width] duration-200",
+          sidebarCollapsed ? "w-14" : "w-[240px]",
+        )}
+      >
+        {/* Top: project/org switcher (two lines) + the collapse toggle,
+            top-aligned so it sits level with the project line. */}
+        <div
+          className={cn(
+            "flex items-start gap-1 overflow-hidden py-2",
+            sidebarCollapsed ? "justify-center px-0" : "px-2",
+          )}
+        >
+          {!sidebarCollapsed && (
+            <div className="min-w-0 flex-1">
+              {inSettings ? (
+                <button
+                  type="button"
+                  onClick={() => navigate("/agents")}
+                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <ArrowLeft className="size-4" />
+                  Back to workspace
+                </button>
+              ) : (
+                <OrgProjectSwitcher
+                  onNewOrg={() => setCreateOrgOpen(true)}
+                  onNewProject={() => setCreateProjectOpen(true)}
+                />
+              )}
+            </div>
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-8 shrink-0 text-muted-foreground"
+            title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            aria-label={
+              sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"
+            }
+            onClick={toggleSidebar}
+          >
+            <PanelLeft className="size-4" />
+          </Button>
         </div>
 
-        <nav className="flex-1 overflow-y-auto p-3 scrollbar-thin">
-          <div className="mb-4">
-            <div className="px-3 pb-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-              Workspace
+        <nav className="flex-1 overflow-y-auto px-2 py-2 scrollbar-thin">
+          {/* Collapsed settings space has no switcher line, so surface the exit
+              as a nav row too. */}
+          {inSettings && sidebarCollapsed && (
+            <div className="mb-0.5 flex flex-col gap-0.5">
+              <NavItem
+                to="/agents"
+                label="Back to workspace"
+                icon={ArrowLeft}
+                collapsed
+              />
             </div>
-            <div className="flex flex-col gap-0.5">
-              {workspaceLinks.map((l) => (
-                <NavItem key={l.to} {...l} />
-              ))}
-            </div>
+          )}
+          <div className="flex flex-col gap-0.5">
+            {links.map((l) => (
+              <NavItem key={l.to} {...l} collapsed={sidebarCollapsed} />
+            ))}
           </div>
         </nav>
 
-        <div className="border-t border-border p-3 text-[11px] text-muted-foreground space-y-1">
-          <div className="flex items-center gap-1.5">
-            <span className="relative flex size-1.5">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-50" />
-              <span className="relative inline-flex size-1.5 rounded-full bg-primary" />
-            </span>
-            Serving bundle <span className="font-mono text-foreground">v1</span>
-          </div>
-          <div>Pushed just now</div>
-          <div>local · 1 region</div>
-        </div>
+        <AccountChip collapsed={sidebarCollapsed} />
       </aside>
 
       <div className="flex flex-1 flex-col">
-        <header className="flex h-14 items-center justify-between border-b border-border px-6">
-          <div className="flex items-center gap-3">
-            <OrgProjectSwitcher />
-          </div>
-          <UserMenu />
-        </header>
-
         <PreviewBanner />
         <VerifyEmailBanner />
 
@@ -196,44 +344,155 @@ export function AppShell() {
           <Outlet />
         </main>
       </div>
+
+      {/* Workspace dialogs live at the shell level so their lifecycle is
+          independent of the sidebar's collapse state. */}
+      <CreateOrgDialog open={createOrgOpen} onOpenChange={setCreateOrgOpen} />
+      <CreateProjectDialog
+        open={createProjectOpen}
+        onOpenChange={setCreateProjectOpen}
+      />
     </div>
   );
 }
 
-/** Top-right corner: shows the signed-in user's initial + a sign-out
- * button. Phase 5 will replace this with a proper dropdown menu (and
- * an org switcher next to it); for now a flat layout is enough. */
-function UserMenu() {
+/**
+ * Bottom-of-sidebar account chip — the signed-in user, opening a menu
+ * upward with settings shortcuts and sign-out (OpenAI-style). The project
+ * and org now live in the top switcher, so this is purely the user's
+ * identity. When the sidebar is collapsed it shrinks to just the avatar.
+ */
+function AccountChip({ collapsed }: { collapsed: boolean }) {
   const { user } = useUser();
   const logout = useLogout();
   const navigate = useNavigate();
 
   if (!user) return null;
 
-  const initial = user.email.slice(0, 1).toUpperCase();
+  const username = user.email.split("@")[0] || user.email;
+  const initial = (user.email.slice(0, 1) || "?").toUpperCase();
 
   return (
-    <div className="flex items-center gap-3 text-muted-foreground">
-      <div className="flex items-center gap-2">
-        <span className="size-8 rounded-full bg-primary/20 text-primary grid place-items-center text-xs font-medium">
-          {initial}
-        </span>
-        <span className="hidden text-xs text-foreground sm:inline">
-          {user.email}
-        </span>
+    <div className="p-2">
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            title={collapsed ? user.email : undefined}
+            className={cn(
+              "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              collapsed && "justify-center",
+            )}
+          >
+            <span className="grid size-7 shrink-0 place-items-center rounded-full bg-primary/20 text-xs font-medium text-primary">
+              {initial}
+            </span>
+            {!collapsed && (
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium">
+                  {username}
+                </span>
+                <span className="block truncate text-xs text-muted-foreground">
+                  {user.email}
+                </span>
+              </span>
+            )}
+          </button>
+        </DropdownMenuTrigger>
+
+        <DropdownMenuContent align="start" side="top" className="min-w-[240px]">
+          <DropdownMenuLabel className="truncate text-xs font-normal text-muted-foreground">
+            {user.email}
+          </DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => navigate("/settings")}>
+            <Settings2 className="size-4" />
+            <span>Settings</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => navigate("/orgs")}>
+            <Building2 className="size-4" />
+            <span>Organizations</span>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <AppearanceControl />
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            disabled={logout.isPending}
+            onSelect={async () => {
+              await logout.mutateAsync().catch(() => undefined);
+              navigate("/sign-in", { replace: true });
+            }}
+          >
+            <LogOut className="size-4" />
+            <span>Log out</span>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
+
+const MODES = [
+  ["light", Sun, "Light"],
+  ["dark", Moon, "Dark"],
+  ["system", Monitor, "System"],
+] as const;
+
+const SCHEMES = [
+  ["blue", "226 78% 65%", "Blue"],
+  ["plum", "313 75% 68%", "Plum"],
+] as const;
+
+/** Appearance picker inside the account menu: mode (light/dark/system) + accent
+ * scheme (blue/plum). Plain buttons so a pick doesn't close the menu. */
+function AppearanceControl() {
+  const mode = useTheme((s) => s.mode);
+  const scheme = useTheme((s) => s.scheme);
+  const setMode = useTheme((s) => s.setMode);
+  const setScheme = useTheme((s) => s.setScheme);
+
+  const seg =
+    "flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md text-xs text-muted-foreground transition-colors hover:text-foreground";
+  const on = "bg-accent text-foreground";
+
+  return (
+    <div className="px-2 py-1.5">
+      <div className="mb-1.5 text-[11px] font-medium text-muted-foreground">
+        Appearance
       </div>
-      <Button
-        variant="ghost"
-        size="icon"
-        title="Sign out"
-        disabled={logout.isPending}
-        onClick={async () => {
-          await logout.mutateAsync().catch(() => undefined);
-          navigate("/sign-in", { replace: true });
-        }}
-      >
-        <LogOut className="h-4 w-4" />
-      </Button>
+      <div className="flex gap-1">
+        {MODES.map(([m, Icon, label]) => (
+          <button
+            key={m}
+            type="button"
+            title={label}
+            aria-label={label}
+            onClick={() => setMode(m)}
+            className={cn(seg, mode === m && on)}
+          >
+            <Icon className="size-4" />
+          </button>
+        ))}
+      </div>
+      <div className="mt-1 flex gap-1">
+        {SCHEMES.map(([s, hsl, label]) => (
+          <button
+            key={s}
+            type="button"
+            title={`${label} accent`}
+            aria-label={`${label} accent`}
+            onClick={() => setScheme(s)}
+            className={cn(seg, scheme === s && on)}
+          >
+            <span
+              className="size-3 rounded-full"
+              style={{ backgroundColor: `hsl(${hsl})` }}
+            />
+            {label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

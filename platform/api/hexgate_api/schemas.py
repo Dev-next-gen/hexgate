@@ -1,10 +1,11 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     EmailStr,
     Field,
     StringConstraints,
@@ -250,9 +251,25 @@ class TokenMintRequest(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     scopes: list[str] = Field(default_factory=lambda: ["mint_user_token", "read_audit"])
     env: str = Field(default="test", pattern="^(test|live)$")
+    # Whose key this is; defaults to the caller. 403 unless the caller is an
+    # admin/owner and the target is a member of the project's org.
+    owner_user_id: Optional[str] = Field(default=None, max_length=64)
 
 
-class TokenListItem(BaseModel):
+class TokenActorFields(BaseModel):
+    """The two actors on an API key, with emails resolved server-side.
+
+    Same shape as :class:`BanRead`'s pair, so the dashboard never looks users
+    up itself. All four are ``None`` for a system or pre-#160 key.
+    """
+
+    created_by_user_id: Optional[str] = None
+    created_by_email: Optional[str] = None
+    owner_user_id: Optional[str] = None
+    owner_email: Optional[str] = None
+
+
+class TokenListItem(TokenActorFields):
     id: str
     name: str
     masked: str  # e.g., "fty_live_8F3d…k29P"
@@ -261,7 +278,7 @@ class TokenListItem(BaseModel):
     last_used_at: Optional[datetime]
 
 
-class TokenMintResponse(BaseModel):
+class TokenMintResponse(TokenActorFields):
     id: str
     name: str
     full: str  # only returned on mint
@@ -308,6 +325,96 @@ class AgentUpdate(BaseModel):
     system_md: str | None = None
 
 
+# --- AI Act classification ---------------------------------------------------
+#
+# The operator asserts these values; the platform records them and judges
+# nothing about them. The two closed sets below are wire-shape guards only —
+# the completeness rule keys off ``risk_tier == "high_risk"`` by exact string,
+# so a typo'd tier must be a 422 rather than a silently-not-high-risk entry.
+
+OperatorRole = Literal["provider", "deployer"]
+RiskTier = Literal["high_risk", "not_high_risk", "prohibited", "minimal"]
+
+
+class AgentClassificationWrite(BaseModel):
+    """``PUT …/agents/{name}/classification`` body.
+
+    A full replace of the agent's entry, not a patch: the dashboard form
+    submits every field, and an omitted field means the operator cleared it.
+    Blank strings are normalised to null so a whitespace-only value doesn't
+    read as a recorded assertion.
+
+    ``extra="forbid"`` where the rest of this module takes pydantic's default,
+    because replace semantics turn an ignored key into silent data loss: a
+    misspelled ``risk_teir`` would not merely fail to set the tier, it would
+    clear the tier already recorded, and still return 200.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    intended_purpose: Optional[str] = Field(default=None, max_length=4096)
+    operator_role: Optional[OperatorRole] = None
+    risk_tier: Optional[RiskTier] = None
+    annex_iii_point: Optional[str] = Field(default=None, max_length=32)
+    oversight_owner_name: Optional[str] = Field(default=None, max_length=256)
+    oversight_owner_contact: Optional[str] = Field(default=None, max_length=256)
+    checker_last_update_date: Optional[date] = None
+
+    @field_validator(
+        "intended_purpose",
+        "annex_iii_point",
+        "oversight_owner_name",
+        "oversight_owner_contact",
+        mode="after",
+    )
+    @classmethod
+    def _blank_to_none(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def _assert_something(self) -> "AgentClassificationWrite":
+        """Reject a body that asserts nothing at all.
+
+        A partial entry is fine — the report carries it as incomplete. A
+        wholly empty one is not: it would name an accountable recorder against
+        zero assertions, and, since PUT replaces, wipe a complete entry and
+        its original recorder if the form submitted before it had loaded.
+        """
+        if not any(self.model_dump().values()):
+            raise ValueError("a classification must assert at least one field")
+        return self
+
+
+class AgentClassificationRead(BaseModel):
+    """An agent's entry as the dashboard reads it.
+
+    ``recorded`` is False when no entry has been saved yet — the GET still
+    answers 200 with an empty entry (``intended_purpose`` prefilled from the
+    manifest where there is one) so the form has something to open on, but
+    nothing counts as recorded until the operator PUTs it.
+
+    ``missing_fields`` names what completeness is still waiting on, in a fixed
+    order, so the report and the dashboard agree on the wording.
+    """
+
+    agent_name: str
+    intended_purpose: Optional[str] = None
+    operator_role: Optional[str] = None
+    risk_tier: Optional[str] = None
+    annex_iii_point: Optional[str] = None
+    oversight_owner_name: Optional[str] = None
+    oversight_owner_contact: Optional[str] = None
+    checker_last_update_date: Optional[date] = None
+    recorded: bool
+    recorded_by_user_id: Optional[str] = None
+    recorded_at: Optional[datetime] = None
+    complete: bool
+    missing_fields: list[str] = Field(default_factory=list)
+
+
 class PolicyValidationError(BaseModel):
     """One diagnostic from the policy-document linter.
 
@@ -323,6 +430,10 @@ class PolicyValidationError(BaseModel):
     role: str | None = None
     tool: str | None = None
     line: int | None = None
+    # The SDK finding's severity, when the diagnostic is one (``None`` for a
+    # parse/schema error). A warning can still carry ``error``: an advisory
+    # finding the runtime would stop cold on.
+    severity: str | None = None
     message: str
 
 
@@ -395,15 +506,19 @@ class ResolvedPolicyResponse(BaseModel):
 
 
 class PolicyLintOut(BaseModel):
-    """One analyzer lint, tagged with the role it fired in (None if project-wide)."""
+    """One analyzer lint, tagged with the role and the named agent it fired in
+    (None if project-wide; ``agent`` is also None for the generic ``"*"`` view).
+    A named agent's lint also names it in ``message``."""
 
     code: str
     severity: str
     message: str
     source: str | None = None
+    line: int | None = None
     tier: str | None = None
     tool: str | None = None
     role: str | None = None
+    agent: str | None = None
 
 
 class PolicyCheckResponse(BaseModel):
@@ -411,6 +526,98 @@ class PolicyCheckResponse(BaseModel):
 
     ok: bool
     lints: list[PolicyLintOut] = Field(default_factory=list)
+
+
+# --- Compose file store (entry-file + import graph) --------------------------
+
+
+class PolicyFileRead(BaseModel):
+    name: str  # e.g. "policy.yaml", "caps/refunds.yaml"
+    content: str
+    content_hash: str
+    updated_at: datetime
+
+
+class PolicyFileWrite(BaseModel):
+    """Body for upserting a policy file. The name comes from the URL."""
+
+    content: str
+
+
+class PolicyPreviewRequest(BaseModel):
+    """A draft file to resolve without saving — the editor's live preview. The
+    draft is overlaid on the project's stored files for ``name``."""
+
+    name: str
+    content: str
+    agent: str = "*"
+
+
+class PolicyPreviewResponse(BaseModel):
+    """The effective policy per role for the draft, plus any resolution lints."""
+
+    resolved: dict[str, dict] | None = None
+    lints: list[PolicyLintOut] = Field(default_factory=list)
+
+
+class PolicyGraphNode(BaseModel):
+    """One node in the policy graph: an agent, a tool, an MCP tool, or a role."""
+
+    id: str
+    kind: str  # "agent" | "tool" | "mcp" | "role"
+    label: str
+
+
+class PolicyGraphEdge(BaseModel):
+    """One directed edge: a tool call, an agent→agent reach (``via`` tool/handoff),
+    or a role→agent admission. ``verdict`` is the composed mode; ``constraints`` the
+    per-edge conditions; ``roles`` the roles it appears under."""
+
+    source: str
+    target: str
+    kind: str  # "call" | "reach" | "admission"
+    via: str | None = None  # "tool" | "handoff" (reach only)
+    verdict: str  # "allow" | "approval_required" | "deny"
+    constraints: list[str] = Field(default_factory=list)
+    roles: list[str] = Field(default_factory=list)
+
+
+class PolicyGraphResponse(BaseModel):
+    """Nodes + edges for the resolved-policy graph view, plus every role across
+    all agents (the role picker's options — independent of any role filter)."""
+
+    nodes: list[PolicyGraphNode] = Field(default_factory=list)
+    edges: list[PolicyGraphEdge] = Field(default_factory=list)
+    roles: list[str] = Field(default_factory=list)
+
+
+class PolicyFileDraft(BaseModel):
+    """An unsaved compose file edit, overlaid before test (like the preview draft)."""
+
+    name: str
+    content: str
+
+
+class PolicyTestRequest(BaseModel):
+    """A tool call to evaluate against the resolved policy for ``role`` + ``agent``."""
+
+    role: str
+    # The executing agent, "*" (the generic column) by default — matches
+    # /policy/resolve and /policy/preview so the editor's panels agree.
+    agent: str = "*"
+    tool: str
+    args: dict = Field(default_factory=dict)
+    attributes: dict | None = None
+    draft: PolicyFileDraft | None = None  # reflect an unsaved edit, like preview
+
+
+class PolicyTestResponse(BaseModel):
+    """The gate's verdict for a single evaluated tool call."""
+
+    outcome: str  # "allow" | "deny" | "approval_required"
+    reason: str | None = None
+    violations: list[str] = Field(default_factory=list)
+    hint: str | None = None
 
 
 # --- Agent manifest registration ---------------------------------------------
@@ -441,6 +648,62 @@ class ToolDefinition(BaseModel):
     input_schema: InputSchema
 
 
+class SubagentRef(BaseModel):
+    """A reach edge to a sub-agent (name + via), mirroring the SDK manifest.
+
+    A flat named reference to a sibling agent — ``via`` is ``tool`` (agent-as-tool)
+    or ``handoff`` (control transfer) — not a nested subtree.
+    """
+
+    name: str
+    via: Literal["tool", "handoff"]
+
+
+class SkillResources(BaseModel):
+    """L3 contents of a skill, by name."""
+
+    references: list[str] = Field(default_factory=list)
+    assets: list[str] = Field(default_factory=list)
+    scripts: list[str] = Field(default_factory=list)
+
+
+class SkillDefinition(BaseModel):
+    """One skill available to an agent, as discovered at registration.
+
+    The SDK's caps (MAX_SKILLS, MAX_RESOURCES_PER_SKILL) and its same-name
+    dedupe are deliberately not mirrored: it truncates before it sends, and
+    the platform's job is to accept what it is given. Hashing is no argument
+    either way — ``compute_manifest_hash`` runs over what the platform
+    *parsed*, so it would stay self-consistent under a cap.
+    """
+
+    name: str
+    description: str
+    source: Optional[str] = None
+    # None means the framework does not enumerate resources; an instance with
+    # empty lists means it does and the skill ships none. Do not collapse.
+    resources: Optional[SkillResources] = None
+    allowed_tools: list[str] = Field(default_factory=list)
+    additional_tools: list[str] = Field(default_factory=list)
+    content_hash: Optional[str] = None
+
+
+class GuardDefinition(BaseModel):
+    """A guard declared on an agent, mirroring ``GuardManifest`` in the SDK.
+
+    Surfaced so the platform can show which guards an agent ships with (and govern
+    them by name via the policy ``guards:`` block). ``kind`` is a display hint —
+    a built-in ``hexgate.plugins`` guard vs the developer's own code.
+    """
+
+    name: str
+    position: Literal["before", "after"]
+    tool_names: Optional[list[str]] = None
+    observe: bool = False
+    kind: Literal["official", "custom"]
+    plugin_id: Optional[str] = None
+
+
 class AgentManifest(BaseModel):
     """Schema for the manifest of an agent."""
 
@@ -450,6 +713,16 @@ class AgentManifest(BaseModel):
     model: Optional[str] = None
     system_prompt: Optional[str] = None
     tools: list[ToolDefinition]
+    # Optional-None (not []) so an agent with no sub-agents hashes exactly as before
+    # this field existed (compute_manifest_hash uses exclude_none).
+    subagents: Optional[list[SubagentRef]] = None
+    # None — not [] — when the framework has no skill concept, so
+    # ``compute_manifest_hash`` (exclude_none=True) is unchanged for every
+    # agent that has none.
+    skills: Optional[list[SkillDefinition]] = None
+    # None — not [] — when the agent declares no guards, same hash-continuity reason
+    # (exclude_none); matches the SDK's GuardManifest/AgentManifest.guards default.
+    guards: Optional[list[GuardDefinition]] = None
 
 
 class RegisterAgentRequest(BaseModel):
@@ -543,6 +816,20 @@ class DecisionEvent(AuditEnvelope):
     # against. Advisory: contextvar-sourced and client-assertable, exactly like
     # ``role`` and ``user_id``.
     attributes: Optional[dict] = None
+    # Run attribution — same advisory + client-assertable tier as user_id /
+    # user_roles. Populated from hexgate/security/enforcer.py's run_ns dict;
+    # an SDK that doesn't yet send it, and a decision made outside a run
+    # scope, omit run_id here and the platform substitutes the zero UUID at
+    # insert time (core.clickhouse.ZERO_RUN_ID) — never NULL.
+    run_id: Optional[UUID] = None
+    # Upper bound for the same reason as the usage counters below: the columns
+    # are UInt32, and an over-range value that passes validation is a permanent
+    # insert error the enricher retries forever instead of DLQ-ing the span.
+    run_tool_calls: int = Field(default=0, ge=0, le=UINT32_MAX)
+    run_llm_calls: int = Field(default=0, ge=0, le=UINT32_MAX)
+    run_denials: int = Field(default=0, ge=0, le=UINT32_MAX)
+    run_total_tokens: int = Field(default=0, ge=0, le=UINT32_MAX)
+    run_elapsed_ms: int = Field(default=0, ge=0, le=UINT32_MAX)
 
 
 class LlmInvocationEvent(AuditEnvelope):
@@ -558,6 +845,53 @@ class LlmInvocationEvent(AuditEnvelope):
     latency_ms: int = Field(ge=0, le=UINT32_MAX)
     status: str = Field(default="success", max_length=64)
     error_code: str = Field(default="", max_length=64)
+    # Run attribution — same tier and same zero-UUID-at-insert-time
+    # substitution as DecisionEvent.run_id.
+    run_id: Optional[UUID] = None
+
+
+class LlmMessageEvent(AuditEnvelope):
+    """One LLM call's prompt delta and completion; mirrors the llm_message table.
+
+    The three content fields are the official ``gen_ai.*`` shapes as JSON
+    text, redacted and byte-capped by the enricher before validation. No
+    ``max_length`` here on purpose: the caps truncate, and a bound on this
+    model would turn an over-cap payload into a rejection — the column is an
+    unbounded ``String``, so nothing downstream needs the guard either.
+    """
+
+    model: str = Field(min_length=1, max_length=256)
+    # Identifies the message list this event appends to. One session can hold
+    # several: the main run, each sub-agent and each handoff keeps its own, and
+    # message_seq restarts at 0 in each. The design has the SDK derive it from
+    # the framework's own run identity plus the agent name (see the LLM message
+    # logging spec), which keeps it under agent_name's cap plus an id prefix;
+    # the bound is sized for that, not for a session-wide path.
+    turn_key: str = Field(min_length=1, max_length=512)
+    # Counter within ``turn_key``; UInt32 column, same reasoning as the token
+    # bounds on LlmInvocationEvent.
+    message_seq: int = Field(ge=0, le=UINT32_MAX)
+    # This event restates the whole list (the framework rewrote it) rather
+    # than extending it.
+    resynced: bool = False
+    # Any content field below was cut to its cap — by the SDK before export,
+    # by the enricher, or both.
+    truncated: bool = False
+    input_messages: str
+    output_messages: str
+    system_instructions: str = ""
+    # Run attribution — same tier and same zero-UUID-at-insert-time
+    # substitution as LlmInvocationEvent.run_id, so a transcript stays
+    # attributable to its run when session_id is empty.
+    run_id: Optional[UUID] = None
+
+
+class AgentRunEvent(AuditEnvelope):
+    """One admitted agent run; mirrors the agent_run table."""
+
+    # Required, unlike the other events' run_id: this span only exists inside a
+    # run scope, so a missing id is a malformed span, not an older SDK.
+    run_id: UUID
 
 
 class DecisionAccepted(BaseModel):
@@ -677,12 +1011,56 @@ class AuditDecisionRow(BaseModel):
     hint: Any = None
     arguments: Any = None
     attributes: Any = None
+    # None rather than the zero UUID the column stores for "outside a run".
+    # The drawer passes this to the llm-messages read when session_id is empty.
+    run_id: Optional[UUID] = None
 
 
 class AuditDecisionPage(BaseModel):
     """A page of rows; ``total`` is the unpaginated match count."""
 
     rows: list[AuditDecisionRow]
+    total: int
+    limit: int
+    offset: int
+
+
+class LlmMessageRow(BaseModel):
+    """One row of a session transcript, as the Audit drawer reads it.
+
+    The three content fields are decoded from their stored JSON text, so a
+    caller gets the ``gen_ai.*`` structures rather than strings to parse
+    again; a value that no longer parses comes back as the raw text (see
+    ``decode_json_column``). ``resynced`` / ``truncated`` are the UInt8 flags
+    the reader needs to mark a row as restated history or as lossy.
+    """
+
+    event_id: UUID
+    occurred_at: datetime
+    received_at: datetime
+    agent_name: str
+    agent_version_id: str = ""
+    session_id: str = ""
+    user_id: str = ""
+    model: str
+    turn_key: str
+    message_seq: int
+    resynced: bool = False
+    truncated: bool = False
+    input_messages: Any = None
+    output_messages: Any = None
+    system_instructions: Any = None
+    # None rather than the zero UUID the column stores for "outside a run":
+    # the read surface says absent, it does not hand out a run id that joins
+    # to nothing.
+    run_id: Optional[UUID] = None
+
+
+class LlmMessagePage(BaseModel):
+    """A page of transcript rows, oldest first; ``total`` is the unpaginated
+    match count for the session."""
+
+    rows: list[LlmMessageRow]
     total: int
     limit: int
     offset: int
@@ -725,3 +1103,57 @@ class AuditAnomaly(BaseModel):
     deny_rate: float
     first_seen: datetime
     last_seen: datetime
+
+
+# ---------------------------------------------------------------------------
+# AI Act evidence report (https://app.notion.com/p/3e2fb45dbae281f794fefa40ff4a1a8d)
+# ---------------------------------------------------------------------------
+
+
+class AiActReportCreate(BaseModel):
+    """Generation request. Both bounds optional; the service defaults to the
+    full retention window ending now, and clamps whatever is supplied to what
+    the store can actually hold.
+
+    Field names are ``from``/``to`` on the wire (the spec's body shape) and
+    ``period_start``/``period_end`` in Python, where ``from`` is a keyword.
+    """
+
+    model_config = {"populate_by_name": True}
+
+    period_start: Optional[datetime] = Field(default=None, alias="from")
+    period_end: Optional[datetime] = Field(default=None, alias="to")
+
+
+class AiActReportSummary(BaseModel):
+    """A history row: what was generated, over what, by whom, and its digest.
+
+    ``annex_bytes`` is the signed byte length, not the row's storage size — a
+    verifier checking the digest needs to know how much it should have.
+    """
+
+    id: str
+    project_id: str
+    period_start: datetime
+    period_end: datetime
+    generated_at: datetime
+    # Both nullable: the row's actor FK degrades to NULL when the account is
+    # erased (models.actor_fk_column). The annex itself keeps the attribution
+    # — it is inside the signed bytes — so only this convenience view loses it.
+    generated_by_user_id: Optional[str] = None
+    generated_by_email: Optional[str] = None
+    annex_sha256: str
+    annex_bytes: int
+    annex_filename: str
+    signing_kid: str
+    signature_b64: str
+
+
+class AiActReportRead(AiActReportSummary):
+    """A history row plus the annex itself, parsed.
+
+    The parsed object is a convenience for a renderer; the signature covers the
+    bytes served by the annex download, not a re-serialization of this field.
+    """
+
+    annex: dict

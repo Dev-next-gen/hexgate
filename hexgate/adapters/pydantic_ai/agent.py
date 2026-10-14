@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import (
     AbstractAsyncContextManager,
     AbstractContextManager,
@@ -14,13 +15,20 @@ from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRun, AgentRunResult
 from pydantic_ai.result import StreamedRunResult
 
-from hexgate.adapters._common import abind, bind
-from hexgate.adapters.pydantic_ai.usage import emit_run_usage
+from hexgate.adapters._common import (
+    abind,
+    aprepare_run,
+    bind,
+    prepare_run,
+)
+from hexgate.adapters.pydantic_ai.usage import emit_run_messages, emit_run_usage
 from hexgate.runtime import HexgateContext
 
 if TYPE_CHECKING:
     from hexgate.security.bans import BanGate
     from hexgate.security.binding import PolicyBinding
+
+_log = logging.getLogger(__name__)
 
 
 class HexgatePydanticAgent:
@@ -61,15 +69,6 @@ class HexgatePydanticAgent:
         if self._binding is not None:
             self._binding.refresh()
 
-    async def _check_ban_async(self, context: HexgateContext) -> None:
-        """Refuse a banned agent/user before running, if a gate is attached."""
-        if self._ban_gate is not None:
-            await self._ban_gate.check_async(context)
-
-    def _check_ban(self, context: HexgateContext) -> None:
-        if self._ban_gate is not None:
-            self._ban_gate.check(context)
-
     def _setup_observability(self) -> None:
         """Globally instrument all pydantic_ai Agents (idempotent)."""
         Agent.instrument_all()
@@ -79,17 +78,49 @@ class HexgatePydanticAgent:
     ) -> AbstractAsyncContextManager[None]:
         """Async HexgateContext scope + run facts + Langfuse propagation.
         See :func:`hexgate.adapters._common.abind`."""
-        return abind(context, self._agent_name, self._tag(method))
+        return abind(
+            context, self._agent_name, self._tag(method), api_key=self._api_key
+        )
 
     def _bind(
         self, context: HexgateContext, method: str
     ) -> AbstractContextManager[None]:
         """Sync mirror of :meth:`_abind`."""
-        return bind(context, self._agent_name, self._tag(method))
+        return bind(context, self._agent_name, self._tag(method), api_key=self._api_key)
 
     @staticmethod
     def _tag(method: str) -> str:
         return f"pydantic_ai.agent.{method}"
+
+    def _emit_run_events(self, result: Any, *, completed: bool = True) -> None:
+        """Transcript, and token usage when the run actually finished. Called
+        inside the bound scope, and both resolve the model through the same
+        ``_resolve_model``, so the two rows cannot disagree about it.
+
+        ``completed`` gates them differently. Usage is dropped outright, since
+        pydantic_ai reports 0 tokens until a run ends. The transcript is still
+        emitted — a run someone cut short is the one an incident review asks
+        about — but records no completion, because the last response of an
+        unfinished run is a mid-run tool call rather than an answer. The
+        transcript goes first so a raise while reading usage cannot take it
+        down too.
+
+        Both are guarded: this runs from a ``finally``, where an exception
+        would replace the one the caller is already unwinding.
+        """
+        emit_run_messages(
+            self._agent_name,
+            self._agent,
+            result,
+            api_key=self._api_key,
+            completed=completed,
+        )
+        if not completed:
+            return
+        try:
+            emit_run_usage(self._agent_name, self._agent, result, api_key=self._api_key)
+        except Exception:
+            _log.exception("emit_run_usage raised; ignoring")
 
     async def run(
         self,
@@ -98,11 +129,15 @@ class HexgatePydanticAgent:
         **kwargs: Any,
     ) -> AgentRunResult[Any]:
         """Run the agent asynchronously inside a HexgateContext scope."""
-        await self._refresh_async()
-        await self._check_ban_async(hexgate_context)
+        await aprepare_run(
+            self._refresh_async(),
+            self._ban_gate,
+            hexgate_context,
+            binding=self._binding,
+        )
         async with self._abind(hexgate_context, "run"):
             result = await self._agent.run(*args, **kwargs)
-            emit_run_usage(self._agent_name, self._agent, result, api_key=self._api_key)
+            self._emit_run_events(result)
             return result
 
     def run_sync(
@@ -112,11 +147,15 @@ class HexgatePydanticAgent:
         **kwargs: Any,
     ) -> AgentRunResult[Any]:
         """Run the agent synchronously inside a HexgateContext scope."""
-        self._refresh()
-        self._check_ban(hexgate_context)
+        prepare_run(
+            self._refresh,
+            self._ban_gate,
+            hexgate_context,
+            binding=self._binding,
+        )
         with self._bind(hexgate_context, "run_sync"):
             result = self._agent.run_sync(*args, **kwargs)
-            emit_run_usage(self._agent_name, self._agent, result, api_key=self._api_key)
+            self._emit_run_events(result)
             return result
 
     @asynccontextmanager
@@ -127,20 +166,24 @@ class HexgatePydanticAgent:
         **kwargs: Any,
     ) -> AsyncIterator[StreamedRunResult[Any, Any]]:
         """Stream the agent response asynchronously inside a HexgateContext scope."""
-        await self._refresh_async()
-        await self._check_ban_async(hexgate_context)
+        await aprepare_run(
+            self._refresh_async(),
+            self._ban_gate,
+            hexgate_context,
+            binding=self._binding,
+        )
         async with self._abind(hexgate_context, "run_stream"):
             async with self._agent.run_stream(*args, **kwargs) as result:
-                yield result
-                # Emit usage only if the run completed, not if the caller aborted mid-stream,
-                # because the usage counts from pydantic's side are 0 until the run completes.
-                # This can happen if a user cancels a LLM request mid-response: we will never
-                # know the total number of input / output tokens, however they are still charged by the LLM provider.
-                # This is a known limitation of pydantic_ai's usage reporting, and we will not be able to report usage in this case.
-                if result.is_complete:
-                    emit_run_usage(
-                        self._agent_name, self._agent, result, api_key=self._api_key
-                    )
+                try:
+                    yield result
+                finally:
+                    # In a finally, not after the yield: a caller who cancels or
+                    # whose body raises — a dropped connection, a timeout — is
+                    # how a stream actually gets aborted, and that is the run
+                    # whose prompt an incident review wants. pydantic's counts
+                    # are 0 until the run completes, so usage is still dropped;
+                    # the transcript lands without a completion.
+                    self._emit_run_events(result, completed=result.is_complete)
 
     @asynccontextmanager
     async def iter(
@@ -150,15 +193,18 @@ class HexgatePydanticAgent:
         **kwargs: Any,
     ) -> AsyncIterator[AgentRun[Any, Any]]:
         """Iterate over the agent execution graph asynchronously."""
-        await self._refresh_async()
-        await self._check_ban_async(hexgate_context)
+        await aprepare_run(
+            self._refresh_async(),
+            self._ban_gate,
+            hexgate_context,
+            binding=self._binding,
+        )
         async with self._abind(hexgate_context, "iter"):
             async with self._agent.iter(*args, **kwargs) as run:
-                yield run
-                if run.result is not None:
-                    emit_run_usage(
-                        self._agent_name, self._agent, run, api_key=self._api_key
-                    )
+                try:
+                    yield run
+                finally:
+                    self._emit_run_events(run, completed=run.result is not None)
 
     def __getattr__(self, name: str) -> Any:
         """Delegate unknown attributes to the wrapped agent.

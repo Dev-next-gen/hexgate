@@ -19,22 +19,27 @@ import argparse
 import hashlib
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from pydantic import TypeAdapter, ValidationError
 from yaml.error import MarkedYAMLError
 
 from hexgate.runtime.context import ContextAttributeValue
+
+if TYPE_CHECKING:
+    from hexgate.manifest.models import AgentManifest
+    from hexgate.security.analyzer import PolicyLint
+from hexgate.runtime.agent_usage import AGENT_USAGE_VOCABULARY, KNOWN_AGENT_USAGE_PATHS
 from hexgate.runtime.roles import distinct_roles, resolve_role_set
 from hexgate.runtime.run_facts import KNOWN_RUN_PATHS
-from hexgate.security.testing import run_namespace
 from hexgate.security import (
-    AgentPolicy,
-    DecisionOutcome,
     DEFAULT_AGENT,
     DEFAULT_ROLE_NAME,
+    AgentPolicy,
+    DecisionOutcome,
     OpaNotFoundError,
     PolicySetError,
     SignatureError,
@@ -55,6 +60,7 @@ from hexgate.security import (
     verdict_from_rego,
 )
 from hexgate.security.constraints import ConstraintParseError, parse_constraint
+from hexgate.security.testing import agent_usage_namespace, run_namespace
 
 # Same schema ``HexgateContext.attributes`` enforces at runtime, so a bag the
 # simulator accepts is a bag production can actually produce — including the
@@ -151,11 +157,21 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Parse the YAML and check every constraint against the grammar.",
         description=(
             "Runs the same checks the platform's /validate endpoint does, "
-            "but locally — no network needed. Exits 0 on success, 1 on any "
-            "error (with all errors printed)."
+            "but locally — no network needed. Exits 1 on a parse or build "
+            "error, or on a lint at or above --max-severity; 0 otherwise."
         ),
     )
     p_val.add_argument("source", help="Path to the policy.yaml file.")
+    p_val.add_argument(
+        "--manifest",
+        help=(
+            "Path to the agent's manifest JSON. Enables the manifest lints: a "
+            "guards: rule naming a guard the agent doesn't declare (or declares "
+            "twice), a tool, skill or argument the agent doesn't have, and an "
+            "admission, agents or skills rule reading an argument its gate "
+            "doesn't pass."
+        ),
+    )
     p_val.add_argument(
         "--max-severity",
         choices=_MAX_SEVERITY_CHOICES,
@@ -239,6 +255,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     p_test.add_argument(
+        "--agent-usage",
+        default="{}",
+        help=(
+            "Agent usage as a JSON object, exposed to agent_usage.* constraints "
+            "(e.g. '{\"invocations_1h\": 99}'). Unset paths read zero, matching "
+            "a fresh process. Defaults to {}."
+        ),
+    )
+    p_test.add_argument(
         "--engine",
         choices=("pydantic", "wasm"),
         default="pydantic",
@@ -309,8 +334,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "Links the boundary + capability modules under <dir>/policies/ and "
             "reports authoring problems that don't stop composition but are "
             "almost always mistakes: a capability grant a boundary ceiling makes "
-            "dead, a duplicate grant, or (with --manifest) a rule referencing a "
-            "tool/arg the agent's code doesn't have. Exits non-zero when any lint "
+            "dead, a duplicate grant, a constraint path no call sets, or (with "
+            "--manifest) a rule referencing a tool, skill or arg the agent's code "
+            "doesn't have. Exits non-zero when any lint "
             "is at or above --max-severity, so CI can gate on it."
         ),
     )
@@ -329,8 +355,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         metavar="PATH",
         help=(
-            "Optional AgentManifest JSON. Enables drift checks (unknown tool / "
-            "arg); without it those are skipped."
+            "Optional AgentManifest JSON. Enables drift checks (unknown tool, "
+            "skill or arg, including an admission, agents or skills rule "
+            "reading an argument its gate doesn't pass); without it those are "
+            "skipped."
         ),
     )
     p_check.add_argument(
@@ -468,8 +496,31 @@ def _main_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_manifest(path: str) -> "tuple[AgentManifest | None, str | None]":
+    """Load an ``AgentManifest`` from a JSON file for the manifest-aware commands.
+
+    Returns ``(manifest, None)`` on success or ``(None, error_message)`` — the one
+    place ``validate`` and ``check`` load a manifest, so their error handling can't
+    drift. The manifest package is imported lazily (only these two paths need it)."""
+    from hexgate.manifest.models import AgentManifest
+
+    try:
+        return AgentManifest.model_validate_json(
+            Path(path).read_text(encoding="utf-8")
+        ), None
+    except (OSError, ValidationError, ValueError) as exc:
+        return None, f"manifest error: {exc}"
+
+
 def _main_validate(args: argparse.Namespace) -> int:
-    """Mirror the platform's /validate endpoint, locally."""
+    """Check a single-file policy locally, as ``build`` would compile it.
+
+    The lints come from :func:`analyze_policy`, the same call the platform's
+    /validate makes (R-POL-003). With ``--manifest`` they include the manifest
+    checks too: unknown guards, and tools or arguments the agent doesn't have.
+    Unlike the platform, the ``--max-severity`` gate decides the exit code, so
+    an ``error`` lint fails validate even where the platform would save.
+    """
     source_path = Path(args.source)
     source_text, payload, err = _read_and_parse(source_path)
     if err is not None:
@@ -510,24 +561,30 @@ def _main_validate(args: argparse.Namespace) -> int:
         print(f"policy build: {exc}", file=sys.stderr)
         return 1
 
-    # Warnings, not errors: a permissive ``default`` is legitimate for a
-    # single-role policy. CI opts in with --max-severity warning.
-    from hexgate.security.analyzer import SEVERITY_RANK, check_default_role_exposure
+    from hexgate.security.analyzer import SEVERITY_RANK, analyze_policy
 
-    lints = check_default_role_exposure(policy_set)
+    manifest = None
+    manifest_path = getattr(args, "manifest", None)
+    if manifest_path:
+        manifest, mf_err = _load_manifest(manifest_path)
+        if mf_err is not None:
+            print(mf_err, file=sys.stderr)
+            return 1
+    lints = analyze_policy(policy_set, manifest=manifest, source=str(source_path))
     for lint in lints:
-        print(f"⚠ {lint.code}: {lint.message}", file=sys.stderr)
+        print(_format_lint(lint), file=sys.stderr)
 
-    # Same fold as ``policy check``: the worst lint decides, so a future
-    # ``error``-severity lint gates at the default threshold instead of
-    # slipping through a comparison against a hardcoded "warning".
+    # Each lint's own severity decides, so an ``error``-severity lint gates at
+    # the default threshold instead of slipping through a comparison against
+    # a hardcoded "warning".
     severity = getattr(args, "max_severity", _DEFAULT_MAX_SEVERITY)
     threshold = SEVERITY_RANK[severity]
-    if lints and min(SEVERITY_RANK[lint.severity] for lint in lints) <= threshold:
+    gating = sum(1 for lint in lints if SEVERITY_RANK[lint.severity] <= threshold)
+    if gating:
         # Below the gate on purpose: stdout must not claim a clean policy on a
         # run that exits non-zero.
         print(
-            f"✗ Policy parses, but {len(lints)} lint(s) are at or above "
+            f"✗ Policy parses, but {gating} lint(s) are at or above "
             f"--max-severity {severity}.",
             file=sys.stderr,
         )
@@ -537,11 +594,25 @@ def _main_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+_SEVERITY_ICON = {"error": "✗", "warning": "!", "info": "·"}
+
+
+def _format_lint(lint: PolicyLint) -> str:
+    """One lint as ``validate`` and ``check`` print it: a per-severity icon, so a
+    run that mixes severities shows which lints would fail the gate."""
+    where = f" ({lint.source})" if lint.source else ""
+    role = f" [{lint.role}]" if lint.role else ""
+    agent = f" [agent {lint.agent}]" if lint.agent else ""
+    return f"{_SEVERITY_ICON[lint.severity]} [{lint.code}]{role}{agent} {lint.message}{where}"
+
+
 def _iter_raw_constraints(payload: dict) -> "list[tuple[str, str, str]]":
     """Yield ``(role, tool, raw_constraint)`` over an unvalidated policy payload.
 
     Handles both document shapes: inline-roles (``payload["roles"]``) and the
     flat single-policy form (tools at the top level → the ``default`` role).
+    Constraints with no tool of their own are labelled ``<policy>``
+    (policy-level) or ``<default>`` (the catch-all).
     Defensive against partially-malformed payloads — non-dict tools/specs are
     skipped so the schema validator downstream reports them.
     """
@@ -562,9 +633,10 @@ def _iter_raw_constraints(payload: dict) -> "list[tuple[str, str, str]]":
     for role, spec in specs:
         if not isinstance(spec, dict):
             continue
-        # The role's catch-all policy also carries constraints — report a bad
-        # expression there under "<default>" instead of letting the schema
+        # Policy-level and catch-all constraints have no tool of their own —
+        # report a bad one under a named bucket instead of letting the schema
         # load raise a raw, unlocalized ValidationError.
+        _emit(role, "<policy>", spec)
         _emit(role, "<default>", spec.get("default_policy"))
         tools = spec.get("tools")
         if isinstance(tools, dict):
@@ -606,18 +678,26 @@ def _main_resolve(args: argparse.Namespace) -> int:
     # --file (compose grammar) and --dir (policies/ tree) are the two front-ends;
     # both produce the same ProjectLinkResult, so the print path below is shared.
     if args.file is not None:
-        from hexgate.security.compose import parse_entry, resolve_entry
+        from hexgate.security.compose import file_loader, parse_entry, resolve_entry
 
+        file_path = Path(args.file)
         try:
-            text = Path(args.file).read_text(encoding="utf-8")
+            text = file_path.read_text(encoding="utf-8")
         except OSError as exc:
             print(f"load error: {exc}", file=sys.stderr)
             return 1
         # Parse once: resolve_entry reuses the Entry, and the agent hint below reads
         # its declared agents. resolve_entry surfaces every failure as LinkError.
+        # `import:` refs resolve relative to the entry file's directory (sandboxed).
         try:
             entry = parse_entry(text, source=args.file)
-            result = resolve_entry(entry, agent=args.agent, source=args.file)
+            result = resolve_entry(
+                entry,
+                agent=args.agent,
+                source=args.file,
+                loader=file_loader(file_path.parent),
+                entry_path=file_path.name,
+            )
         except LinkError as exc:
             print(f"link error: {exc}", file=sys.stderr)
             return 1
@@ -754,14 +834,9 @@ def _main_check(args: argparse.Namespace) -> int:
 
     manifest = None
     if args.manifest:
-        from hexgate.manifest.models import AgentManifest
-
-        try:
-            manifest = AgentManifest.model_validate_json(
-                Path(args.manifest).read_text(encoding="utf-8")
-            )
-        except (OSError, ValidationError, ValueError) as exc:
-            print(f"manifest error: {exc}", file=sys.stderr)
+        manifest, mf_err = _load_manifest(args.manifest)
+        if mf_err is not None:
+            print(mf_err, file=sys.stderr)
             return 1
 
     from hexgate.security.analyzer import SEVERITY_RANK
@@ -773,9 +848,10 @@ def _main_check(args: argparse.Namespace) -> int:
     if args.role is not None:
         lints = [lint for lint in lints if lint.role in (args.role, None)]
 
-    # A link error short-circuits before drift/soft lints run, so the
-    # "supply a manifest" hint only makes sense when linking succeeded.
-    linked = not (len(lints) == 1 and lints[0].code == "link-error")
+    # A link error in the "*" column (agent None) short-circuits before drift and
+    # soft lints run, so the "supply a manifest" hint only makes sense without
+    # one. A named agent's link error leaves the rest of the project linted.
+    linked = not any(lint.code == "link-error" and lint.agent is None for lint in lints)
 
     def _drift_hint() -> None:
         if manifest is None and linked:
@@ -789,13 +865,8 @@ def _main_check(args: argparse.Namespace) -> int:
         _drift_hint()
         return 0
 
-    icon = {"error": "✗", "warning": "!", "info": "·"}
     for lint in lints:
-        where = f" ({lint.source})" if lint.source else ""
-        role = f" [{lint.role}]" if lint.role else ""
-        print(
-            f"{icon.get(lint.severity, '·')} [{lint.code}]{role} {lint.message}{where}"
-        )
+        print(_format_lint(lint))
     _drift_hint()
 
     threshold = SEVERITY_RANK[args.max_severity]
@@ -842,6 +913,7 @@ def _main_test(args: argparse.Namespace) -> int:
 
     try:
         run = _resolve_run_facts(getattr(args, "run_facts", "{}"), args.tool)
+        agent_usage = _resolve_agent_usage(getattr(args, "agent_usage", "{}"))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -888,36 +960,75 @@ def _main_test(args: argparse.Namespace) -> int:
 
     if engine == "wasm":
         return _test_via_wasm(
-            payload, roles, args.tool, tool_args, attributes, run, label
+            payload, roles, args.tool, tool_args, attributes, run, agent_usage, label
         )
     return _test_via_pydantic(
-        policy_set, roles, args.tool, tool_args, attributes, run, label
+        policy_set, roles, args.tool, tool_args, attributes, run, agent_usage, label
     )
+
+
+_RUN_FACTS_FLAG = "--run-facts"
+_AGENT_USAGE_FLAG = "--agent-usage"
 
 
 def _resolve_run_facts(raw: str, tool: str) -> dict[str, Any]:
     """Parse ``--run-facts`` over a zeroed run, so an unset path reads zero
-    rather than failing the dry-run closed. Raises :class:`ValueError` with a
-    printable message; the caller renders it."""
+    rather than failing the dry-run closed."""
+    return _resolve_namespace_flag(
+        _RUN_FACTS_FLAG,
+        raw,
+        root="run",
+        known=KNOWN_RUN_PATHS,
+        vocabulary=", ".join(sorted(KNOWN_RUN_PATHS)),
+        build=lambda **values: run_namespace(tool, **values),
+    )
+
+
+def _resolve_agent_usage(raw: str) -> dict[str, int]:
+    """Parse ``--agent-usage`` over a fresh process's zeros, so an unset path reads
+    zero rather than failing the dry-run closed."""
+    return _resolve_namespace_flag(
+        _AGENT_USAGE_FLAG,
+        raw,
+        root="agent_usage",
+        known=KNOWN_AGENT_USAGE_PATHS,
+        vocabulary=AGENT_USAGE_VOCABULARY,
+        build=agent_usage_namespace,
+    )
+
+
+def _resolve_namespace_flag[T](
+    flag: str,
+    raw: str,
+    *,
+    root: str,
+    known: frozenset[str],
+    vocabulary: str,
+    build: Callable[..., T],
+) -> T:
+    """Parse a JSON-object flag into ``build(**values)``. Raises
+    :class:`ValueError` with a printable message; the caller renders it."""
     try:
         parsed: Any = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"--run-facts is not valid JSON: {exc}") from exc
+        raise ValueError(f"{flag} is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
-        raise ValueError("--run-facts must be a JSON object (dict).")
-    unknown = sorted(set(parsed) - KNOWN_RUN_PATHS)
+        raise ValueError(f"{flag} must be a JSON object (dict).")
+    # Checked here although the builders check too: they raise one ValueError for
+    # unknown and wrong-typed alike, and a typo is not a wrong type.
+    unknown = sorted(set(parsed) - known)
     if unknown:
         raise ValueError(
-            f"--run-facts has unknown run.* path(s) {unknown} "
-            f"(this build knows: {', '.join(sorted(KNOWN_RUN_PATHS))})"
+            f"{flag} has unknown {root}.* path(s) {unknown} "
+            f"(this build knows: {vocabulary})"
         )
     try:
-        return run_namespace(tool, **parsed)
+        return build(**parsed)
     except ValueError as exc:
-        # Re-raised against the flag: a wrong-typed value otherwise fails the
-        # comparison closed and prints as an ordinary threshold trip, so the
-        # dry-run answers a question the user did not ask.
-        raise ValueError(f"--run-facts has a wrong-typed value: {exc}") from exc
+        # Re-raised against the flag: a wrong-typed or negative value otherwise
+        # fails the comparison closed or reads as no usage, so the dry-run answers
+        # a question the user did not ask.
+        raise ValueError(f"{flag} has an invalid value: {exc}") from exc
 
 
 def _resolve_test_roles(args: argparse.Namespace) -> list[str]:
@@ -971,6 +1082,7 @@ def _test_via_pydantic(
     tool_args: dict,
     attributes: dict,
     run: dict,
+    agent_usage: dict,
     label: str,
 ) -> int:
     """Run the decision through the in-process constraint evaluator.
@@ -981,10 +1093,16 @@ def _test_via_pydantic(
 
     def evaluate(role: str | None) -> Verdict:
         policy: AgentPolicy = policy_set.policy_for(role)
-        # Forward role/attributes/run so their constraints decide the same as
-        # production — omitting any makes the dry-run fail closed.
+        # Forward role/attributes/run/agent_usage so their constraints decide the
+        # same as production — omitting any makes the dry-run fail closed.
         return evaluate_tool_call(
-            policy, tool, tool_args, role=role, attributes=attributes, run=run
+            policy,
+            tool,
+            tool_args,
+            role=role,
+            attributes=attributes,
+            run=run,
+            agent_usage=agent_usage,
         )
 
     verdict, deciding_role = combine_role_verdicts(
@@ -1000,6 +1118,7 @@ def _test_via_wasm(
     tool_args: dict,
     attributes: dict,
     run: dict,
+    agent_usage: dict,
     label: str,
 ) -> int:
     """Compile to wasm on the fly + evaluate — matches production semantics."""
@@ -1024,7 +1143,12 @@ def _test_via_wasm(
         # ``None`` maps to the default role, mirroring PolicyBundle.evaluate.
         role_ = role or DEFAULT_ROLE_NAME
         decision = wasm_policy.decide(
-            role=role_, tool=tool, args=tool_args, ctx=attributes, run=run
+            role=role_,
+            tool=tool,
+            args=tool_args,
+            ctx=attributes,
+            run=run,
+            agent_usage=agent_usage,
         )
         return verdict_from_rego(decision, tool_name=tool, role=role_)
 

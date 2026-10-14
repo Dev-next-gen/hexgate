@@ -45,9 +45,13 @@ import (
 
 // Defaults for the revocation cache. The 15-30s poll window comes from the
 // design doc; 20s sits in the middle of it.
+//
+// max_staleness bounds only how long a snapshot may go UN-REFRESHED, so a value
+// under the length of routine control-plane maintenance turns a database blip
+// into total ingest rejection. Keep in lockstep with config.yaml's literals.
 const (
 	defaultPollInterval = 20 * time.Second
-	defaultMaxStaleness = 2 * time.Minute
+	defaultMaxStaleness = time.Hour
 )
 
 // devPostgresPassword is the committed local-dev credential from
@@ -75,8 +79,10 @@ type Config struct {
 
 // RevocationConfig controls the in-process cache of live API keys.
 //
-// Revoking a key deletes its row (see tokens/service.py:delete_api_key), so
-// "revoked" means "no longer in the table" — a lookup miss, not a flag.
+// Revoking a key soft-deletes its row (see tokens/service.py:revoke_api_key),
+// stamping revoked_at so the row survives as the audit record. The snapshot
+// query filters those rows out (cache.go:apiKeyQuery), so "revoked" is still a
+// lookup MISS in the cache — the flag lives in Postgres, never in memory here.
 type RevocationConfig struct {
 	// Enabled turns the revocation check on. Defaults to true: a Collector
 	// that only checks signatures would honour a leaked API key forever,

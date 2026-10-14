@@ -4,23 +4,33 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from datetime import datetime, timezone
 
 import pytest
 
 from hexgate.tracing import semconv
 from hexgate_api.jobs.enricher.coerce import SpanRejected
-from hexgate_api.jobs.enricher.mapping import map_span
+from hexgate_api.jobs.enricher.mapping import (
+    KNOWN_SCOPES,
+    _envelope,
+    _message_fields,
+    map_span,
+)
 from hexgate_api.schemas import (
     UINT32_MAX,
+    AgentRunEvent,
     BanEnforcementEvent,
     DecisionEvent,
     LlmInvocationEvent,
+    LlmMessageEvent,
 )
 from tests.jobs.enricher.conftest import (
     ban_attrs,
     decision_attrs,
     make_span,
+    message_attrs,
+    run_attrs,
     usage_attrs,
 )
 
@@ -146,3 +156,332 @@ def test_when_agent_name_is_absent_then_resource_service_name_is_used() -> None:
         semconv.SCOPE_AUDIT, make_span(attrs), {"service.name": "svc-agent"}
     )
     assert event.agent_name == "svc-agent"
+
+
+# --- run attribution: the SDK↔platform contract -----------------------------
+
+
+def test_map_span_carries_run_attribution() -> None:
+    run_id = str(uuid.uuid4())
+    attrs = decision_attrs(
+        **{
+            semconv.RUN_ID: run_id,
+            semconv.RUN_TOOL_CALLS: 3,
+            semconv.RUN_LLM_CALLS: 2,
+            semconv.RUN_DENIALS: 1,
+            semconv.RUN_TOTAL_TOKENS: 1200,
+            semconv.RUN_ELAPSED_MS: 4500,
+        }
+    )
+
+    event = map_span(semconv.SCOPE_AUDIT, make_span(attrs), {})
+
+    assert str(event.run_id) == run_id
+    assert event.run_tool_calls == 3
+    assert event.run_llm_calls == 2
+    assert event.run_denials == 1
+    assert event.run_total_tokens == 1200
+    assert event.run_elapsed_ms == 4500
+
+
+def test_when_run_attributes_are_absent_then_counters_default_to_zero() -> None:
+    """A span from an emitter that predates the run namespace still maps."""
+    event = map_span(semconv.SCOPE_AUDIT, make_span(decision_attrs()), {})
+
+    assert event.run_id is None
+    assert event.run_tool_calls == 0
+    assert event.run_elapsed_ms == 0
+
+
+def test_sdk_decision_span_validates_in_and_out_of_a_run_scope() -> None:
+    """The cross-package contract, asserted against the real SDK emitter — the
+    only place both halves of the wire shape meet.
+
+    Out of a run scope the SDK omits ``RUN_ID``: OTLP cannot carry null, and an
+    empty string would DLQ the whole record rather than its attribution.
+    """
+    from hexgate.audit import AuditEvent
+    from hexgate.security.decision import Decision, DecisionOutcome, RunAttribution
+
+    run_id = str(uuid.uuid4())
+    attributed = AuditEvent(
+        decision=Decision(
+            outcome=DecisionOutcome.DENY,
+            agent_name="example_agent",
+            tool_name="read_file",
+            run=RunAttribution(
+                run_id=run_id,
+                tool_calls=3,
+                llm_calls=2,
+                denials=1,
+                total_tokens=1200,
+                elapsed_ms=4500,
+            ),
+        )
+    ).span_attributes()
+    detached = AuditEvent(
+        decision=Decision(
+            outcome=DecisionOutcome.ALLOW,
+            agent_name="example_agent",
+            tool_name="read_file",
+        )
+    ).span_attributes()
+
+    in_run = map_span(semconv.SCOPE_AUDIT, make_span(attributed), {})
+    out_of_run = map_span(semconv.SCOPE_AUDIT, make_span(detached), {})
+
+    assert str(in_run.run_id) == run_id
+    assert in_run.run_tool_calls == 3
+    assert in_run.run_llm_calls == 2
+    assert in_run.run_denials == 1
+    assert in_run.run_total_tokens == 1200
+    assert in_run.run_elapsed_ms == 4500
+    assert out_of_run.run_id is None
+    assert out_of_run.run_tool_calls == 0
+
+
+def test_sdk_clamps_an_overflowing_run_counter_into_a_span_this_side_accepts() -> None:
+    """The other half of the counter contract.
+
+    Counters are monotone within a run, so an unclamped overflow would not cost
+    one row: every later decision for that run would fail the same validator and
+    DLQ, taking the tail of the trail with it. The SDK clamps at projection so
+    the run stays observable; ``le=UINT32_MAX`` here stays the backstop for a
+    foreign emitter.
+    """
+    from hexgate.audit import AuditEvent
+    from hexgate.security.decision import Decision, DecisionOutcome, RunAttribution
+
+    attrs = AuditEvent(
+        decision=Decision(
+            outcome=DecisionOutcome.ALLOW,
+            agent_name="example_agent",
+            tool_name="read_file",
+            run=RunAttribution.from_namespace(
+                {
+                    "id": str(uuid.uuid4()),
+                    "total_tokens": UINT32_MAX + 1,
+                    "elapsed_seconds": 1e9,
+                }
+            ),
+        )
+    ).span_attributes()
+
+    event = map_span(semconv.SCOPE_AUDIT, make_span(attrs), {})
+
+    assert event.run_total_tokens == UINT32_MAX
+    assert event.run_elapsed_ms == UINT32_MAX
+
+
+def test_sdk_usage_span_validates_in_and_out_of_a_run_scope() -> None:
+    """Same contract for llm_invocation.run_id, which joins usage rows to the
+    policy_decision rows of the same invocation."""
+    from hexgate.tracing.usage import LlmUsageEvent
+
+    def _event(**overrides: object) -> LlmUsageEvent:
+        base = dict(
+            agent_name="a",
+            model="gpt-4o",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            status="success",
+        )
+        return LlmUsageEvent(**{**base, **overrides})
+
+    run_id = str(uuid.uuid4())
+    attributed = map_span(
+        semconv.SCOPE_USAGE, make_span(_event(run_id=run_id).span_attributes()), {}
+    )
+    detached = map_span(semconv.SCOPE_USAGE, make_span(_event().span_attributes()), {})
+
+    assert str(attributed.run_id) == run_id
+    assert detached.run_id is None
+
+
+# --- LLM messages ---------------------------------------------------------------
+#
+# The field tests below call ``_message_fields()`` directly (they predate the
+# scope's acceptance); ``map_span`` dispatch has its own test.
+
+
+def _message_event(attrs: dict[str, object]) -> LlmMessageEvent:
+    scope = semconv.SCOPE_MESSAGES
+    span = make_span(attrs)
+    payload = _envelope(span, attrs, {}, scope) | _message_fields(attrs, scope)
+    return LlmMessageEvent(**payload)
+
+
+def test_when_scope_is_messages_then_map_span_builds_an_llm_message_event() -> None:
+    """Accepted in the same change as its consumer bucket: a scope in
+    KNOWN_SCOPES without a bucket would be validated and dropped silently."""
+    assert semconv.SCOPE_MESSAGES in KNOWN_SCOPES
+    attrs = message_attrs()
+
+    event = map_span(semconv.SCOPE_MESSAGES, make_span(attrs), {})
+
+    assert isinstance(event, LlmMessageEvent)
+    assert str(event.event_id) == attrs[semconv.EVENT_ID]
+    assert event.turn_key == "run_1:researcher"
+    assert event.message_seq == 0
+
+
+def test_when_a_message_span_is_invalid_then_map_span_rejects_it() -> None:
+    attrs = message_attrs()
+    del attrs[semconv.TURN_KEY]
+    with pytest.raises(SpanRejected) as exc:
+        map_span(semconv.SCOPE_MESSAGES, make_span(attrs), {})
+    assert exc.value.error_class == "validation"
+    assert exc.value.scope == semconv.SCOPE_MESSAGES
+
+
+def test_message_fields_happy_path() -> None:
+    attrs = message_attrs(
+        **{
+            semconv.SESSION_ID: "sess_1",
+            semconv.MESSAGE_SEQ: 3,
+            semconv.GEN_AI_SYSTEM_INSTRUCTIONS: json.dumps(
+                [{"type": "text", "content": "Be terse."}]
+            ),
+            semconv.RESYNCED: True,
+        }
+    )
+    event = _message_event(attrs)
+
+    assert event.model == "gpt-4o"
+    assert event.session_id == "sess_1"
+    assert event.turn_key == "run_1:researcher"
+    assert event.message_seq == 3
+    assert event.resynced is True
+    assert event.truncated is False
+    assert json.loads(event.input_messages) == json.loads(
+        attrs[semconv.GEN_AI_INPUT_MESSAGES]
+    )
+    assert json.loads(event.output_messages) == json.loads(
+        attrs[semconv.GEN_AI_OUTPUT_MESSAGES]
+    )
+    assert json.loads(event.system_instructions) == [
+        {"type": "text", "content": "Be terse."}
+    ]
+
+
+def test_when_optional_message_attributes_are_absent_then_defaults() -> None:
+    # The SDK omits system_instructions after a turn_key's first event and
+    # omits the flags when false; the row must still validate.
+    event = _message_event(message_attrs())
+    assert event.system_instructions == ""
+    assert event.resynced is False
+    assert event.truncated is False
+    assert event.session_id == ""
+
+
+def test_when_message_span_carries_run_id_then_kept_else_none() -> None:
+    # Same contract as llm_invocation.run_id: joins a transcript to its run
+    # when session_id is empty; absent on the wire, never "".
+    run_id = str(uuid.uuid4())
+    attributed = _message_event(message_attrs(**{semconv.RUN_ID: run_id}))
+    detached = _message_event(message_attrs())
+    assert str(attributed.run_id) == run_id
+    assert detached.run_id is None
+
+
+def test_when_a_flag_is_not_a_bool_then_validation_fails() -> None:
+    # No coercer of our own: the raw attribute reaches the model, and Pydantic
+    # rejects what it cannot read as a bool — a DLQ reject via map_span.
+    with pytest.raises(ValueError):
+        _message_event(message_attrs(**{semconv.RESYNCED: "maybe"}))
+
+
+def test_when_sdk_marked_the_event_truncated_then_the_flag_is_kept() -> None:
+    # This side cut nothing, but the SDK did before export: the stored row
+    # must not claim to be the whole message.
+    event = _message_event(message_attrs(**{semconv.TRUNCATED: True}))
+    assert event.truncated is True
+
+
+def test_when_input_messages_exceed_cap_then_stored_short_and_flagged() -> None:
+    big = [{"role": "user", "parts": [{"type": "text", "content": "x" * 300_000}]}]
+    attrs = message_attrs(**{semconv.GEN_AI_INPUT_MESSAGES: json.dumps(big)})
+    event = _message_event(attrs)
+    assert event.truncated is True
+    assert len(event.input_messages.encode("utf-8")) <= 256 * 1024
+    assert "...[truncated " in event.input_messages
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        semconv.GEN_AI_REQUEST_MODEL,
+        semconv.TURN_KEY,
+        semconv.MESSAGE_SEQ,
+        semconv.GEN_AI_INPUT_MESSAGES,
+        semconv.GEN_AI_OUTPUT_MESSAGES,
+    ],
+)
+def test_when_a_required_message_attribute_is_absent_then_span_rejected(
+    missing: str,
+) -> None:
+    attrs = message_attrs()
+    del attrs[missing]
+    with pytest.raises(SpanRejected) as exc:
+        _message_fields(attrs, semconv.SCOPE_MESSAGES)
+    assert exc.value.error_class == "validation"
+
+
+def test_when_input_messages_json_is_invalid_then_span_rejected() -> None:
+    attrs = message_attrs(**{semconv.GEN_AI_INPUT_MESSAGES: "[broken"})
+    with pytest.raises(SpanRejected):
+        _message_fields(attrs, semconv.SCOPE_MESSAGES)
+
+
+def test_when_message_seq_exceeds_uint32_then_validation_fails() -> None:
+    attrs = message_attrs(**{semconv.MESSAGE_SEQ: UINT32_MAX + 1})
+    with pytest.raises(ValueError):
+        _message_event(attrs)
+
+
+# --- Agent runs -----------------------------------------------------------------
+
+
+def test_when_scope_is_runs_then_map_span_builds_an_agent_run_event() -> None:
+    """Its own branch, not the bans fall-through: there it would be rejected
+    for a missing ban_type."""
+    assert semconv.SCOPE_RUNS in KNOWN_SCOPES
+    attrs = run_attrs(**{semconv.SESSION_ID: "sess_1", semconv.USER_ID: "user_1"})
+
+    event = map_span(semconv.SCOPE_RUNS, make_span(attrs), {})
+
+    assert isinstance(event, AgentRunEvent)
+    assert str(event.event_id) == attrs[semconv.EVENT_ID]
+    assert str(event.run_id) == attrs[semconv.RUN_ID]
+    assert (event.session_id, event.user_id) == ("sess_1", "user_1")
+
+
+def test_when_a_run_span_has_no_run_id_then_span_rejected() -> None:
+    attrs = run_attrs()
+    del attrs[semconv.RUN_ID]
+    with pytest.raises(SpanRejected) as exc:
+        map_span(semconv.SCOPE_RUNS, make_span(attrs), {})
+    assert exc.value.error_class == "validation"
+    assert exc.value.scope == semconv.SCOPE_RUNS
+
+
+def test_when_a_run_span_run_id_is_not_a_uuid_then_span_rejected() -> None:
+    attrs = run_attrs(**{semconv.RUN_ID: "not-a-uuid"})
+    with pytest.raises(SpanRejected) as exc:
+        map_span(semconv.SCOPE_RUNS, make_span(attrs), {})
+    assert exc.value.error_class == "validation"
+
+
+def test_sdk_run_start_span_validates() -> None:
+    """The SDK's own event, not a hand-built dict, so the two sides can't drift."""
+    from hexgate.tracing.runs import RunStartEvent
+
+    run_id = str(uuid.uuid4())
+    sdk_event = RunStartEvent(agent_name="a", run_id=run_id, user_id="u")
+
+    event = map_span(semconv.SCOPE_RUNS, make_span(sdk_event.span_attributes()), {})
+
+    assert isinstance(event, AgentRunEvent)
+    assert event.event_id == sdk_event.event_id
+    assert str(event.run_id) == run_id

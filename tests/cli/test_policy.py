@@ -15,12 +15,10 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-
-from hexgate.security import analyzer
-from hexgate.security.analyzer import PolicyLint
 
 from hexgate.cli.policy.main import (
     _main_build,
@@ -30,6 +28,8 @@ from hexgate.cli.policy.main import (
     _main_test,
     _main_validate,
 )
+from hexgate.security import analyzer
+from hexgate.security.analyzer import PolicyLint
 
 _OPA_AVAILABLE = shutil.which("opa") is not None
 needs_opa = pytest.mark.skipif(
@@ -130,6 +130,30 @@ def test_resolve_file_unknown_agent_warns(
     assert "bott" in err and "not defined" in err
 
 
+def test_resolve_file_resolves_imports_relative_to_the_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `resolve --file` must resolve import: refs against the entry file's dir.
+    (tmp_path / "caps.yaml").write_text(
+        "export:\n  refunds:\n    tools: { refund_order: { mode: allow } }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "policy.yaml").write_text(
+        "import: [ caps.yaml#refunds ]\n", encoding="utf-8"
+    )
+    rc = _main_resolve(
+        _ns(
+            dir=".",
+            file=str(tmp_path / "policy.yaml"),
+            agent="*",
+            role=None,
+            output=None,
+        )
+    )
+    assert rc == 0
+    assert "refund_order" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # validate
 # ---------------------------------------------------------------------------
@@ -188,6 +212,23 @@ def test_validate_reports_constraint_error_in_default_policy(
     err = capsys.readouterr().err
     assert rc == 1
     assert "default → <default>" in err
+    assert "no recognised operator" in err
+
+
+def test_validate_reports_constraint_error_at_the_policy_level(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A policy-level constraint has no tool of its own, so it is reported
+    under ``<policy>`` rather than as a raw schema ValidationError."""
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        "version: 1\nroles:\n  default:\n    constraints:\n      - args.amount ~~ 50\n",
+        encoding="utf-8",
+    )
+    rc = _main_validate(_ns(source=str(bad)))
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "default → <policy>" in err
     assert "no recognised operator" in err
 
 
@@ -255,6 +296,166 @@ def test_validate_handles_malformed_yaml(
     assert rc == 1
     assert "YAML parse error" in err
     assert "line" in err.lower()
+
+
+def _guarded_policy(tmp_path: Path) -> Path:
+    p = tmp_path / "guarded.yaml"
+    p.write_text(
+        "tools:\n  send_email: { mode: allow }\nguards:\n  ghost_guard: { enabled: false }\n",
+        encoding="utf-8",
+    )
+    return p
+
+
+# The tool ``_guarded_policy`` grants, so its manifest checks see no drift.
+_SEND_EMAIL_TOOL = {
+    "name": "send_email",
+    "description": "Send an email.",
+    "input_schema": {"properties": {}, "required": []},
+}
+
+
+def _manifest_file(
+    tmp_path: Path,
+    *,
+    guards: Sequence[dict] = (),
+    tools: Sequence[dict] = (_SEND_EMAIL_TOOL,),
+) -> Path:
+    m = tmp_path / "manifest.json"
+    m.write_text(
+        json.dumps(
+            {
+                "name": "bot",
+                "framework": "hexgate",
+                "tools": list(tools),
+                "guards": list(guards),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return m
+
+
+def test_validate_manifest_flags_unknown_guard(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`validate --manifest` fails when a guards: rule names an undeclared guard: it
+    is an error (the runtime stops cold), so it gates even at the default threshold."""
+    policy = _guarded_policy(tmp_path)
+    manifest = _manifest_file(
+        tmp_path,
+        guards=[{"name": "secret_guard", "position": "before", "kind": "official"}],
+    )
+    rc = _main_validate(
+        _ns(source=str(policy), manifest=str(manifest), max_severity="error")
+    )
+    err = capsys.readouterr().err
+    assert rc == 1  # error, gates at the default threshold
+    assert "unknown-guard" in err
+    assert "ghost_guard" in err
+
+
+def test_validate_manifest_clean_when_guard_declared(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    policy = _guarded_policy(tmp_path)
+    manifest = _manifest_file(
+        tmp_path,
+        guards=[{"name": "ghost_guard", "position": "before", "kind": "custom"}],
+    )
+    rc = _main_validate(
+        _ns(source=str(policy), manifest=str(manifest), max_severity="warning")
+    )
+    assert rc == 0
+    assert "parses cleanly" in capsys.readouterr().out
+
+
+def test_when_roles_disagree_on_guards_then_validate_reports_guard_divergence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Manifest-free: building a guarded agent from this policy raises, so it
+    # gates at the default threshold without --manifest.
+    policy = tmp_path / "divergent.yaml"
+    policy.write_text(
+        "version: 1\n"
+        "roles:\n"
+        "  default:\n    guards: { g: { enabled: false } }\n"
+        "  admin:\n    guards: { g: { enabled: true } }\n",
+        encoding="utf-8",
+    )
+    rc = _main_validate(_ns(source=str(policy), max_severity="error"))
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "guard-divergence" in captured.err
+    assert "parses cleanly" not in captured.out
+
+
+def test_when_manifest_lacks_a_tool_or_arg_then_validate_reports_drift(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    policy = tmp_path / "drift.yaml"
+    policy.write_text(
+        "tools:\n"
+        "  refund: { mode: allow, constraints: ['args.amont < 5'] }\n"
+        "  refnd: { mode: allow }\n",
+        encoding="utf-8",
+    )
+    refund = {
+        "name": "refund",
+        "description": "Refund an order.",
+        "input_schema": {
+            "properties": {"amount": {"title": "Amount", "type": "number"}},
+            "required": ["amount"],
+        },
+    }
+    manifest = _manifest_file(tmp_path, tools=[refund])
+
+    assert _main_validate(_ns(source=str(policy), max_severity="warning")) == 0
+    assert "unknown-" not in capsys.readouterr().err
+
+    rc = _main_validate(
+        _ns(source=str(policy), manifest=str(manifest), max_severity="warning")
+    )
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "unknown-tool" in err and "refnd" in err
+    assert "unknown-arg" in err and "amont" in err
+
+
+def _mixed_drift_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> tuple[int, list[str]]:
+    """Validate a policy whose drift spans severities: a grant on a missing tool
+    (warning), a deny on one (info), and an arg typo that fails closed (warning)."""
+    policy = tmp_path / "mixed.yaml"
+    policy.write_text(
+        "tools:\n"
+        "  refnd: { mode: allow }\n"
+        "  wipe: { mode: deny }\n"
+        "  send_email: { mode: allow, constraints: ['args.too == \"a\"'] }\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest_file(tmp_path)
+    rc = _main_validate(
+        _ns(source=str(policy), manifest=str(manifest), max_severity="warning")
+    )
+    return rc, capsys.readouterr().err.splitlines()
+
+
+def test_when_lints_mix_severities_then_validate_counts_only_those_at_the_gate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, err = _mixed_drift_run(tmp_path, capsys)
+    assert rc == 1
+    assert err[-1].startswith("✗ Policy parses, but 2 lint(s) are at or above")
+
+
+def test_when_lints_mix_severities_then_validate_marks_each_with_its_severity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, err = _mixed_drift_run(tmp_path, capsys)
+    marks = sorted(line.split("]")[0] + "]" for line in err[:-1])
+    assert marks == ["! [unknown-arg]", "! [unknown-tool]", "· [unknown-tool]"]
 
 
 # ---------------------------------------------------------------------------
@@ -1173,14 +1374,13 @@ def test_validate_gates_on_each_lint_severity_not_a_hardcoded_one(
 ) -> None:
     """The default threshold gates on the lint's own severity.
 
-    Only ``check_default_role_exposure``'s warnings exist today, so an
-    ``error``-severity lint slipping through the default threshold would be
-    invisible until the first one is written.
+    Stubbed so each severity is exercised on the same policy, whichever
+    checks happen to emit it today.
     """
     p = tmp_path / "clean.yaml"
     p.write_text(_MULTI_ROLE_POLICY, encoding="utf-8")
     monkeypatch.setattr(
-        analyzer, "check_default_role_exposure", lambda _: _lint_of_severity(severity)
+        analyzer, "analyze_policy", lambda *_, **__: _lint_of_severity(severity)
     )
 
     assert _main_validate(_ns(source=str(p), max_severity="error")) == expected_rc
@@ -1347,7 +1547,7 @@ def test_test_rejects_a_wrong_typed_run_fact(
     )
     out, err = capsys.readouterr()
     assert rc == 1
-    assert "--run-facts has a wrong-typed value" in err
+    assert "--run-facts has an invalid value" in err
     assert "DENY" not in out
 
 
@@ -1365,3 +1565,95 @@ def test_test_reports_an_unknown_run_path_in_the_policy_itself(
     )
     assert rc == 1
     assert "unknown run.* path 'elapsed_secondz'" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# `policy test --agent-usage` — dry-running a cross-run quota
+# ---------------------------------------------------------------------------
+
+
+_USAGE_GATED_POLICY = """\
+version: 1
+admission:
+  mode: allow
+  constraints:
+    - agent_usage.invocations_1h < 100
+"""
+
+
+def _usage_gated(tmp_path: Path) -> str:
+    p = tmp_path / "usage.yaml"
+    p.write_text(_USAGE_GATED_POLICY, encoding="utf-8")
+    return str(p)
+
+
+def _test_admission(source: str, **flags: str) -> int:
+    return _main_test(
+        _ns(
+            source=source,
+            role="default",
+            tool="agent.run",
+            args='{"agent": "a"}',
+            engine=flags.pop("engine", "pydantic"),
+            **flags,
+        )
+    )
+
+
+def test_test_defaults_to_a_fresh_process_rather_than_a_missing_namespace(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _test_admission(_usage_gated(tmp_path)) == 0
+    assert "ALLOW" in capsys.readouterr().out
+
+
+def test_test_agent_usage_fires_the_cap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = _test_admission(_usage_gated(tmp_path), agent_usage='{"invocations_1h": 100}')
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "DENY" in out
+    assert "agent_usage.invocations_1h < 100" in out
+
+
+@needs_opa
+@pytest.mark.parametrize(("usage", "expected"), [("99", 0), ("100", 1)])
+def test_test_agent_usage_agrees_across_engines(
+    tmp_path: Path, usage: str, expected: int
+) -> None:
+    source = _usage_gated(tmp_path)
+    codes = [
+        _test_admission(
+            source, agent_usage=f'{{"invocations_1h": {usage}}}', engine=engine
+        )
+        for engine in ("pydantic", "wasm")
+    ]
+
+    assert codes == [expected, expected]
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("not json", "--agent-usage is not valid JSON"),
+        ("[1]", "--agent-usage must be a JSON object (dict)"),
+        (
+            '{"invocation_1h": 1}',
+            "--agent-usage has unknown agent_usage.* path(s) ['invocation_1h']",
+        ),
+        ('{"invocations_1h": "1"}', "--agent-usage has an invalid value"),
+        ('{"invocations_1h": -1}', "--agent-usage has an invalid value"),
+    ],
+    ids=["non-json", "non-object", "unknown-path", "wrong-type", "negative"],
+)
+def test_test_rejects_a_bad_agent_usage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], raw: str, message: str
+) -> None:
+    rc = _test_admission(_usage_gated(tmp_path), agent_usage=raw)
+
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert message in err
+    assert "DENY" not in out

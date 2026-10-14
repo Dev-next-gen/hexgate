@@ -39,6 +39,7 @@ from hexgate.security.models import (
     FileToolPolicy,
     ToolPolicy,
     is_agent_key,
+    is_skill_key,
 )
 from hexgate.security.modules import (
     DEFAULT_AGENT,
@@ -127,6 +128,20 @@ def resolve_role_map(
     return resolved
 
 
+def named_agent_roles(
+    roles: RoleMatrix | Mapping[str, Sequence[str]] | None,
+) -> dict[str, set[str]]:
+    """Each named agent (not ``"*"``) with the roles whose cell it defines: the
+    roles where :func:`resolve_role_map` uses the agent's own cell instead of
+    falling back to ``"*"``. A legacy flat binding names no agent."""
+    named: dict[str, set[str]] = {}
+    for role, cells in (roles or {}).items():
+        if isinstance(cells, Mapping):
+            for agent in cells.keys() - {DEFAULT_AGENT}:
+                named.setdefault(agent, set()).add(role)
+    return named
+
+
 def resolve_for_project(
     boundaries: list[ModuleContent],
     library: list[ModuleContent],
@@ -180,6 +195,11 @@ def effective_policy_by_role(
     narrows to a subset in the given order; ``None`` yields every role, sorted.
     """
     names = sorted(result.by_role) if roles is None else list(roles)
+    # Empty `guards` maps and an unset `usage` block are dropped by
+    # AgentPolicy/BaseToolPolicy's own serializer (R-GUARD-006), so a guards-free,
+    # usage-free resolved policy dumps byte-identically here and
+    # in every other dump path (the CLI's single-role/`--role` forms, tests) — no
+    # source_hash drift, no per-call-site strip to keep in sync.
     return {
         name: result.by_role[name].effective[DEFAULT_ROLE_NAME].model_dump(mode="json")
         for name in names
@@ -195,8 +215,9 @@ def _reject_capability_denies(capabilities: Sequence[ModuleContent]) -> None:
     hoisted here and run over every capability, bound or not.
     """
     for cap in capabilities:
-        # effective_tools, so a capability that denies an agent key (a lowered
-        # agents:/admission deny) is caught too — capabilities grant only.
+        # effective_tools, so a capability that denies an agent or skill key (a
+        # lowered agents:/admission/skills deny) is caught too — capabilities grant
+        # only.
         for tool, tp in cap.policy.effective_tools.items():
             if tp.mode == "deny":
                 raise LinkError(
@@ -222,8 +243,9 @@ def link(
             tools[name] = rule
 
     # Effective default is fail-closed: a tool no layer grants is denied. The
-    # folded map may include lowered agent.* keys (composed agent-level blocks),
-    # so build through the resolved path, which carries them in tools directly.
+    # folded map may include lowered agent.* / skill*: keys (composed agent/skill
+    # blocks), so build through the resolved path, which carries them in tools
+    # directly.
     effective = AgentPolicy.resolved(
         default_policy=BaseToolPolicy(mode="deny"), tools=tools, consts=consts
     )
@@ -326,6 +348,8 @@ _MODULE_COMPOSABLE_FIELDS = frozenset(
         # (a boundary agent-deny is authoritative, a capability agent-grant unions).
         "admission",
         "agents",
+        # `skills` lowers to skill*: keys the fold composes the same way.
+        "skills",
     }
 )
 # `inherits` / `is_mixin` are deliberately NOT here: the module fold composes
@@ -341,7 +365,7 @@ def _reject_unsupported_module_fields(
     """Reject any top-level AgentPolicy field a module sets that the fold does not
     compose (whatever is added next).
 
-    The fold composes ``tools`` and the lowered ``agent.*`` keys from
+    The fold composes ``tools`` and the lowered ``agent.*`` / ``skill*:`` keys from
     ``effective_tools``, so an un-composed field would be silently dropped, erasing
     a rule an operator authored — the same fail-open :func:`_reject_file_scope`
     guards against, generalized. Allowlisting the fields the fold understands means
@@ -352,9 +376,17 @@ def _reject_unsupported_module_fields(
         if extra:
             raise LinkError(
                 f"module {module.name!r} sets {sorted(extra)}, which module "
-                f"composition does not support (the fold composes only tools); "
+                f"composition does not support (the fold composes tools and the agent/skill blocks); "
                 f"keep it in a single-file policy ({module.source})"
             )
+
+
+def _is_closed_world_key(tool: str) -> bool:
+    """Synthetic keys whose gate engages from their presence in the resolved policy
+    (declares_admission / declares_reach / declares_skills). The fold must keep them
+    as an explicit deny: dropping a shadowed or ungranted one can take the gate's
+    engagement to False and admit everyone / run every skill ungated — fail-open."""
+    return is_agent_key(tool) or is_skill_key(tool)
 
 
 def _fold_tool(
@@ -400,13 +432,9 @@ def _fold_tool(
             # doesn't (unlisted, or mentioned only via a conditional deny), the
             # tool is ineligible — a capability grant can't make it eligible.
             trace.shadow(tool, _prov(g))
-            # For an ordinary tool, dropping it (None) IS the implicit deny. An
-            # agent key must instead stay as an explicit deny: the gate's
-            # engagement is derived from whether the resolved policy still carries
-            # the key (declares_admission / declares_reach), so a shadowed-away
-            # agent.run would silently DISENGAGE the gate (admit everyone) rather
-            # than deny — a fail-open. Keep it present and closed.
-            return BaseToolPolicy(mode="deny") if is_agent_key(tool) else None
+            # An ordinary tool's omission IS the deny; a closed-world key must stay
+            # present or its gate disengages (see _is_closed_world_key).
+            return BaseToolPolicy(mode="deny") if _is_closed_world_key(tool) else None
 
     # 3+4. Capability grants. No grant → eligible but ungranted → implicit deny.
     grants: list[tuple[ModuleContent, ToolPolicy]] = []
@@ -415,12 +443,8 @@ def _fold_tool(
         if tp is not None and tp.mode in GRANT_MODES:
             grants.append((cap, tp))
     if not grants:
-        # Same reasoning as the ceiling-shadow branch above: for an ordinary tool
-        # omission IS the implicit deny, but an ungranted agent key must stay an
-        # explicit deny — dropping it removes agent.run/agent.<via>: from the
-        # resolved policy, so declares_admission()/declares_reach() reads it as
-        # absent and disengages the gate (admit everyone) instead of denying.
-        return BaseToolPolicy(mode="deny") if is_agent_key(tool) else None
+        # Same as the ceiling-shadow branch: keep a closed-world key as a deny.
+        return BaseToolPolicy(mode="deny") if _is_closed_world_key(tool) else None
     contributors.extend(_prov(cap) for cap, _ in grants)
 
     mode = (
@@ -484,7 +508,7 @@ def _tool_names(*groups: list[ModuleContent]) -> list[str]:
     names: set[str] = set()
     for group in groups:
         for module in group:
-            # effective_tools, so lowered agent.* keys are folded like tool keys.
+            # effective_tools, so lowered agent.* / skill*: keys fold like tool keys.
             names.update(module.policy.effective_tools)
     return sorted(names)
 

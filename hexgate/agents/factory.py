@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, TypeAlias
@@ -35,18 +36,22 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel
 
+from hexgate.adapters._common import aprepare_run
+from hexgate.agents.subagents import SubagentEdge
+
 # BC re-export — canonical home is hexgate.approvals (framework-agnostic).
 from hexgate.approvals import ApprovalHandler  # noqa: F401 — re-export
 from hexgate.config.env import resolve_api_key
 from hexgate.runtime import (
-    DEFAULT_AGENT_NAME,
     LocalWorkspace,
     ToolUseContext,
     Workspace,
+    get_current_context,
     reset_current_tool_use_context,
     run_scope,
     set_current_tool_use_context,
 )
+from hexgate.security.naming import canonical_name
 from hexgate.streaming import StreamEvent, new_root_run_id, normalize_langchain_events
 from hexgate.tracing.langfuse import (
     CallbackHandler,
@@ -296,7 +301,7 @@ def _resolve_tool_use_context(
     own facts in (e.g. tests, or production code that wants to bypass the
     context scope for a specific call).
     """
-    agent_name = getattr(agent, "name", None)
+    agent_name = canonical_name(getattr(agent, "name", None))
     agent_workspace = getattr(agent, "workspace", None)
     fallback_workspace = agent_workspace or LocalWorkspace(Path.cwd())
     if tool_use_context is not None:
@@ -380,8 +385,78 @@ class HexgateAgent:
         # (only hexgate_client, attached post-init by _bind_policy). If one is added,
         # thread it through here too, or usage events will keep silently resolving
         # from HEXGATE_API_KEY instead of the caller's explicit key.
+        # Lives as long as the runtime, so both run methods below owe its
+        # per-run transcript state a reset on the way out.
         self._usage_handler = HexgateUsageCallbackHandler(
-            agent_name=name or DEFAULT_AGENT_NAME
+            agent_name=canonical_name(name)
+        )
+
+    @property
+    def _canonical_name(self) -> str:
+        return canonical_name(self.name)
+
+    @property
+    def subagents(self) -> "list[SubagentEdge]":
+        """The agent's sub-agent edges — the enumerable view registration reads.
+
+        Native reach is agent-as-tool only, so every edge is **derived** from the
+        mounted ``SubagentTool``s (added to ``tools=`` via :meth:`as_tool`) and tracks
+        the tool list through each ``with_tools`` rebuild.
+        """
+        from hexgate.adapters.langchain.tools import SubagentTool
+
+        return [
+            SubagentEdge(child=t.child, via="tool", as_name=t.name)
+            for t in self.tools
+            if isinstance(t, SubagentTool)
+        ]
+
+    def as_tool(
+        self, *, name: str | None = None, description: str | None = None
+    ) -> "BaseTool":
+        """Return this agent as a policy-gated delegation **tool** for a parent.
+
+        Drop the result into another agent's ``tools=`` (mirrors OpenAI's
+        ``Agent.as_tool()``). When the parent runs it, the tool decides
+        ``agent.tool:<this-agent>`` under the *parent's* policy, then runs this
+        agent's own enforced ``ainvoke`` — the child governs itself, and the caller's
+        role rides the ambient context in. Control **returns** to the parent with the
+        answer (agent-as-tool, not a handoff).
+
+        ``name`` overrides the LLM-facing tool name (default
+        ``delegate_to_<agent>``, sanitized to a valid tool identifier); ``description``
+        overrides the default one-liner.
+        """
+        from hexgate.adapters.langchain.tools import SubagentTool
+
+        raw = self.name
+        if not raw or not raw.strip():
+            raise ValueError(
+                "a sub-agent used as a tool must have a name (create_agent(name=...)) — "
+                "the name is the agent.tool:<name> reach key the parent's policy grants."
+            )
+        # Canonicalize to the identity the reach key + gate use; sanitize only the
+        # LLM-facing tool name to ^[A-Za-z0-9_-]+$ (e.g. "Billing Bot" ->
+        # delegate_to_Billing_Bot) — the reach target keeps the canonical name.
+        target = self._canonical_name
+        default_name = f"delegate_to_{re.sub(r'[^A-Za-z0-9_-]', '_', target)}"
+        # A `name` override is used verbatim (unlike the auto-sanitized default), so
+        # validate it against the provider tool-name charset here — else the parent's
+        # model bind / first tool call fails at runtime with an opaque provider error.
+        if name is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+            raise ValueError(
+                f"as_tool(name={name!r}) is not a valid tool name — it must match "
+                r"^[A-Za-z0-9_-]{1,64}$ (the provider's tool-name charset)."
+            )
+        return SubagentTool(
+            name=name or default_name,
+            description=description
+            or (
+                f"Delegate a task to the {target} sub-agent and return its answer. "
+                "Use when the request needs that specialist."
+            ),
+            child=self,
+            target_name=target,
         )
 
     def _with_usage_callback(self, config: dict[str, Any]) -> dict[str, Any]:
@@ -398,19 +473,28 @@ class HexgateAgent:
     ) -> dict[str, Any]:
         """Delegate invocation to the underlying graph.
 
-        Refreshes the attached policy source before delegating — see
-        :func:`_refresh_policy_safely`. The refresh seam lives here (not
+        Refreshes the attached policy source and fetches bans concurrently
+        before delegating — see :func:`_refresh_policy_safely` — then checks
+        admission against the refreshed policy. The refresh seam lives here (not
         only in :func:`invoke_agent`) so a direct caller of
         ``agent.ainvoke(...)`` gets hot-reload too, instead of silently
         running with stale policy.
         """
-        await _refresh_policy_safely(self)
-        await self._check_ban()
+        await aprepare_run(
+            _refresh_policy_safely(self),
+            self._ban_gate,
+            get_current_context(),
+            binding=self._binding,
+        )
         await self._check_admission()
-        with run_scope(self.name or DEFAULT_AGENT_NAME):
-            return await self._graph.ainvoke(
-                payload, config=self._with_usage_callback(config)
-            )
+        with run_scope(self._canonical_name):
+            turn_key = self._usage_handler.turn_key()
+            try:
+                return await self._graph.ainvoke(
+                    payload, config=self._with_usage_callback(config)
+                )
+            finally:
+                self._usage_handler.end_run(turn_key)
 
     async def astream_events(
         self,
@@ -425,25 +509,25 @@ class HexgateAgent:
         :meth:`ainvoke`. Wrapping both methods means hot-reload fires
         regardless of which entry point a caller picks.
         """
-        await _refresh_policy_safely(self)
-        await self._check_ban()
+        await aprepare_run(
+            _refresh_policy_safely(self),
+            self._ban_gate,
+            get_current_context(),
+            binding=self._binding,
+        )
         await self._check_admission()
-        with run_scope(self.name or DEFAULT_AGENT_NAME):
-            async for event in self._graph.astream_events(
-                payload, config=self._with_usage_callback(config), version=version
-            ):
-                yield event
-
-    async def _check_ban(self) -> None:
-        """Refuse a banned agent/user before the graph runs, if a gate is
-        attached. Context comes from the active :class:`HexgateContext` scope
-        (this path is ambient, unlike the framework adapters which pass it
-        explicitly)."""
-        if self._ban_gate is None:
-            return
-        from hexgate.runtime.context import get_current_context
-
-        await self._ban_gate.check_async(get_current_context())
+        with run_scope(self._canonical_name):
+            # Captured on the way in because this is a generator, whose
+            # ``finally`` an early break runs in a different Context — see
+            # ``HexgateUsageCallbackHandler.end_run``.
+            turn_key = self._usage_handler.turn_key()
+            try:
+                async for event in self._graph.astream_events(
+                    payload, config=self._with_usage_callback(config), version=version
+                ):
+                    yield event
+            finally:
+                self._usage_handler.end_run(turn_key)
 
     async def _check_admission(self) -> None:
         """Refuse a caller not admitted by policy before the graph runs, if an
@@ -456,6 +540,12 @@ class HexgateAgent:
 
     def with_tools(self, tools: Sequence[ToolSpec]) -> Self:
         """Rebuild the runtime with a new tool list."""
+        # Enforce the sub-agent delegation-tool guards on every construction path, not
+        # just create_agent — a colliding SubagentTool added through with_tools (the
+        # lower-level API, also used by enforce_policy) would otherwise slip through.
+        # A no-op for an already-validated tool list (enforce_policy re-wraps the same
+        # tools), so the cost is a cheap scan.
+        _check_subagent_tool_collisions(tools)
         graph = _build_langchain_agent(
             model=self.model,
             tools=tools,
@@ -474,7 +564,7 @@ class HexgateAgent:
         )
         # Thread the binding + client through the rebuild so refresh and
         # lazy user attenuation keep working after with_tools.
-        return type(self)(
+        rebuilt = type(self)(
             graph=graph,
             model=self.model,
             tools=tools,
@@ -496,6 +586,13 @@ class HexgateAgent:
             ban_gate=self._ban_gate,
             agent_gate=self._agent_gate,
         )
+        # create_agent stamps only the object it returns, so carry the guard stamp
+        # across every rebuild (with_tools underlies enforce_policy/refresh) — otherwise
+        # create_manifest(rebuilt) would publish guards=None while the guards still run.
+        # read_guards(self) is None when unstamped, so attach_guards no-ops there.
+        from hexgate.guards.attach import attach_guards, read_guards
+
+        return attach_guards(rebuilt, read_guards(self))
 
     def enforce_policy(
         self,
@@ -546,15 +643,20 @@ class HexgateAgent:
         """
         from langchain_core.tools import BaseTool
 
-        from hexgate.adapters.langchain.tools import GuardedTool
+        from hexgate.adapters.langchain.tools import GuardedTool, SubagentTool
+        from hexgate.guards.attach import attach_guards, resolve_guards
         from hexgate.guards.types import build_pipeline
         from hexgate.security.binding import PolicyBinding
         from hexgate.security.bundle import PolicyBundle
         from hexgate.security.enforcer import build_enforcer
         from hexgate.security.policy_set import PolicySet, load_policy_set
 
-        # Split the flat guard list into the internal pre/post pipeline once.
-        pipeline = build_pipeline(guards, observer=guard_observer)
+        # Guards fall back to the stamp the agent already carries (attach_guards /
+        # create_agent), so re-enforcing without restating guards keeps running them —
+        # and the result is stamped with exactly what runs, so create_manifest declares
+        # the same set (the manifest and the runtime must agree).
+        resolved_guards = resolve_guards(self, guards)
+        pipeline = build_pipeline(resolved_guards, observer=guard_observer)
 
         enforcer: PolicyEnforcer | None
         if policy is None:
@@ -572,6 +674,8 @@ class HexgateAgent:
                 # refuse admission.
                 unguarded = self.with_tools(list(self.tools))
                 unguarded._agent_gate = None
+                # resolved_guards is empty here (the pipeline is empty), so with_tools's
+                # carried stamp already matches "no guards" in the common case.
                 return unguarded
             enforcer = None  # guards-only gating, no policy engine
         else:
@@ -581,8 +685,22 @@ class HexgateAgent:
                 engine = load_policy_set(policy)
             enforcer = build_enforcer(
                 engine,
-                agent_name=self.name or DEFAULT_AGENT_NAME,
+                agent_name=self._canonical_name,
                 decision_observer=decision_observer,
+            )
+
+        # Fail-fast closed-world check of the policy's guard stance (R-GUARD-007): a
+        # policy naming an undeclared or ambiguous guard stops cold at construction.
+        # The enable/disable stance itself is applied per call in the guard runner, so
+        # one shared pipeline is installed on every tool. `engine` exists whenever
+        # `enforcer` does. Check `resolved_guards` — the list actually installed (the
+        # stamp when this call omits `guards=`) — not the raw argument, or re-enforcing
+        # a stamped agent without restating its guards would wrongly stop cold.
+        if enforcer is not None:
+            from hexgate.guards.stance import validate_guard_policy
+
+            validate_guard_policy(
+                engine, resolved_guards, agent_name=self._canonical_name
             )
 
         # One wrap loop for both paths, so the guards-only path can't drift from
@@ -591,7 +709,30 @@ class HexgateAgent:
         # a guard Halt(NEEDS_APPROVAL).
         wrapped: list[ToolSpec] = []
         for tool_spec in self.tools:
-            if isinstance(tool_spec, BaseTool):
+            if isinstance(tool_spec, SubagentTool):
+                # A SubagentTool decides its own delegation in _arun (reach key when
+                # the policy declares agent-as-tool reach, else the plain tool name),
+                # so it isn't wrapped in GuardedTool — but it needs the SAME enforcer
+                # the binding holds (so a refresh reaches it) plus the guard pipeline
+                # and approval handler. Fall through like GuardedTool.wrap: keep the
+                # tool's existing pipeline/approval_handler unless this call supplies
+                # new ones, so a re-enforce that omits guards doesn't wipe them.
+                wrapped.append(
+                    tool_spec.model_copy(
+                        update={
+                            "enforcer": enforcer,
+                            "approval_handler": (
+                                approval_handler
+                                if approval_handler is not None
+                                else tool_spec.approval_handler
+                            ),
+                            "pipeline": (
+                                pipeline if pipeline is not None else tool_spec.pipeline
+                            ),
+                        }
+                    )
+                )
+            elif isinstance(tool_spec, BaseTool):
                 wrapped.append(
                     GuardedTool.wrap(
                         tool_spec,
@@ -604,7 +745,10 @@ class HexgateAgent:
                 wrapped.append(tool_spec)
         rebuilt = self.with_tools(wrapped)
         if enforcer is not None:
-            from hexgate.security.agent_gate import resolve_agent_gate
+            from hexgate.security.agent_gate import (
+                resolve_agent_gate,
+                warn_if_reach_unenforced,
+            )
 
             # The binding pairs the enforcer the tools just closed over with the
             # refresh source, so refresh_policy() can swap the policy in place.
@@ -614,11 +758,32 @@ class HexgateAgent:
             rebuilt._agent_gate = resolve_agent_gate(
                 enforcer, approval_handler=approval_handler
             )
+            # Reach: agent-as-tool reach is enforced for each mounted `child.as_tool()`
+            # (its SubagentTool gates agent.tool:<child>). Warn — naming the via — only
+            # about what those edges don't cover: declared handoff reach (no native seam)
+            # or an un-mounted tool target. Only decidable when the policy is a readable
+            # PolicySet (a local policy). For an opaque signed bundle (the platform path)
+            # `_uncovered_reach` returns None: we can't enumerate its per-role reach keys,
+            # but native DOES enforce agent-as-tool reach (SubagentTool reads
+            # declares_tool_reach from the bundle), so we stay silent rather than emit the
+            # generic "reach unenforced" message — which would falsely claim the tool seam
+            # is unchecked on the very path the deployed product takes.
+            uncovered = _uncovered_reach(self.subagents, enforcer.policy)
+            if uncovered is not None and (uncovered[0] or uncovered[1]):
+                warn_if_reach_unenforced(
+                    enforcer.policy,
+                    framework="native",
+                    agent_name=self._canonical_name,
+                    handoff_targets=uncovered[0],
+                    tool_targets=uncovered[1],
+                )
         else:
             # Guards-only path: no enforcer, so no admission. Clear any gate a
             # prior enforce_policy left, which with_tools would otherwise carry.
             rebuilt._agent_gate = None
-        return rebuilt
+        # Stamp the result with exactly the guards its pipeline runs, so
+        # create_manifest declares the same set (a no-op when resolved_guards is empty).
+        return attach_guards(rebuilt, resolved_guards)
 
     def refresh_policy(self) -> None:
         """Pull the current policy from the attached source and swap it in.
@@ -632,6 +797,114 @@ class HexgateAgent:
 
 
 AgentGraph: TypeAlias = HexgateAgent
+
+
+def _tool_name(tool: ToolSpec) -> str | None:
+    """Best-effort LLM-facing name of a tool spec — for collision detection.
+
+    Covers a ``BaseTool``, a plain callable (LangChain names it by ``__name__``),
+    and a ``{"name": ...}`` dict tool def; ``None`` when a name can't be read.
+    """
+    if isinstance(tool, BaseTool):
+        return tool.name
+    if isinstance(tool, dict):
+        name = tool.get("name")
+        if not isinstance(name, str):
+            # OpenAI/function-style def: {"type": "function", "function": {"name": ...}}.
+            fn = tool.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else None
+        return name if isinstance(name, str) else None
+    return getattr(tool, "name", None) or getattr(tool, "__name__", None)
+
+
+def _uncovered_reach(
+    subagents: "Sequence[SubagentEdge]", engine: object
+) -> "tuple[list[str], list[str]] | None":
+    """Split the policy's declared reach into what the mounted edges *don't* enforce.
+
+    Returns ``(handoff_targets, unmounted_tool_targets)`` — the target names of
+    declared ``agent.handoff:*`` keys (no seam on native) and declared
+    ``agent.tool:*`` keys with no mounted ``child.as_tool()`` edge. Both empty ⇒ fully
+    covered ⇒ no warning. Returns ``None`` for an opaque WASM bundle (its keys aren't
+    readable), so the caller falls back to the generic conservative warning.
+
+    A target whose tool reach is *both* mounted and granted is reported under neither
+    via: ``via`` defaults to ``["tool", "handoff"]``, so the idiomatic ``{mode: allow}``
+    grant declares both keys — warning about its handoff bit when the author correctly
+    wired (and granted) agent-as-tool would be noise on the common path. A handoff-*only*
+    grant on a tool-mounted child still warns, though: its tool edge is closed-world
+    denied and its handoff has no seam, so the config is genuinely broken.
+    """
+    from hexgate.security.models import (
+        agent_target_key,
+        is_agent_reach_key,
+        is_agent_via_key,
+    )
+    from hexgate.security.naming import canonical_agent_name
+    from hexgate.security.policy_set import PolicySet
+
+    if not isinstance(engine, PolicySet):
+        return None
+    # Canonicalize the child name the same way the reach gate and enumerate_subagents
+    # do (canonical_agent_name), so a non-canonical name (e.g. "Billing Bot") still
+    # matches its mounted edge and a name-less child degrades to 'default', not a raise.
+    mounted = {
+        agent_target_key("tool", canonical_agent_name(edge.child))
+        for edge in subagents
+        if edge.via == "tool"
+    }
+    declared = {
+        key
+        for role in engine.roles
+        for key in engine.policy_for(role).effective_tools
+        if is_agent_reach_key(key)
+    }
+    # Targets genuinely covered by an enforced tool edge (mounted AND tool reach granted).
+    # Their default-via handoff bit is a permissive-default artifact, not an unenforced edge.
+    covered = mounted & declared
+    handoff = sorted(
+        target
+        for key in declared
+        if is_agent_via_key(key, "handoff")
+        and agent_target_key("tool", (target := key.split(":", 1)[1])) not in covered
+    )
+    tool = sorted(
+        key.split(":", 1)[1]
+        for key in declared
+        if is_agent_via_key(key, "tool") and key not in mounted
+    )
+    return handoff, tool
+
+
+def _check_subagent_tool_collisions(tools: "Sequence[ToolSpec]") -> None:
+    """Fail loud on sub-agent delegation-tool collisions in a ``tools=`` list.
+
+    Two guards: a ``SubagentTool``'s LLM-facing name must not clash with another
+    tool (ambiguous routing), and two ``SubagentTool``s must not target the same
+    agent (they'd collapse onto one ``agent.tool:<name>`` reach key).
+    """
+    from hexgate.adapters.langchain.tools import SubagentTool
+
+    other_names = {
+        n for t in tools if not isinstance(t, SubagentTool) and (n := _tool_name(t))
+    }
+    seen_names: set[str] = set()
+    seen_targets: set[str] = set()
+    for t in tools:
+        if not isinstance(t, SubagentTool):
+            continue
+        if t.name in other_names or t.name in seen_names:
+            raise ValueError(
+                f"sub-agent delegation tool {t.name!r} collides with another tool — "
+                "give the child a distinct name via child.as_tool(name=...)."
+            )
+        if t.target_name in seen_targets:
+            raise ValueError(
+                f"two sub-agent tools target the agent {t.target_name!r} — they "
+                "collapse onto one agent.tool: reach key; give each a distinct name."
+            )
+        seen_names.add(t.name)
+        seen_targets.add(t.target_name)
 
 
 def enforce_policy(
@@ -696,6 +969,13 @@ def create_agent(
     tool whether or not a policy binds — with the resolved policy when it does,
     guards-only when it does not. ``guard_observer`` receives a provenance
     ``GuardEvent`` when a guard acts.
+
+    **Sub-agents (agent-as-tool):** put ``child.as_tool()`` in ``tools=[...]``. The
+    child runs and control *returns* to the caller; the delegation tool decides
+    ``agent.tool:<child>`` under this agent's policy, then runs the child's own
+    enforced ``ainvoke`` (the child governs itself, the caller's role rides in). This
+    is the only native reach mode — handoff (control transfer) needs a seam LangChain
+    doesn't expose; it exists only on OpenAI/Google agents, authored with their SDKs.
     """
     # Validate at the public boundary, before the (relatively expensive) graph
     # build, so the error lands at the call site rather than deep in dispatch.
@@ -709,9 +989,14 @@ def create_agent(
         if isinstance(system_prompt, SystemMessage)
         else load_system_prompt(system_prompt)
     )
+    # Agent-as-tool sub-agents ride in ``tools`` as SubagentTools (built by
+    # child.as_tool()); validate they don't collide before the graph build.
+    _check_subagent_tool_collisions(tools)
+    # Defensive copy so the graph and the agent don't share the caller's list.
+    tool_specs: list[ToolSpec] = list(tools)
     graph = _build_langchain_agent(
         model=model,
-        tools=tools,
+        tools=tool_specs,
         system_prompt=resolved_system_prompt,
         middleware=middleware,
         response_format=response_format,
@@ -728,7 +1013,7 @@ def create_agent(
     agent = HexgateAgent(
         graph=graph,
         model=model,
-        tools=tools,
+        tools=tool_specs,
         system_prompt=resolved_system_prompt,
         middleware=middleware,
         response_format=response_format,
@@ -756,6 +1041,13 @@ def create_agent(
             approval_handler=approval_handler,
         )
 
+    # Stamp the guard list onto the returned agent so it travels with the object
+    # to registration — the CLI (`hexgate register` / `hexgate serve`) only holds
+    # the loaded agent, never the original list. Guards still run via the pipeline
+    # enforce_policy built above; this is purely so create_manifest can declare them.
+    from hexgate.guards.attach import attach_guards
+
+    attach_guards(agent, guards)
     handler = get_langfuse_handler(
         session_id=session_id,
         user_id=user_id,

@@ -36,6 +36,18 @@ ADD --checksum=sha256:00d114b94fdb1606a48cccdfc73c9ccdc62c38721150131ae578d5ff3d
     https://openpolicyagent.org/downloads/v0.70.0/opa_linux_amd64_static /usr/local/bin/opa
 RUN chmod +x /usr/local/bin/opa && opa version
 
+# WeasyPrint's native stack: the AI Act evidence report renders through it.
+# Pango does the text layout, so it and its font machinery are runtime
+# dependencies of the API process, not build tooling. Liberation and DejaVu
+# are the document's two faces (see render/report.css) — pinning them in the
+# image is what makes a re-render of an old report look like the original,
+# rather than like whatever host it landed on.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
+      libharfbuzz-subset0 libfribidi0 \
+      fonts-liberation2 fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # SDK source (needed to build the hexgate wheel).
@@ -47,8 +59,27 @@ COPY hexgate ./hexgate
 # source (copied below).
 COPY platform/api/pyproject.toml platform/api/uv.lock ./platform/api/
 WORKDIR /app/platform/api
+# --refresh-package is load-bearing, not redundant: uv keys the built wheel on
+# the mtime of the path dep's pyproject.toml (/app/pyproject.toml), NOT on the
+# source it builds from -- so any release that changed hexgate/ without touching
+# that file gets a wheel built from stale source off the cache mount. A version
+# bump only works as a side effect of rewriting that file. `--no-cache` does not
+# help -- it invalidates layers, not cache mounts.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable
+    uv sync --frozen --no-dev --no-editable --refresh-package hexgate
+
+# Guards the flag above: fail the build, not the deploy, if the installed wheel
+# drifts from the source. `uv run` because the venv is not on PATH here. Compared
+# both ways and across every file type, so a module missing from the wheel, one
+# deleted from the source but retained in it, and drifted package data all fail
+# the build. Markdown (AGENTS.md, CLAUDE.md) is in the source tree but not packaged.
+RUN INSTALLED="$(uv run --no-sync python -c 'import hexgate, os; print(os.path.dirname(hexgate.__file__))')" \
+    && if ! diff -r -x '*.md' -x '__pycache__' /app/hexgate "$INSTALLED"; then \
+         echo 'ERROR: the installed hexgate SDK differs from the source in this image'; \
+         echo 'Either the uv cache served a stale wheel (see --refresh-package above),'; \
+         echo 'or a source file is not packaged (see [tool.setuptools] in pyproject.toml).'; \
+         exit 1; fi \
+    && echo 'SDK wheel matches the source in this image'
 
 # API source last so edits don't bust the deps layer.
 COPY platform/api ./

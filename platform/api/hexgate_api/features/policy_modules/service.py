@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import yaml
 from sqlalchemy.exc import IntegrityError
@@ -20,7 +21,10 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from hexgate_api.core.ids import new_id
-from hexgate_api.models import PolicyModule, RoleBinding, utcnow
+from hexgate_api.models import PolicyFile, PolicyModule, RoleBinding, utcnow
+
+if TYPE_CHECKING:  # the SDK is imported lazily at run time
+    from hexgate.security import PolicyLint
 
 logger = logging.getLogger("hexgate.platform.policy_modules")
 
@@ -37,6 +41,15 @@ class InvalidModuleError(Exception):
 
     Routes translate this to HTTP 422. Raised before the row is written so a
     malformed module never lands in the store.
+    """
+
+
+class UnknownRoleError(Exception):
+    """The role a decision-test targets isn't in the resolved policy set.
+
+    Its own type (not a bare ``KeyError``) so the router maps *this* to HTTP 404
+    without also catching a ``KeyError`` the SDK decision engine might raise for an
+    unrelated missing key — which should surface as a 500, not a phantom 404.
     """
 
 
@@ -112,12 +125,16 @@ async def upsert_module(
     tier: str,
     path: str,
     content: str,
+    actor_user_id: str,
 ) -> PolicyModule:
     """Create or replace one module. Validates the tier and the policy content.
 
     Insert falls back to update on the unique constraint, so two concurrent
     creates of the same module don't 500: the loser rolls back and updates the
     row the winner just wrote.
+
+    ``actor_user_id`` lands on ``created_by_user_id`` for an insert and
+    ``updated_by_user_id`` for a replace, the create-race fallthrough included.
     """
     if tier not in VALID_TIERS:
         raise InvalidModuleError(
@@ -134,6 +151,7 @@ async def upsert_module(
             path=path,
             content=content,
             content_hash=_content_hash(content),
+            created_by_user_id=actor_user_id,
         )
         session.add(row)
         try:
@@ -153,6 +171,7 @@ async def upsert_module(
     existing.content = content
     existing.content_hash = _content_hash(content)
     existing.updated_at = utcnow()
+    existing.updated_by_user_id = actor_user_id
     session.add(existing)
     await session.commit()
     await session.refresh(existing)
@@ -162,7 +181,11 @@ async def upsert_module(
 async def delete_module(
     session: AsyncSession, *, project_id: str, tier: str, path: str
 ) -> bool:
-    """Remove one module. Returns False if it didn't exist."""
+    """Remove one module. Returns False if it didn't exist.
+
+    A hard delete records no actor — no row is left to stamp. Closing that gap
+    is the ``audit_event`` log's job, not these columns'.
+    """
     row = await _get_module(session, project_id, tier, path)
     if row is None:
         return False
@@ -236,6 +259,7 @@ async def set_roles(
     *,
     project_id: str,
     roles: RoleMatrixJson | dict[str, list[str]],
+    created_by_user_id: str,
 ) -> RoleMatrixJson:
     """Replace the project's role bindings wholesale (a small, edited-together set).
 
@@ -249,6 +273,9 @@ async def set_roles(
     colliding on the unique constraint. The retry re-reads the winner's rows and
     replaces them cleanly instead of surfacing a 500 (same posture as
     ``upsert_module``'s create-race handling).
+
+    Being a delete-and-reinsert, each fresh row's ``created_by_user_id`` IS the
+    last writer, which is why the table has no ``updated_*`` pair.
     """
     normalized = {role: _normalize_cell(cells) for role, cells in roles.items()}
     for attempt in range(2):
@@ -270,6 +297,7 @@ async def set_roles(
                     project_id=project_id,
                     role=role,
                     capabilities=dict(cells),
+                    created_by_user_id=created_by_user_id,
                 )
             )
         try:
@@ -370,16 +398,21 @@ def compose_error_types() -> tuple[type[BaseException], ...]:
     )
 
 
+def _all_agent_names(roles) -> set[str]:
+    """Every agent column named in the role matrix, plus the generic ``"*"``."""
+    agents = {DEFAULT_AGENT}
+    if roles:
+        agents |= {agent for cells in roles.values() for agent in cells}
+    return agents
+
+
 def _resolve_all_agents(boundaries, capabilities, roles) -> None:
     """Resolve EVERY agent column of ``roles`` (not just ``"*"``, so a named-agent
     cell importing an unknown capability is caught). Raises the SDK compose errors
     on failure; resolves only (no YAML serialization)."""
     from hexgate.security import resolve_for_project
 
-    agents = {DEFAULT_AGENT}
-    if roles:
-        agents |= {agent for cells in roles.values() for agent in cells}
-    for agent in agents:
+    for agent in _all_agent_names(roles):
         resolve_for_project(boundaries, capabilities, roles, agent=agent)
 
 
@@ -463,12 +496,16 @@ async def resolves_with_module(
 
 
 async def is_modular(session: AsyncSession, project_id: str) -> bool:
-    """Whether the project compiles agents from modules rather than policy_yaml.
+    """Whether the project compiles agents from a policy store rather than each
+    agent's ``policy_yaml``.
 
-    A project is modular once it has at least one role binding. Binding a role is
-    the deliberate opt-in: uploading a capability or boundary module alone does
-    not flip enforcement, so a half-built library never bricks live agents.
+    Modular once the project has either a compose **entry file** (``policy.yaml``)
+    or at least one **role binding** (the tier store). Either is the deliberate
+    opt-in: a half-built library (a lone capability, or non-entry files) does not
+    flip enforcement, so live agents are never bricked mid-authoring.
     """
+    if await has_entry_file(session, project_id):
+        return True
     row = (
         await session.exec(
             select(RoleBinding.id)  # type: ignore[arg-type]
@@ -533,3 +570,554 @@ async def resolved_yaml_by_agent(
             sort_keys=False,
         )
     return out
+
+
+# --- compose file store (entry-file + import graph) --------------------------
+# Additive alongside the tier store above: a project may be authored as files —
+# one entry ``policy.yaml`` plus imported fragments — resolved through the SDK's
+# compose front-end, instead of tier modules + a role binding. ``is_modular`` and
+# the compile path prefer the entry file when present.
+
+ENTRY_FILE = "policy.yaml"
+
+
+async def list_files(session: AsyncSession, project_id: str) -> list[PolicyFile]:
+    rows = await session.exec(
+        select(PolicyFile)
+        .where(PolicyFile.project_id == project_id)
+        .order_by(PolicyFile.name)  # type: ignore[arg-type]
+    )
+    return list(rows.all())
+
+
+async def get_file(
+    session: AsyncSession, project_id: str, name: str
+) -> PolicyFile | None:
+    return (
+        await session.exec(
+            select(PolicyFile).where(
+                PolicyFile.project_id == project_id, PolicyFile.name == name
+            )
+        )
+    ).first()
+
+
+async def has_entry_file(session: AsyncSession, project_id: str) -> bool:
+    return await get_file(session, project_id, ENTRY_FILE) is not None
+
+
+async def _files_map(session: AsyncSession, project_id: str) -> dict[str, str]:
+    """The project's files as ``{name: content}`` — the compose loader's substrate."""
+    return {r.name: r.content for r in await list_files(session, project_id)}
+
+
+def _db_loader(files: dict[str, str]):
+    """A compose ``Loader`` over a ``{name: content}`` map — a missing file raises
+    ``FileNotFoundError`` so the resolver reports a source-named ``cannot import``."""
+
+    def load(name: str) -> str:
+        try:
+            return files[name]
+        except KeyError:
+            raise FileNotFoundError(name) from None
+
+    return load
+
+
+def _resolve_files(files: dict[str, str], agent: str = DEFAULT_AGENT):
+    """Resolve a ``{name: content}`` project for one agent through compose. Pure —
+    no DB; raises the SDK's compose errors (``LinkError`` etc.)."""
+    from hexgate.security.compose import resolve_text
+
+    if ENTRY_FILE not in files:
+        raise InvalidModuleError(f"no entry file {ENTRY_FILE!r} in this project")
+    return resolve_text(
+        files[ENTRY_FILE],
+        agent=agent,
+        source=ENTRY_FILE,
+        loader=_db_loader(files),
+        entry_path=ENTRY_FILE,
+    )
+
+
+def _compose_agent_names(files: dict[str, str]) -> list[str]:
+    """``"*"`` plus every agent the entry declares — the compile fan-out set."""
+    from hexgate.security.compose import parse_entry
+
+    entry = parse_entry(files[ENTRY_FILE], source=ENTRY_FILE)
+    return [DEFAULT_AGENT, *sorted(entry.agents)]
+
+
+async def compose_resolve(
+    session: AsyncSession, project_id: str, agent: str = DEFAULT_AGENT
+):
+    """Resolve the project's entry file for one agent via the compose front-end."""
+    return _resolve_files(await _files_map(session, project_id), agent)
+
+
+def validate_compose_file(content: str) -> None:
+    """Structural check: the file parses as a compose document (raises
+    :class:`InvalidModuleError` → HTTP 422). Checked before resolution so a
+    malformed file returns 422, not the 409 an unresolvable-but-valid file gets."""
+    from hexgate.security.compose import parse_entry
+    from hexgate.security.modules import LinkError
+
+    try:
+        parse_entry(content, source="<file>")
+    except LinkError as exc:
+        raise InvalidModuleError(str(exc)) from exc
+
+
+async def project_resolves_with_file(
+    session: AsyncSession, project_id: str, name: str, content: str
+) -> tuple[bool, str | None]:
+    """Whether the project still resolves (for every agent) with ``name`` set to
+    ``content``. Vacuously true until an entry file exists (a project being built
+    up file-by-file); the router turns a False into a 409."""
+    files = {**await _files_map(session, project_id), name: content}
+    if ENTRY_FILE not in files:
+        return True, None
+    try:
+        _resolve_all_agents_files(files)
+    except compose_error_types() as exc:
+        return False, str(exc)
+    return True, None
+
+
+async def upsert_file(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    name: str,
+    content: str,
+    actor_user_id: str,
+) -> PolicyFile:
+    """Create or replace a file — a store primitive. The router owns validation:
+    :func:`validate_compose_file` (→ 422) and :func:`project_resolves_with_file`
+    (→ 409) run before this, so it doesn't re-parse the content.
+
+    ``actor_user_id`` is stamped as in :func:`upsert_module`.
+    """
+    chash = _content_hash(content)
+    row = await get_file(session, project_id, name)
+    if row is None:
+        row = PolicyFile(
+            id=new_id(PolicyFile),
+            project_id=project_id,
+            name=name,
+            content=content,
+            content_hash=chash,
+            created_by_user_id=actor_user_id,
+        )
+        session.add(row)
+        try:
+            await session.flush()
+        except IntegrityError:  # create race — fall back to update
+            await session.rollback()
+            row = await get_file(session, project_id, name)
+            if row is None:  # the racing row was deleted between — re-create
+                row = PolicyFile(
+                    id=new_id(PolicyFile),
+                    project_id=project_id,
+                    name=name,
+                    content=content,
+                    content_hash=chash,
+                    created_by_user_id=actor_user_id,
+                )
+                session.add(row)
+            else:
+                _apply_file_edit(row, content, chash, actor_user_id)
+    else:
+        _apply_file_edit(row, content, chash, actor_user_id)
+    await session.commit()
+    return row
+
+
+def _apply_file_edit(
+    row: PolicyFile, content: str, content_hash: str, actor_user_id: str
+) -> None:
+    row.content = content
+    row.content_hash = content_hash
+    row.updated_at = utcnow()
+    row.updated_by_user_id = actor_user_id
+
+
+async def delete_file(session: AsyncSession, *, project_id: str, name: str) -> bool:
+    row = await get_file(session, project_id, name)
+    if row is None:
+        return False
+    await session.delete(row)
+    await session.commit()
+    return True
+
+
+async def resolve_auto(
+    session: AsyncSession, project_id: str, agent: str = DEFAULT_AGENT
+):
+    """Resolve for the resolve endpoint — compose (an entry file) or the tier
+    store, deciding from a **single** store read of the files. Raises the SDK's
+    compose errors (:func:`compose_error_types`, a superset of the tier errors)."""
+    files = await _files_map(session, project_id)
+    if ENTRY_FILE in files:
+        return _resolve_files(files, agent)
+    return await resolve(session, project_id, agent=agent)
+
+
+async def check_auto(session: AsyncSession, project_id: str) -> list[PolicyLint]:
+    """Lints for the check endpoint — compose (a resolution error, else the SDK's
+    ``analyze_policy`` findings) or tier (analyzer lints), from a single files
+    read. Both stores return SDK ``PolicyLint``s, so the router builds the
+    response the same way for each."""
+    files = await _files_map(session, project_id)
+    if ENTRY_FILE in files:
+        try:
+            _, lints = await _resolve_and_lint(session, project_id, files)
+        except compose_error_types() as exc:
+            return [_link_error(str(exc))]
+        return lints
+    return await check(session, project_id)
+
+
+def _link_error(message: str) -> PolicyLint:
+    """A project that doesn't compose, reported as one error lint."""
+    from hexgate.security import PolicyLint
+
+    return PolicyLint("link-error", "error", message)
+
+
+def _resolve_all_agents_files(files: dict[str, str]) -> dict:
+    """Resolve ``"*"`` and every agent the entry declares, keyed by agent. Raises
+    :func:`compose_error_types` on the first agent that doesn't resolve."""
+    return {
+        agent: _resolve_files(files, agent) for agent in _compose_agent_names(files)
+    }
+
+
+def _resolution_for(resolved: dict, agent: str):
+    """``agent``'s resolution from :func:`_resolve_all_agents_files`. An agent the
+    entry doesn't declare resolves exactly like ``"*"`` (only the top-level scopes
+    apply to it), so it reuses that result instead of resolving again."""
+    return resolved[agent] if agent in resolved else resolved[DEFAULT_AGENT]
+
+
+async def _resolve_and_lint(
+    session: AsyncSession, project_id: str, files: dict[str, str]
+) -> tuple[dict, list[PolicyLint]]:
+    """Resolve every declared agent, then lint the project. Raises
+    :func:`compose_error_types` when an agent doesn't resolve, before the
+    manifests are loaded, so a draft that doesn't compose costs no DB query."""
+    from hexgate_api.features.agents.service import latest_manifests
+
+    resolved = _resolve_all_agents_files(files)
+    manifests = await latest_manifests(session, project_id)
+    return resolved, _compose_lints(resolved, manifests)
+
+
+def _compose_lints(resolved: dict, manifests: dict) -> list[PolicyLint]:
+    """The ``PolicyLint``s ``analyze_policy`` reports for every agent the entry
+    declares (``resolved``) and every registered agent (the ones
+    ``recompile_project`` builds a bundle for), each against its latest registered
+    manifest (``manifests``; ``latest_manifests`` skips a stored manifest that no
+    longer validates, so a manifest problem can never read as a link error); a declared
+    agent that never registered gets no manifest checks. The ``"*"`` view has no
+    manifest, so it gets the manifest-free checks. Lints carry ``ENTRY_FILE`` as
+    their source so the editor shows them inline; drift can come from an imported
+    file, which the resolved form no longer tells apart.
+
+    A named agent's lint is tagged with the agent and dropped only when the
+    ``"*"`` view already reported it (a top-level rule every agent shares), so two
+    named agents with the same defect each report it."""
+    from dataclasses import replace
+
+    from hexgate.security import analyze_policy
+    from hexgate.security.analyzer import SEVERITY_RANK
+
+    def key(lint) -> tuple:
+        return (lint.code, lint.message, lint.tool, lint.role)
+
+    generic = analyze_policy(resolved[DEFAULT_AGENT].policy_set, source=ENTRY_FILE)
+    shared = {key(lint) for lint in generic}
+    lints = list(generic)
+    for agent in sorted((set(resolved) | set(manifests)) - {DEFAULT_AGENT}):
+        policy_set = _resolution_for(resolved, agent).policy_set
+        lints_for_agent = analyze_policy(
+            policy_set, manifest=manifests.get(agent), source=ENTRY_FILE
+        )
+        for lint in lints_for_agent:
+            if key(lint) not in shared:
+                lints.append(replace(lint, agent=agent))
+    lints.sort(key=lambda lint: SEVERITY_RANK[lint.severity])
+    return lints
+
+
+async def compose_preview(
+    session: AsyncSession,
+    project_id: str,
+    *,
+    name: str,
+    content: str,
+    agent: str = DEFAULT_AGENT,
+) -> tuple[dict | None, list[PolicyLint]]:
+    """Resolve the project with a draft ``name``=``content`` overlaid — the
+    editor's live preview. Returns ``(resolved, lints)``: the requested agent's
+    effective policy (``None`` when it doesn't compose) and the lints. Validates *every* declared agent (like the save-time 409 check) so
+    the preview and the save agree — a draft that breaks a different agent still
+    previews as an error, not falsely clean. The lints are the same findings
+    :func:`check_auto` returns for the saved project."""
+    files = {**await _files_map(session, project_id), name: content}
+    if ENTRY_FILE not in files:
+        return None, [_link_error(f"no entry file {ENTRY_FILE!r} in this project")]
+    try:
+        # Every declared agent, so the preview and the save agree.
+        resolved, lints = await _resolve_and_lint(session, project_id, files)
+        requested = _resolution_for(resolved, agent)
+    except compose_error_types() as exc:
+        return None, [_link_error(str(exc))]
+    return roles_json(requested), lints
+
+
+def _graph_from(agent_names, resolve_for_agent, role: str | None = None) -> dict:
+    """Build the node/edge graph from a per-agent resolver — model-agnostic, fed
+    either the compose or the tier resolver. An agent's effective tools split into
+    tool *calls*, lowered *reach* keys (``agent.tool:``/``agent.handoff:`` → an
+    agent→agent edge tagged by ``via``), and the *admission* key (``agent.run`` → a
+    role→agent ingress edge); a ``mcp-`` tool is an ``mcp`` node. ``role`` filters
+    to one role, else unions across every role each agent resolves. Nodes/edges
+    de-dup: a merged edge keeps the MOST-PERMISSIVE verdict across roles
+    (allow > approval_required > deny), with the constraints + roles of the roles
+    at that verdict — so an edge allowed for some role reads as allowed, matching
+    how tool edges behave (a role lacking a grant omits the edge, while a
+    closed-world agent key materializes a deny that shouldn't mask a real allow).
+    The returned ``roles`` is every role across all agents (independent of the
+    ``role`` filter), for the UI's role picker. See R-AGENT-002 in the SDK."""
+    from hexgate.security import DEFAULT_ROLE_NAME
+    from hexgate.security.models import (
+        AGENT_REACH_PREFIXES,
+        AGENT_RUN_TOOL,
+        is_agent_reach_key,
+    )
+
+    # Most-permissive wins on merge across roles.
+    _PERM = {"allow": 3, "approval_required": 2, "deny": 1}
+    nodes: dict[str, dict] = {}
+    edges: dict[tuple, dict] = {}
+    all_roles: set[str] = set()
+
+    def add_node(node_id: str, kind: str, label: str) -> None:
+        nodes.setdefault(node_id, {"id": node_id, "kind": kind, "label": label})
+
+    def add_edge(source, target, kind, verdict, constraints, via=None, at_role=None):
+        prev = edges.get((source, target, kind, via))
+        if prev is None:
+            edges[(source, target, kind, via)] = {
+                "source": source,
+                "target": target,
+                "kind": kind,
+                "via": via,
+                "verdict": verdict,
+                "constraints": list(constraints),
+                "roles": [at_role] if at_role else [],
+            }
+            return
+        rank_new = _PERM.get(verdict, 0)
+        rank_prev = _PERM.get(prev["verdict"], 0)
+        if rank_new > rank_prev:
+            # Strictly more permissive: this verdict wins, and its constraints +
+            # role replace the prior (stricter) ones — a denied role shouldn't
+            # leave its constraints on an edge that some role allows.
+            prev["verdict"] = verdict
+            prev["constraints"] = list(constraints)
+            prev["roles"] = [at_role] if at_role else []
+        elif rank_new == rank_prev:
+            for c in constraints:
+                if c not in prev["constraints"]:
+                    prev["constraints"].append(c)
+            if at_role and at_role not in prev["roles"]:
+                prev["roles"].append(at_role)
+        # else: strictly less permissive — ignore (a real allow already stands)
+
+    for agent in sorted(agent_names):
+        add_node(f"agent:{agent}", "agent", agent)
+        result = resolve_for_agent(agent)
+        # In the union view (role=None) the same edge can appear under several
+        # roles; we keep the MOST-permissive verdict (a role that allows it wins
+        # over one the closed world denies). The per-edge ``roles`` list (and the
+        # ?role= filter) give the exact per-role picture.
+        all_roles.update(result.by_role)  # every role, regardless of the filter
+        roles_here = [role] if role is not None else list(result.by_role)
+        for r in roles_here:
+            link_result = result.by_role.get(r)
+            if link_result is None:
+                continue
+            policy = link_result.effective[DEFAULT_ROLE_NAME]
+            for tool, tp in policy.effective_tools.items():
+                cons = list(tp.constraints)
+                if tool == AGENT_RUN_TOOL:
+                    add_node(f"role:{r}", "role", r)
+                    add_edge(
+                        f"role:{r}",
+                        f"agent:{agent}",
+                        "admission",
+                        tp.mode,
+                        cons,
+                        at_role=r,
+                    )
+                elif is_agent_reach_key(tool):
+                    prefix = next(p for p in AGENT_REACH_PREFIXES if tool.startswith(p))
+                    via = prefix[len("agent.") : -1]  # "tool" | "handoff"
+                    target = tool[len(prefix) :]
+                    add_node(f"agent:{target}", "agent", target)
+                    add_edge(
+                        f"agent:{agent}",
+                        f"agent:{target}",
+                        "reach",
+                        tp.mode,
+                        cons,
+                        via=via,
+                        at_role=r,
+                    )
+                else:
+                    is_mcp = tool.startswith("mcp-")
+                    kind = "mcp" if is_mcp else "tool"
+                    # Drop the "mcp-" prefix in the label so "mcp-demo-read" reads
+                    # as "demo-read".
+                    node_label = tool[len("mcp-") :] if is_mcp else tool
+                    add_node(f"tool:{tool}", kind, node_label)
+                    add_edge(
+                        f"agent:{agent}",
+                        f"tool:{tool}",
+                        "call",
+                        tp.mode,
+                        cons,
+                        at_role=r,
+                    )
+
+    # "*" is the generic-column sentinel, not a real agent — drop its node when it
+    # carries nothing (named agents present, no top-level grants) so the UI doesn't
+    # render a literal "*" agent; keep it when a top-level grant gives it an edge.
+    star = f"agent:{DEFAULT_AGENT}"
+    if star in nodes and not any(
+        e["source"] == star or e["target"] == star for e in edges.values()
+    ):
+        del nodes[star]
+
+    return {
+        "nodes": list(nodes.values()),
+        "edges": list(edges.values()),
+        "roles": sorted(all_roles),
+    }
+
+
+async def policy_graph(
+    session: AsyncSession, project_id: str, role: str | None = None
+) -> dict:
+    """A node/edge graph of the project's agents, tools, and reach/admission edges,
+    for one ``role`` (or the union across roles). Auto-dispatches compose (an entry
+    file) vs the tier store — a single files read — and feeds the same builder.
+    Raises the SDK's compose errors if the project doesn't resolve."""
+    files = await _files_map(session, project_id)
+    if ENTRY_FILE in files:
+        agent_names = _compose_agent_names(files)
+
+        def resolve_for_agent(a: str):
+            return _resolve_files(files, a)
+    else:
+        from hexgate.security import resolve_for_project
+
+        boundaries, capabilities, roles_matrix = await _sdk_inputs(session, project_id)
+        agent_names = sorted(_all_agent_names(roles_matrix))
+
+        def resolve_for_agent(a: str):
+            return resolve_for_project(boundaries, capabilities, roles_matrix, agent=a)
+
+    return _graph_from(agent_names, resolve_for_agent, role=role)
+
+
+async def test_policy(
+    session: AsyncSession,
+    project_id: str,
+    *,
+    role: str,
+    tool: str,
+    agent: str = DEFAULT_AGENT,
+    args: dict,
+    attributes: dict | None = None,
+    draft: tuple[str, str] | None = None,
+):
+    """Evaluate one tool call against the resolved policy for ``role`` + ``agent``,
+    then run the SDK decision engine.
+
+    ``draft`` is an optional ``(name, content)`` compose overlay — the editor's
+    unsaved edit. It's applied to the file set, so it takes effect whenever the
+    project resolves via compose (has, or the draft introduces, an entry file); a
+    project with no entry file resolves from the tier store and a draft naming a
+    non-entry file has no tier meaning. Raises the SDK's compose errors if the
+    project doesn't resolve, and :class:`UnknownRoleError` (→ 404) for an unknown
+    role."""
+    files = await _files_map(session, project_id)
+    if draft is not None:
+        files = {**files, draft[0]: draft[1]}
+    if ENTRY_FILE in files:
+        result = _resolve_files(files, agent)
+    else:
+        from hexgate.security import resolve_for_project
+
+        boundaries, capabilities, roles = await _sdk_inputs(session, project_id)
+        result = resolve_for_project(boundaries, capabilities, roles, agent=agent)
+    if role not in result.policy_set.roles:
+        raise UnknownRoleError(role)
+    return result.policy_set.evaluate(
+        role=role, tool=tool, args=dict(args), attributes=attributes
+    )
+
+
+async def resolved_yaml_by_agent_compose(
+    session: AsyncSession, project_id: str, agents: Iterable[str]
+) -> dict[str, str]:
+    """Per-agent resolved YAML for the compile fan-out, via compose. Reads the
+    store once; note it re-parses per agent (the compose resolver runs per-agent
+    import resolution, which mutates per-scope state, so the parsed entry can't be
+    safely shared across agents — a shared parse cache is a follow-up). Raises the
+    SDK's compose errors so callers keep the last-good bundle (fail-safe)."""
+    from hexgate.security import RESOLVED_POLICY_MARKER
+
+    files = await _files_map(session, project_id)
+    out: dict[str, str] = {}
+    for agent in agents:
+        result = _resolve_files(files, agent)
+        out[agent] = yaml.safe_dump(
+            {"roles": roles_json(result), RESOLVED_POLICY_MARKER: True},
+            sort_keys=False,
+        )
+    return out
+
+
+# --- compile dispatch: entry-file (compose) vs tier store --------------------
+# The compile path calls these; they pick the compose resolver when the project
+# has a `policy.yaml` entry, else fall back to the tier resolver. One branch, so
+# `agents.service` stays store-shape-agnostic.
+
+
+async def resolved_yaml_by_agent_auto(
+    session: AsyncSession, project_id: str, agents: Iterable[str]
+) -> dict[str, str]:
+    """Per-agent resolved YAML for compile — compose if there's an entry file,
+    else tier. Raises the SDK's compose errors so callers keep the last bundle."""
+    if await has_entry_file(session, project_id):
+        return await resolved_yaml_by_agent_compose(session, project_id, agents)
+    return await resolved_yaml_by_agent(session, project_id, agents)
+
+
+async def resolved_policy_yaml_auto(
+    session: AsyncSession, project_id: str, agent: str = DEFAULT_AGENT
+) -> str:
+    """One agent's resolved YAML for compile — compose if there's an entry file,
+    else tier."""
+    if not await has_entry_file(session, project_id):
+        return await resolved_policy_yaml(session, project_id, agent)
+    from hexgate.security import RESOLVED_POLICY_MARKER
+
+    result = await compose_resolve(session, project_id, agent)
+    return yaml.safe_dump(
+        {"roles": roles_json(result), RESOLVED_POLICY_MARKER: True}, sort_keys=False
+    )

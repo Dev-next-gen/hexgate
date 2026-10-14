@@ -10,7 +10,7 @@ Shape (scope by depth — a block keyword is a sibling of the ``agents``/``roles
 name-map, never a key inside it):
 
     version, import, export          # top-level only
-    boundary / tools / reach / mcp   # at any scope → applies to that scope
+    boundary / tools / reach / mcp / admission / skills   # at any scope → that scope
     agents: { <name>: agent-body }   # top level only; body may add roles:
     roles:  { <name>: role-body }    # agent-body only
 
@@ -20,11 +20,18 @@ that agent + all its roles; in a role body, that one cell.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
-from hexgate.security.models import AgentVia
+from hexgate.security.models import AgentVia, GuardRule, SkillVia, UsagePolicy
 
 # Keywords that are structural, so an agent or role may not be *named* one — a
 # `roles: { tools: … }` would be unreadable even though the parser could tell it
@@ -38,6 +45,10 @@ RESERVED_NAMES = frozenset(
         "tools",
         "reach",
         "mcp",
+        "admission",
+        "skills",
+        "guards",
+        "usage",
         "agents",
         "roles",
     }
@@ -55,7 +66,10 @@ def _as_list(v: object) -> object:
 class _ConstraintsMixin(BaseModel):
     """Shared ``constraint``/``constraints`` ergonomics for every spec."""
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    # No populate_by_name: an aliased field is spelled only by its YAML alias, so
+    # its field name is rejected by extra="forbid" (ReachSpec takes `as:`, not
+    # `via:`). An unaliased field, like the skill specs' `via`, uses its name.
+    model_config = ConfigDict(extra="forbid")
 
     constraints: list[str] = Field(default_factory=list)
 
@@ -100,6 +114,28 @@ class CeilingSpec(_ConstraintsMixin):
     mode: CeilingMode = "allow"
 
 
+class _SkillLevelsMixin(_ConstraintsMixin):
+    """``via``: the disclosure levels governed, spelled as on ``SkillPolicy`` (which
+    the lowering builds, and which rejects an empty list and drops duplicates)."""
+
+    via: list[SkillVia] = Field(default_factory=lambda: list(get_args(SkillVia)))
+
+    _one_or_many = field_validator("via", mode="before")(_as_list)
+
+
+class SkillGrantSpec(_SkillLevelsMixin):
+    """A ``skills`` grant. Grants only ever allow or gate on approval."""
+
+    mode: GrantMode = "allow"
+
+
+class SkillCeilingSpec(_SkillLevelsMixin):
+    """A ``boundary.skills`` entry — a ceiling per level: permits up to a
+    constraint, or subtracts (``deny``); it never grants."""
+
+    mode: CeilingMode = "allow"
+
+
 class BoundaryBlock(BaseModel):
     """A ceiling block. ``default_policy`` is fail-closed deny by construction, so
     a tool (or reach edge) it does not list is denied — the closed-world posture.
@@ -114,17 +150,48 @@ class BoundaryBlock(BaseModel):
 
     tools: dict[str, CeilingSpec] = Field(default_factory=dict)
     reach: dict[str, ReachSpec] = Field(default_factory=dict)
+    # The ceiling on ingress: may any role *start* this agent at all? Closed-world
+    # like reach — with no admission ceiling, an authored admission grant is
+    # intersected to deny, so a boundary must permit admission to allow it.
+    admission: CeilingSpec | None = None
+    # Per-level ceiling on skills; closed-world like reach — an unlisted level is
+    # denied even if a role grants it.
+    skills: dict[str, SkillCeilingSpec] = Field(default_factory=dict)
 
 
 class _GrantScope(BaseModel):
-    """The grant blocks legal at any scope (role body, agent body, top level)."""
+    """The grant blocks legal at any scope (role body, agent body, top level),
+    plus an ``import:`` list — position is scope, so a fragment imported here
+    applies at exactly this depth."""
 
+    # No populate_by_name: only the `import` alias is accepted, so the `imports`
+    # field-name spelling is rejected by extra="forbid" (no silent second spelling).
     model_config = ConfigDict(extra="forbid")
 
     boundary: BoundaryBlock | None = None
     tools: dict[str, GrantSpec] = Field(default_factory=dict)
     reach: dict[str, ReachSpec] = Field(default_factory=dict)
     mcp: dict[str, GrantSpec] = Field(default_factory=dict)
+    # Ingress grant: may this scope's role start/enter this agent? Lowers to the
+    # ``agent.run`` key the runtime AgentGate enforces. A single grant (it is about
+    # *this* agent), boundary-ceilinged like reach. Constraints here gate on
+    # identity/attributes, not ``run.*`` facts: admission fires at run entry,
+    # before a run accrues, so run counters read zero — a run budget belongs on a
+    # tool or reach, not admission.
+    admission: GrantSpec | None = None
+    # Lowers to skill:/skill.resource:/skill.script: keys, ceilinged like reach.
+    skills: dict[str, SkillGrantSpec] = Field(default_factory=dict)
+    imports: list[str] = Field(default_factory=list, alias="import")
+
+    # Resolved leaf fragments spliced at this scope — populated by the import
+    # resolver, never authored. PrivateAttr so it is not YAML-settable, not
+    # validated, and not serialized. Elements are leaf ``_GrantScope``s (a
+    # ``RoleBlock`` export, or a whole-file ``Entry`` with no agents).
+    _imported: list["_GrantScope"] = PrivateAttr(default_factory=list)
+    # Source file this scope came from, for provenance on lowered ModuleContents.
+    # Local scopes keep the entry file; the resolver stamps each imported fragment
+    # with the file it was loaded from.
+    _source: str = PrivateAttr(default="policy.yaml")
 
     @model_validator(mode="after")
     def _no_tools_mcp_collision(self) -> "_GrantScope":
@@ -147,6 +214,15 @@ class AgentBlock(_GrantScope):
     """One agent's body: its all-roles grants/ceiling + a ``roles`` name-map."""
 
     roles: dict[str, RoleBlock] = Field(default_factory=dict)
+    # Guard enable/disable stance for THIS agent (R-GUARD-006). Agent-level, not
+    # per-role (no `guards` on RoleBlock) and not composable (no `guards` on a
+    # boundary or an imported fragment), so the one agent-wide stance can never
+    # diverge across roles. A guard name -> {enabled: bool}; merged over the
+    # entry's top-level guards, last-wins per key.
+    guards: dict[str, GuardRule] = Field(default_factory=dict)
+    # Usage fail mode for THIS agent. Agent-level and not composable, like `guards`;
+    # replaces the entry's top-level `usage` block whole rather than per key.
+    usage: UsagePolicy | None = None
 
     @field_validator("roles")
     @classmethod
@@ -165,11 +241,18 @@ class Entry(_GrantScope):
     """
 
     version: int = 1
-    imports: list[str] = Field(default_factory=list, alias="import")
     exports: dict[str, RoleBlock] = Field(default_factory=dict, alias="export")
     agents: dict[str, AgentBlock] = Field(default_factory=dict)
+    # Top-level guard stance: applies to EVERY agent (R-GUARD-006). An agent body's
+    # own `guards` overlays this per key. Agent-level and non-composable, like the
+    # agent-body block above.
+    guards: dict[str, GuardRule] = Field(default_factory=dict)
+    # Top-level usage fail mode: applies to EVERY agent. An agent body's own `usage`
+    # replaces it. Agent-level and non-composable, like `guards`.
+    usage: UsagePolicy | None = None
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    # Only the `export` alias is accepted (not the `exports` field name).
+    model_config = ConfigDict(extra="forbid")
 
     @field_validator("agents")
     @classmethod

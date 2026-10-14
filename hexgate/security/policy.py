@@ -17,15 +17,16 @@ from hexgate.security.models import (
     BaseToolPolicy,
     FileToolPolicy,
     ToolPolicy,
-    is_agent_key,
+    is_reserved_key,
 )
 
-# Agent keys (admission agent.run AND reach agent.tool:/agent.handoff:) are
-# closed-world: an unlisted agent key denies regardless of default_policy. A role
-# that is not granted admission is denied, so a permissive tool default cannot
-# silently grant a run or a handoff. Whether admission is enforced at all is the
-# gate's opt-in engagement decision (declares_admission), not this fallback (R-AGENT-002).
-_AGENT_CLOSED_WORLD_DENY = BaseToolPolicy(mode="deny")
+# Agent keys (admission agent.run AND reach agent.tool:/agent.handoff:) and skill
+# keys (skill:/skill.resource:/skill.script:) are closed-world: an unlisted one
+# denies regardless of default_policy, so a permissive tool default cannot silently
+# grant a run, a handoff or a skill. Whether either gate fires at all is its opt-in
+# engagement decision (declares_admission / declares_skills), not this fallback
+# (R-AGENT-002).
+_CLOSED_WORLD_DENY = BaseToolPolicy(mode="deny")
 
 if TYPE_CHECKING:
     from hexgate.security.bundle import PolicyBundle
@@ -51,19 +52,19 @@ def load_policy(policy: str | Path | AgentPolicy | None) -> AgentPolicy:
 def get_tool_policy(policy: AgentPolicy, tool_name: str) -> ToolPolicy:
     """Resolve the effective policy for a tool name.
 
-    Reads ``effective_tools`` (authored tools plus lowered ``agent.*`` keys) so a
-    synthetic agent-level key resolves through the same path as any tool. An
-    unlisted **agent** key (admission or reach) denies, closed-world, so a
-    permissive ``default_policy`` never silently grants a run or a handoff; any
-    other unlisted tool falls to ``default_policy``. The Rego compiler mirrors this
-    (its permissive catch-all excludes every agent key), keeping the engines in
-    agreement (R-AGENT-002).
+    Reads ``effective_tools`` (authored tools plus lowered ``agent.*`` / ``skill*``
+    keys) so a synthetic key resolves through the same path as any tool. An
+    unlisted **agent** or **skill** key denies, closed-world, so a permissive
+    ``default_policy`` never silently grants a run, a handoff or a skill; any other
+    unlisted tool falls to ``default_policy``. The Rego compiler mirrors this (its
+    permissive catch-all excludes every agent and skill key), keeping the engines
+    in agreement (R-AGENT-002).
     """
     tool_policy = policy.effective_tools.get(tool_name)
     if tool_policy is not None:
         return tool_policy
-    if is_agent_key(tool_name):
-        return _AGENT_CLOSED_WORLD_DENY
+    if is_reserved_key(tool_name):
+        return _CLOSED_WORLD_DENY
     return policy.default_policy
 
 
@@ -75,13 +76,14 @@ def evaluate_tool_call(
     role: str | None = None,
     attributes: Mapping[str, Any] | None = None,
     run: Mapping[str, Any] | None = None,
+    agent_usage: Mapping[str, Any] | None = None,
 ) -> Verdict:
     """Return a :class:`Verdict` for a proposed tool call (pydantic engine).
 
-    Evaluates the tool's ``constraints`` list against the invocation's
-    arguments (see :mod:`hexgate.security.constraints` for the grammar).
-    Every constraint must pass for the call to authorize — fail-closed by
-    design. A path denial carries a machine-readable ``hint`` so the host
+    Evaluates the policy's own ``constraints`` (which apply to every tool)
+    followed by the tool's, against the invocation's arguments (see
+    :mod:`hexgate.security.constraints` for the grammar). Every constraint must
+    pass for the call to authorize — fail-closed by design. A path denial carries a machine-readable ``hint`` so the host
     can tell the model what scope it stayed within.
 
     Returns rather than raises; :func:`authorize_tool_call` wraps this for
@@ -99,13 +101,16 @@ def evaluate_tool_call(
 
     try:
         check_constraints(
-            tool_policy.constraints,
+            # Policy-level first, so a run-budget denial is the one reported.
+            # Order is all it affects — every constraint must pass either way.
+            [*policy.constraints, *tool_policy.constraints],
             arguments,
             tool_name,
             role=role,
             consts=policy.consts,
             attributes=attributes,
             run=run,
+            agent_usage=agent_usage,
         )
     except PolicyDeniedError as exc:
         return Verdict(outcome=DecisionOutcome.DENY, reason=str(exc))
@@ -148,17 +153,25 @@ def authorize_tool_call(
     role: str | None = None,
     attributes: Mapping[str, Any] | None = None,
     run: Mapping[str, Any] | None = None,
+    agent_usage: Mapping[str, Any] | None = None,
 ) -> None:
     """Raise when a tool call is denied or requires approval.
 
     Thin raise-on-deny wrapper over :func:`evaluate_tool_call`, kept for
     callers (the CLI, direct API users) that prefer the exception contract.
-    ``role``, ``attributes`` and ``run`` are all forwarded so their respective
-    constraints see the same inputs the WASM engine always receives.
+    ``role``, ``attributes``, ``run`` and ``agent_usage`` are all forwarded so
+    their respective constraints see the same inputs the WASM engine always
+    receives.
     """
     _raise_for_verdict(
         evaluate_tool_call(
-            policy, tool_name, arguments, role=role, attributes=attributes, run=run
+            policy,
+            tool_name,
+            arguments,
+            role=role,
+            attributes=attributes,
+            run=run,
+            agent_usage=agent_usage,
         )
     )
 
@@ -171,6 +184,7 @@ def evaluate_tool_call_wasm(
     *,
     attributes: Mapping[str, Any] | None = None,
     run: Mapping[str, Any] | None = None,
+    agent_usage: Mapping[str, Any] | None = None,
 ) -> Verdict:
     """WASM-backed counterpart of :func:`evaluate_tool_call`.
 
@@ -190,6 +204,7 @@ def evaluate_tool_call_wasm(
         args=arguments or {},
         ctx=dict(attributes or {}),
         run=dict(run or {}),
+        agent_usage=dict(agent_usage or {}),
     )
     return verdict_from_rego(decision, tool_name=tool_name, role=role)
 
@@ -235,6 +250,7 @@ def authorize_tool_call_wasm(
     *,
     attributes: Mapping[str, Any] | None = None,
     run: Mapping[str, Any] | None = None,
+    agent_usage: Mapping[str, Any] | None = None,
 ) -> None:
     """Raise-on-deny wrapper over :func:`evaluate_tool_call_wasm`.
 
@@ -243,6 +259,12 @@ def authorize_tool_call_wasm(
     """
     _raise_for_verdict(
         evaluate_tool_call_wasm(
-            bundle, role, tool_name, arguments, attributes=attributes, run=run
+            bundle,
+            role,
+            tool_name,
+            arguments,
+            attributes=attributes,
+            run=run,
+            agent_usage=agent_usage,
         )
     )

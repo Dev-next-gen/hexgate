@@ -15,7 +15,8 @@ from hexgate.security.policy_set import (
     DEFAULT_ROLE_NAME,
     PolicySet,
     PolicySetError,
-    _validate_run_refs,
+    _run_root,
+    _validate_path_refs,
 )
 
 _LIST_PATHS = frozenset({"tools_used"})
@@ -36,10 +37,9 @@ def _default_policy(*constraints: str) -> AgentPolicy:
 
 
 def _validate(*constraints: str, policy: AgentPolicy | None = None) -> None:
-    _validate_run_refs(
+    _validate_path_refs(
         {_ROLE: policy if policy is not None else _policy(*constraints)},
-        scalar_paths=_SCALAR_PATHS,
-        list_paths=_LIST_PATHS,
+        _run_root(_SCALAR_PATHS, _LIST_PATHS),
     )
 
 
@@ -168,3 +168,82 @@ def test_policy_set_construction_rejects_an_unknown_run_path() -> None:
 
 def test_policy_set_construction_accepts_a_registered_run_path() -> None:
     PolicySet({DEFAULT_ROLE_NAME: _policy('run.agent == "billing"')})
+
+
+# --- policy-level constraints ----------------------------------------------
+#
+# Where a run cap is most likely to be written, so the linter has to reach it.
+
+
+def _policy_level(*constraints: str) -> AgentPolicy:
+    return AgentPolicy.model_validate({"constraints": list(constraints)})
+
+
+def test_unknown_path_rejected_at_the_policy_level() -> None:
+    with pytest.raises(PolicySetError, match="unknown run.\\* path 'tool_call'"):
+        _validate(policy=_policy_level("run.tool_call < 5"))
+
+
+def test_too_deep_path_rejected_at_the_policy_level() -> None:
+    with pytest.raises(PolicySetError, match="exactly two segments"):
+        _validate(policy=_policy_level('run.id.value == "x"'))
+
+
+def test_list_path_in_scalar_position_rejected_at_the_policy_level() -> None:
+    with pytest.raises(PolicySetError, match="silently passes"):
+        _validate(policy=_policy_level('run.tools_used not in ["shell"]'))
+
+
+def test_known_path_accepted_at_the_policy_level() -> None:
+    _validate(policy=_policy_level("run.tool_calls < 20"))
+
+
+def test_inherited_policy_level_constraint_is_validated() -> None:
+    """Validation runs on the resolved map, so a bad ref cannot hide in a mixin."""
+    from hexgate.security.policy_set import load_policy_map
+
+    with pytest.raises(PolicySetError, match="unknown run.\\* path 'tool_call'"):
+        load_policy_map(
+            {
+                "base": AgentPolicy.model_validate(
+                    {"is_mixin": True, "constraints": ["run.tool_call < 5"]}
+                ),
+                "default": AgentPolicy.model_validate({"inherits": ["base"]}),
+            }
+        )
+
+
+def test_run_refs_are_validated_on_an_authored_admission_grant() -> None:
+    # admission/agents blocks stay as AgentPolicy model fields (they land in
+    # effective_tools, not tools), so run.* validation must walk effective_tools
+    # to reach them — else a bad run.* ref on an authored admission grant
+    # fail-opens. This is the authored single-file path the compose front-end's
+    # own test can't exercise (compose folds agent.run straight into tools).
+    policy = AgentPolicy.model_validate(
+        {
+            "admission": {
+                "mode": "allow",
+                "constraints": ["run.definitely_not_a_path < 5"],
+            }
+        }
+    )
+    with pytest.raises(PolicySetError, match="unknown run"):
+        PolicySet({DEFAULT_ROLE_NAME: policy})
+
+
+def test_run_refs_are_validated_on_an_authored_reach_grant() -> None:
+    # Same gap on the reach half: an agents:/reach block's run.* ref must be
+    # validated too.
+    policy = AgentPolicy.model_validate(
+        {
+            "agents": {
+                "other": {
+                    "via": ["handoff"],
+                    "mode": "allow",
+                    "constraints": ["run.definitely_not_a_path < 5"],
+                }
+            }
+        }
+    )
+    with pytest.raises(PolicySetError, match="unknown run"):
+        PolicySet({DEFAULT_ROLE_NAME: policy})

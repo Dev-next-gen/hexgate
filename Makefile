@@ -29,8 +29,8 @@ install: ## Install runtime deps via uv (creates .venv if needed)
 	uv sync
 
 .PHONY: install-dev
-install-dev: ## Install with dev extras (pytest, ruff)
-	uv sync --extra dev
+install-dev: ## Install with dev extras (pytest, ruff) and evals (inspect-ai), as CI does
+	uv sync --extra dev --extra evals
 
 # -------- Dev loop --------
 
@@ -74,19 +74,19 @@ coverage-html: ## Coverage with a browsable HTML report under htmlcov/
 
 .PHONY: lint
 lint: ## Static check via ruff
-	$(UV) ruff check hexgate tests platform/scripts
+	$(UV) ruff check hexgate tests evals platform/scripts
 
 .PHONY: lint-fix
 lint-fix: ## Apply ruff autofixes
-	$(UV) ruff check --fix hexgate tests platform/scripts
+	$(UV) ruff check --fix hexgate tests evals platform/scripts
 
 .PHONY: fmt
-fmt: ## Format with ruff (SDK + platform/api + platform/scripts)
-	$(UV) ruff format hexgate tests platform/api platform/scripts
+fmt: ## Format with ruff (SDK + evals + platform/api + platform/scripts)
+	$(UV) ruff format hexgate tests evals platform/api platform/scripts
 
 .PHONY: fmt-check
 fmt-check: ## Check formatting without writing changes
-	$(UV) ruff format --check hexgate tests platform/api platform/scripts
+	$(UV) ruff format --check hexgate tests evals platform/api platform/scripts
 
 .PHONY: check
 check: lint fmt-check test ## Python CI parity: lint + fmt-check + test (no coverage overhead)
@@ -108,6 +108,20 @@ platform-api-check: ## Lint + test (with coverage) on the platform API
 .PHONY: policy-build
 policy-build: ## Compile examples/example_agent/policy.yaml to a bundle under /tmp/m2-bundle
 	$(UV) hexgate policy build examples/example_agent/policy.yaml --out /tmp/m2-bundle
+
+CASES ?= explicit_request
+
+.PHONY: policy-eval
+policy-eval: ## Run the policy-writing eval with Claude Code in Docker: CASES=<id prefixes> (one case by default, every run bills the Claude subscription), 3 epochs, needs CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`; results in `inspect view --log-dir evals/policy_writing/logs`
+	$(UV) python -m inspect_ai eval evals/policy_writing/task.py --model none -T agent=claude \
+	  -T cases=$(CASES) --epochs 3 --epochs-reducer mean,at_least_3 --log-dir evals/policy_writing/logs
+
+.PHONY: policy-eval-check
+policy-eval-check: ## Run the policy-writing eval on our own answers (reference, wrong_answers, noop) for `inspect view --log-dir evals/policy_writing/logs`; asserts nothing, the pass/fail assertions live in tests/evals/test_task.py
+	for agent in reference wrong_answers noop; do \
+	  $(UV) python -m inspect_ai eval evals/policy_writing/task.py --model none -T agent=$$agent \
+	    --log-dir evals/policy_writing/logs || exit 1; \
+	done
 
 .PHONY: policy-test-wasm
 policy-test-wasm: ## Smoke a wasm-engine decision on the example policy
@@ -138,15 +152,23 @@ demo-override: ## Build a deny-everything bundle + chat with HEXGATE_LOCAL_POLIC
 # Docker Compose service definition lives in platform/docker-compose.yml.
 # First `make clickhouse-up` on an empty volume runs the init scripts in
 # platform/clickhouse/init/ and creates the policy_decision table.
-# Subsequent schema changes don't auto-apply — use `make clickhouse-reset`
-# (wipes data) or apply platform/clickhouse/migrations/*.sql by hand via
-# `make clickhouse-cli`, in filename order.
+# Subsequent schema changes don't auto-apply — run `make clickhouse-migrate`,
+# which replays platform/clickhouse/migrations/*.sql in filename order and keeps
+# your data. `make clickhouse-reset` wipes the volume and re-runs the init
+# scripts; reach for it only when the migrations cannot get you there.
 
 COMPOSE := docker compose -f platform/docker-compose.yml
+# The container stays outside: clickhouse-cli execs with -it, the others with -i.
+CLICKHOUSE_CLIENT := clickhouse-client --user hexgate --password hexgate-dev-password --database hexgate_audit
 
+# `--wait` is load-bearing, not tidiness: every consumer below execs a
+# clickhouse-client against the container on the next line, and `up -d` returns
+# on container start, not on server ready — so without it a cold container
+# fails with `Code: 210 ... Connection refused`, or, on an empty volume,
+# `Database hexgate_audit doesn't exist` before the init scripts have run.
 .PHONY: clickhouse-up
-clickhouse-up: ## Start the local ClickHouse server (creates schema on first run)
-	$(COMPOSE) up -d clickhouse
+clickhouse-up: ## Start the local ClickHouse server and wait until healthy (creates schema on first run)
+	$(COMPOSE) up -d --wait clickhouse
 
 .PHONY: clickhouse-down
 clickhouse-down: ## Stop ClickHouse (keeps the data volume)
@@ -158,8 +180,27 @@ clickhouse-logs: ## Tail ClickHouse server logs
 
 .PHONY: clickhouse-cli
 clickhouse-cli: ## Open an interactive SQL shell against the local ClickHouse
-	docker exec -it hexgate-clickhouse clickhouse-client \
-	    --user hexgate --password hexgate-dev-password --database hexgate_audit
+	docker exec -it hexgate-clickhouse $(CLICKHOUSE_CLIENT)
+
+# The local twin of `platform-migrate`'s ClickHouse half. Without it the only
+# documented way to pick up a new table was clickhouse-reset, which wipes — so a
+# developer whose volume predates a migration was nudged into destroying data.
+.PHONY: clickhouse-migrate
+clickhouse-migrate: clickhouse-up ## Replay platform/clickhouse/migrations/*.sql against local ClickHouse (idempotent)
+	@for f in platform/clickhouse/migrations/*.sql; do \
+		echo "applying $$f"; \
+		docker exec -i hexgate-clickhouse $(CLICKHOUSE_CLIENT) \
+			--multiquery < "$$f" || exit 1; \
+	done
+
+# The local twin of `platform-backfill`. A fresh volume never needs it: schema.sql
+# creates the views before any row exists.
+.PHONY: clickhouse-backfill
+clickhouse-backfill: ## Run one backfill against local ClickHouse: make clickhouse-backfill FILE=0005_usage_minute
+	@test -n "$(FILE)" || (echo "Set FILE=<name>, e.g. make clickhouse-backfill FILE=0005_usage_minute" && exit 1)
+	$(COMPOSE) up -d --wait clickhouse
+	docker exec -i hexgate-clickhouse $(CLICKHOUSE_CLIENT) \
+		--multiquery < platform/clickhouse/backfills/$(FILE).sql
 
 .PHONY: clickhouse-reset
 clickhouse-reset: ## Wipe ONLY the ClickHouse data volume and re-run init scripts
@@ -183,8 +224,25 @@ postgres-up: ## Start local Postgres and wait until healthy
 # fresh volume never surfaces as "no such table" on the first request.
 .PHONY: postgres-init
 postgres-init: postgres-up ## Create the platform-api tables on local Postgres (idempotent)
+	@# `import hexgate_api.models` is load-bearing: it registers every table on
+	@# SQLModel.metadata before create_all runs. Without it the metadata is
+	@# empty and this silently creates NOTHING — the same reason the deploy
+	@# stack's api-init one-shot imports it (docker-compose.deploy.yml).
 	cd platform/api && DATABASE_URL=$(POSTGRES_DSN) uv run python -c \
-		"import asyncio; from hexgate_api.core.db import init_db; asyncio.run(init_db())"
+		"import asyncio; import hexgate_api.models; from hexgate_api.core.db import init_db; asyncio.run(init_db())"
+	@# create_all adds missing TABLES, never missing columns, so a volume that
+	@# predates a column keeps 500ing at request time with no startup error.
+	@# Every file here is idempotent (IF NOT EXISTS), so replaying the whole
+	@# directory on each init is the cheapest honest local-dev migration story.
+	@# Deployed stacks apply these by hand — see platform/DEPLOY.md section 6.
+	@# `|| exit 1` is load-bearing: the whole loop is one shell invocation with no
+	@# `set -e`, so without it a failing file is swallowed and make exits on the
+	@# LAST iteration's status. Output stays quiet here — this runs on nearly every
+	@# local workflow and is usually a no-op; the deploy path is the one that needs
+	@# to show its work.
+	for f in platform/postgres/migrations/*.sql; do \
+		docker exec -i hexgate-postgres psql -v ON_ERROR_STOP=1 -U hexgate -d hexgate < "$$f" >/dev/null || exit 1; \
+	done
 
 .PHONY: postgres-stop
 postgres-stop: ## Stop Postgres (keeps the data volume)
@@ -296,6 +354,10 @@ collector-check: ## Vet + test + build the collector, validate config.yaml (no o
 	cd platform/collector && go vet ./...
 	cd platform/collector && go build -o hexgate-collector ./...
 	cd platform/collector && ./hexgate-collector validate --config=config.yaml
+	# Only a REFUSED invalid pair proves the env values reached the config
+	# struct, so a typo in either variable name fails here.
+	cd platform/collector && HEXGATE_COLLECTOR_REVOCATION_POLL_INTERVAL=5s HEXGATE_COLLECTOR_REVOCATION_MAX_STALENESS=30m ./hexgate-collector validate --config=config.yaml
+	cd platform/collector && (! HEXGATE_COLLECTOR_REVOCATION_POLL_INTERVAL=1m HEXGATE_COLLECTOR_REVOCATION_MAX_STALENESS=1s ./hexgate-collector validate --config=config.yaml >/dev/null 2>&1)
 
 # -------- Platform API (FastAPI control plane) --------
 #
@@ -303,8 +365,14 @@ collector-check: ## Vet + test + build the collector, validate config.yaml (no o
 # own pyproject.toml. We invoke uv from there directly so it uses the
 # platform's venv, not the SDK's.
 
+# WeasyPrint (the AI Act report renderer) binds to Pango, which uv cannot
+# install: without it `import weasyprint` fails and the whole platform-api
+# suite errors at collection. macOS: `brew install pango`, plus
+# `brew install --cask font-liberation font-dejavu` so a local render uses the
+# same faces the image does. Debian/Ubuntu: the apt list in
+# platform/api/Dockerfile, which pins both the libraries and the fonts.
 .PHONY: platform-api-install
-platform-api-install: ## Install platform API deps (first time)
+platform-api-install: ## Install platform API deps (first time; needs Pango on the host, see above)
 	cd platform/api && uv sync --group dev
 
 .PHONY: platform-api
@@ -312,7 +380,7 @@ platform-api: ## Run the platform API dev server (FastAPI on :8000, SQLite)
 	cd platform/api && uv run uvicorn hexgate_api.main:app --reload --port 8000
 
 .PHONY: platform-api-pg
-platform-api-pg: postgres-up ## Run the platform API against local Postgres (starts PG first)
+platform-api-pg: postgres-init ## Run the platform API against local Postgres (starts PG first)
 	cd platform/api && DATABASE_URL=$(POSTGRES_DSN) uv run uvicorn hexgate_api.main:app --reload --port 8000
 
 .PHONY: platform-api-test
@@ -379,6 +447,61 @@ platform-env-pull: ## Pull platform/.env.<stage> from Scaleway: make platform-en
 .PHONY: _require-stage-env
 _require-stage-env:
 	@test -f platform/.env.$(STAGE) || $(MAKE) platform-env-pull STAGE=$(STAGE)
+
+# The two writers whose sessions hold the locks platform-migrate needs.
+# collector and redpanda are deliberately absent: they stay up so OTLP keeps
+# buffering through the window, and neither holds a session idle in a
+# transaction on the tables being altered.
+DEPLOY_WRITERS = api enricher
+
+# A target rather than a raw compose line in the runbook. This is the FIRST
+# command of every upgrade, and _require-stage-env is the only thing that pulls
+# a missing .env.<stage> — a hand-written `docker compose --env-file` here dies
+# with `couldn't find env file` before platform-migrate would have fetched it.
+.PHONY: platform-stop-writers
+platform-stop-writers: _require-stage-env ## Stop api + enricher ahead of a migrate: make platform-stop-writers STAGE=prod
+	$(DEPLOY_COMPOSE) stop $(DEPLOY_WRITERS)
+
+# Runs BEFORE platform-up on any release that adds a column: init_db() is
+# create_all, which never alters an existing table, and the collector's snapshot
+# query selects the new column — so new images against an unmigrated database
+# take OTLP ingest down. Every file is idempotent, so replaying the whole
+# directory is a no-op when there is nothing new. See platform/DEPLOY.md § 6.
+#
+# Unconditional, including a first-ever deploy: every Postgres file guards each
+# table it touches with to_regclass and skips with a NOTICE when create_all has
+# not built it yet. That used to be "upgrades only, skip it there" -- an
+# operating procedure that depended on the operator knowing how far behind a
+# stage was, and the reason prod stopped on `relation "policy_file" does not
+# exist`. It is a property of the files now.
+# The ClickHouse files are IF NOT EXISTS throughout, so replaying the whole
+# directory on every upgrade is a no-op once applied; a table the API or
+# enricher checks at boot (core.clickhouse.verify_all) must exist BEFORE
+# platform-up recreates their containers, or both crash-loop.
+#
+# The two stores are applied independently: a Postgres failure is reported but
+# does NOT skip ClickHouse, and the run ends with a per-store summary plus a
+# nonzero exit if either did not complete. Postgres DDL runs under a 10s
+# lock_timeout, so stop `api` and `enricher` first (keep `collector` and
+# `redpanda` up, so OTLP keeps buffering) or expect the run to give up.
+.PHONY: platform-migrate
+platform-migrate: _require-stage-env ## Apply platform/{postgres,clickhouse}/migrations/*.sql to a deploy stack: make platform-migrate STAGE=prod
+	$(DEPLOY_COMPOSE) up -d --wait postgres clickhouse
+	@bash platform/scripts/migrate.sh $(STAGE)
+
+# One-time backfills (platform/clickhouse/backfills/), run with the writers
+# stopped, between platform-migrate and platform-up on the release that ships
+# them. Not part of platform-migrate: a backfill is not safe to replay blindly.
+# Refuses while a writer runs: a row it inserts during the scan is counted by
+# the views and by the backfill, for good. `ps` without -a lists only running
+# (and restarting) containers.
+.PHONY: platform-backfill
+platform-backfill: _require-stage-env ## One-time backfill, writers stopped: make platform-backfill STAGE=prod FILE=0005_usage_minute
+	@test -n "$(FILE)" || (echo "Set FILE=<name>, e.g. make platform-backfill STAGE=prod FILE=0005_usage_minute" && exit 1)
+	@running="$$($(DEPLOY_COMPOSE) ps --services $(DEPLOY_WRITERS))" || exit 1; \
+		test -z "$$running" || (echo "Refusing to backfill while these writers run:" $$running "-- make platform-stop-writers STAGE=$(STAGE) first" && exit 1)
+	$(DEPLOY_COMPOSE) up -d --wait clickhouse
+	@bash platform/scripts/backfill.sh $(STAGE) platform/clickhouse/backfills/$(FILE).sql
 
 .PHONY: platform-up
 platform-up: _require-stage-env ## Build + (re)start a deploy stack: make platform-up STAGE=prod (default staging)
@@ -492,6 +615,24 @@ demo-notebook-build: platform-api-install dashboard-install ## One-time setup fo
 demo-notebook: ## Run the bundled BYOK demo locally (one process). Open http://localhost:2718
 	PATH="$(CURDIR)/platform/api/.venv/bin:$$PATH" \
 	  HEXGATE_DEMO=1 HEXGATE_COOKIE_SECURE=0 \
+	  python deploy/boot.py
+
+.PHONY: demo-support
+demo-support: ## Run the compose support-bot showcase — platform + dashboard + live agent in one process. Open http://localhost:2718
+	rm -f platform/api/demo.db platform/api/demo.db-wal platform/api/demo.db-shm
+	PATH="$(CURDIR)/platform/api/.venv/bin:$$PATH" \
+	  DATABASE_URL="sqlite+aiosqlite:///$(CURDIR)/platform/api/demo.db" \
+	  HEXGATE_DEMO=1 HEXGATE_COOKIE_SECURE=0 HEXGATE_SEED_AGENTS=skip \
+	  HEXGATE_NOTEBOOK=deploy/compose_support_demo.py \
+	  python deploy/boot.py
+
+.PHONY: demo-guards
+demo-guards: ## Guarded-agent platform demo (BYOK): flip a plugin on/off live. Open http://localhost:2718
+	rm -f platform/api/demo-guards.db platform/api/demo-guards.db-wal platform/api/demo-guards.db-shm
+	PATH="$(CURDIR)/platform/api/.venv/bin:$$PATH" \
+	  DATABASE_URL="sqlite+aiosqlite:///$(CURDIR)/platform/api/demo-guards.db" \
+	  HEXGATE_DEMO=1 HEXGATE_COOKIE_SECURE=0 HEXGATE_SEED_AGENTS=skip \
+	  HEXGATE_NOTEBOOK="$(CURDIR)/deploy/guards-demo/notebook.py" \
 	  python deploy/boot.py
 
 .PHONY: demo-smoke

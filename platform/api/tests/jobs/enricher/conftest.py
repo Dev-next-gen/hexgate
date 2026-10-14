@@ -5,6 +5,7 @@ can assert ordering, and a job factory wired with those fakes."""
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -129,6 +130,38 @@ def usage_attrs(**overrides: Any) -> dict[str, Any]:
     return {**base, **overrides}
 
 
+def message_attrs(**overrides: Any) -> dict[str, Any]:
+    base = {
+        semconv.EVENT_ID: str(uuid.uuid4()),
+        semconv.AGENT_NAME: "researcher",
+        semconv.GEN_AI_REQUEST_MODEL: "gpt-4o",
+        semconv.TURN_KEY: "run_1:researcher",
+        semconv.MESSAGE_SEQ: 0,
+        semconv.GEN_AI_INPUT_MESSAGES: json.dumps(
+            [{"role": "user", "parts": [{"type": "text", "content": "hello"}]}]
+        ),
+        semconv.GEN_AI_OUTPUT_MESSAGES: json.dumps(
+            [
+                {
+                    "role": "assistant",
+                    "parts": [{"type": "text", "content": "hi"}],
+                    "finish_reason": "stop",
+                }
+            ]
+        ),
+    }
+    return {**base, **overrides}
+
+
+def run_attrs(**overrides: Any) -> dict[str, Any]:
+    base = {
+        semconv.EVENT_ID: str(uuid.uuid4()),
+        semconv.AGENT_NAME: "researcher",
+        semconv.RUN_ID: str(uuid.uuid4()),
+    }
+    return {**base, **overrides}
+
+
 def ban_attrs(**overrides: Any) -> dict[str, Any]:
     base = {
         semconv.EVENT_ID: str(uuid.uuid4()),
@@ -151,6 +184,7 @@ class FakeRecord:
     topic: str = "hexgate.otlp.raw"
     partition: int = 0
     offset: int = 0
+    timestamp: int = 0  # ms, Kafka record time
 
 
 @dataclass
@@ -193,8 +227,10 @@ def make_job(monkeypatch: pytest.MonkeyPatch):
 
         def _log_insert(*args: Any, **kwargs: Any) -> None:
             calls.append("insert")
-            if _make.insert_failures:  # consume one scheduled failure
-                raise _make.insert_failures.pop(0)
+            if _make.insert_failures:  # consume one scheduled outcome
+                failure = _make.insert_failures.pop(0)
+                if failure is not None:  # None schedules a success
+                    raise failure
 
         clickhouse.insert.side_effect = _log_insert
         _make.insert_failures = list(insert_side_effect or [])

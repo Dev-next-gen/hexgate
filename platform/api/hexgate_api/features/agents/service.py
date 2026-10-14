@@ -1,24 +1,41 @@
 """Agent + version persistence, policy-bundle compilation, manifest registration.
 
 Groups the agent read/write helpers, the save-time WASM bundle compile+sign
-(``compile_bundle`` shells out to the SDK/opa), and the ``hexgate register``
-upsert path (manifest → Agent + AgentVersion + Tool rows, with a generated
-starter policy on first registration).
+(``compile_bundle`` shells out to the SDK/opa), the ``hexgate register``
+upsert path (manifest → Agent + AgentVersion + Tool + Skill rows, with a
+generated starter policy on first registration), and the agent's AI Act
+classification entry (the operator's own assertion about the system, at the
+end of the file).
 """
 
 import asyncio
 import hashlib
 import json
 import logging
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+from pydantic import ValidationError
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from hexgate_api.core.ids import new_id
-from hexgate_api.models import Agent, AgentVersion, Tool
-from hexgate_api.schemas import AgentManifest, ToolDefinition
+from hexgate_api.models import (
+    Agent,
+    AgentClassification,
+    AgentVersion,
+    Skill,
+    Tool,
+    utcnow,
+)
+from hexgate_api.schemas import (
+    AgentClassificationWrite,
+    AgentManifest,
+    SkillDefinition,
+    ToolDefinition,
+)
 from hexgate_api.features.agents.seed_data import SEED_AGENTS
 from hexgate_api.features.agents.compiler import (
     _default_policy_for_manifest,
@@ -30,7 +47,14 @@ from hexgate_api.features.agents.compiler import (
 # SDK-free — policy_modules.service imports the SDK lazily — so it's safe at load.
 from hexgate_api.features.policy_modules.service import DEFAULT_AGENT
 
+if TYPE_CHECKING:
+    from hexgate.manifest.models import AgentManifest as SdkAgentManifest
+
 logger = logging.getLogger("hexgate.platform.agents")
+
+
+class DuplicateSkillNameError(Exception):
+    """One manifest declares two skills of the same name. Routes -> 409."""
 
 
 async def ensure_seeded_agents(session: AsyncSession, project_id: str) -> None:
@@ -87,7 +111,11 @@ def _apply_bundle(agent: Agent, bundle: tuple[bytes, str, bytes] | None) -> None
     """Set an agent's three bundle columns from a compile result, or null all
     three when ``bundle`` is ``None`` (drop a stale bundle → the SDK falls back
     to the pydantic engine). One place so the triple can't drift when a bundle
-    column is added or its ordering changes."""
+    column is added or its ordering changes.
+
+    Touches no ``updated_*`` column: the fan-out callers rebuild a derived
+    artifact, so stamping would credit a recompile nobody authored.
+    """
     if bundle is None:
         agent.compiled_wasm = None
         agent.bundle_manifest = None
@@ -127,7 +155,7 @@ async def _modular_bundle(
     from hexgate_api.features.policy_modules import service as modules
 
     try:
-        policy_yaml = await modules.resolved_policy_yaml(
+        policy_yaml = await modules.resolved_policy_yaml_auto(
             session, project_id, agent=agent
         )
     except modules.compose_error_types() as exc:
@@ -157,7 +185,9 @@ async def _resolved_yaml_or_none(
     from hexgate_api.features.policy_modules import service as modules
 
     try:
-        return await modules.resolved_yaml_by_agent(session, project_id, agent_names)
+        return await modules.resolved_yaml_by_agent_auto(
+            session, project_id, agent_names
+        )
     except modules.compose_error_types() as exc:
         logger.warning(
             "modular project %s does not resolve; no bundles: %s", project_id, exc
@@ -307,6 +337,49 @@ async def get_latest_agent_versions_map(
     }
 
 
+async def latest_manifests(
+    session: AsyncSession, project_id: str, names: list[str] | None = None
+) -> "dict[str, SdkAgentManifest]":
+    """Each agent's latest registered manifest, keyed by agent name — the named
+    agents, or every agent in the project when ``names`` is ``None``.
+
+    Built as the SDK's ``AgentManifest``, not the platform's mirror in
+    ``schemas``: the policy checks (``analyze_policy``) are written against the SDK
+    model, and the two are kept by hand and already differ.
+
+    An agent that never registered (or whose version row has no manifest) is
+    omitted, so its manifest-dependent policy checks are skipped. So is one whose
+    stored manifest no longer fits the current schema (a registration older than
+    a schema change): it is logged, and one stale row must not fail the caller's
+    whole project."""
+    if names is not None and not names:
+        return {}
+    from hexgate.manifest.models import AgentManifest as SdkAgentManifest
+
+    stmt = select(Agent.id, Agent.name).where(Agent.project_id == project_id)
+    if names is not None:
+        stmt = stmt.where(Agent.name.in_(names))  # type: ignore[attr-defined]
+    name_by_id = dict((await session.exec(stmt)).all())
+    versions = await get_latest_agent_versions_map(session, list(name_by_id))
+
+    manifests: dict[str, SdkAgentManifest] = {}
+    for agent_id, version in versions.items():
+        name, manifest = name_by_id[agent_id], version.manifest
+        if not manifest:
+            continue
+        try:
+            manifests[name] = SdkAgentManifest.model_validate(manifest)
+        except ValidationError as exc:
+            logger.warning(
+                "agent %r in project %s has a stored manifest that no longer "
+                "validates; skipping its manifest checks: %s",
+                name,
+                project_id,
+                exc,
+            )
+    return manifests
+
+
 async def update_agent(
     session: AsyncSession,
     project_id: str,
@@ -316,6 +389,7 @@ async def update_agent(
     policy_yaml: str | None = None,
     system_md: str | None = None,
     sign: Callable[[bytes], bytes] | None = None,
+    updated_by_user_id: str | None = None,
 ) -> Agent | None:
     from datetime import datetime, timezone
 
@@ -342,6 +416,7 @@ async def update_agent(
             _apply_bundle(agent, bundle)
 
     agent.updated_at = datetime.now(timezone.utc)
+    agent.updated_by_user_id = updated_by_user_id
     session.add(agent)
     await session.commit()
     await session.refresh(agent)
@@ -435,6 +510,7 @@ async def register_manifest(
     manifest: AgentManifest,
     *,
     sign: Callable[[bytes], bytes],
+    actor_user_id: str | None = None,
 ) -> tuple[AgentVersion, bool]:
     """Upsert an agent + version from an AgentManifest.
 
@@ -456,10 +532,13 @@ async def register_manifest(
     On subsequent registers of an existing agent, ``agent.policy_yaml`` is
     left alone — policy belongs to the operator, manifest updates are just
     snapshot churn.
+
+    ``actor_user_id`` (the key's owner) creates the ``Agent`` and every
+    ``AgentVersion``; a re-register never rewrites an existing creator.
     """
     content_hash = compute_manifest_hash(manifest)
     agent, agent_created = await _get_or_create_agent(
-        session, project_id, manifest.name
+        session, project_id, manifest.name, created_by_user_id=actor_user_id
     )
 
     if agent_created:
@@ -490,9 +569,15 @@ async def register_manifest(
 
     next_version = 1 if agent_created else await _next_version_number(session, agent.id)
     version = await _create_agent_version(
-        session, agent.id, manifest, content_hash, next_version
+        session,
+        agent.id,
+        manifest,
+        content_hash,
+        next_version,
+        created_by_user_id=actor_user_id,
     )
     await _create_tools(session, version.id, manifest.tools)
+    await _create_skills(session, version.id, manifest.skills)
 
     await session.commit()
     await session.refresh(version)
@@ -500,13 +585,19 @@ async def register_manifest(
 
 
 async def _get_or_create_agent(
-    session: AsyncSession, project_id: str, name: str
+    session: AsyncSession,
+    project_id: str,
+    name: str,
+    *,
+    created_by_user_id: str | None = None,
 ) -> tuple[Agent, bool]:
     """Return the Agent for (project_id, name), creating it if missing.
 
     The agent_yaml / policy_yaml columns are legacy NOT-NULL fields from the
     YAML-edited dashboard flow; code-defined agents leave them empty since the
     actual content lives on each AgentVersion.
+
+    ``created_by_user_id`` applies on create only.
     """
     agent = await get_agent(session, project_id, name)
     if agent is not None:
@@ -518,6 +609,7 @@ async def _get_or_create_agent(
         agent_yaml="",
         policy_yaml="",
         system_md="",
+        created_by_user_id=created_by_user_id,
     )
     session.add(agent)
     await session.flush()
@@ -553,6 +645,8 @@ async def _create_agent_version(
     manifest: AgentManifest,
     content_hash: str,
     version: int,
+    *,
+    created_by_user_id: str | None = None,
 ) -> AgentVersion:
     """Create and persist a new AgentVersion row for `manifest`."""
     row = AgentVersion(
@@ -562,6 +656,7 @@ async def _create_agent_version(
         description=manifest.description,
         content_hash=content_hash,
         manifest=manifest.model_dump(mode="json"),
+        created_by_user_id=created_by_user_id,
     )
     session.add(row)
     await session.flush()
@@ -584,3 +679,183 @@ async def _create_tools(
                 input_schema=tool.input_schema.model_dump(mode="json"),
             )
         )
+
+
+async def _create_skills(
+    session: AsyncSession,
+    agent_version_id: str,
+    skills: list[SkillDefinition] | None,
+) -> None:
+    """Insert one Skill row per SkillDefinition under an agent version.
+
+    ``None`` — every framework without a skill concept — writes nothing.
+
+    Pre-checks for same-name skills rather than letting UNIQUE raise at
+    commit, on the ``create_project`` precedent: an IntegrityError escaping
+    the route is a 500 with no usable message, since nothing registers an
+    exception handler. The SDK already collapses duplicates, so this only
+    fires for a caller that bypasses it.
+    """
+    names: set[str] = set()
+    for skill in skills or []:
+        if skill.name in names:
+            raise DuplicateSkillNameError(
+                f"skill {skill.name!r} is declared more than once"
+            )
+        names.add(skill.name)
+
+    for skill in skills or []:
+        session.add(
+            Skill(
+                id=new_id(Skill),
+                agent_version_id=agent_version_id,
+                name=skill.name,
+                description=skill.description,
+                source=skill.source,
+                resources=(
+                    skill.resources.model_dump(mode="json")
+                    if skill.resources is not None
+                    else None
+                ),
+                allowed_tools=list(skill.allowed_tools),
+                additional_tools=list(skill.additional_tools),
+                content_hash=skill.content_hash,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# AI Act classification — one entry per agent, holding what the *operator*
+# asserts about the system: its intended purpose, their role under the Act,
+# the risk tier they assessed it into, and the person accountable for human
+# oversight.
+#
+# The platform records the assertion and validates nothing about its
+# substance: no check that a tier fits the agent's tool set, no warning when a
+# high-risk agent grants a dangerous tool. Classifying is the operator's act,
+# and second-guessing it would be asserting something we are not in a position
+# to assert. The only rule here is *completeness* — which fields are filled in
+# — because the report lists incomplete entries rather than omitting them.
+# ---------------------------------------------------------------------------
+
+
+# Fields completeness requires, in the order they're reported. ``annex_iii_point``
+# slots in after the tier and is required only when the operator asserted
+# "high_risk" — an Annex III point is what makes that tier checkable.
+_REQUIRED_FIELDS = (
+    "intended_purpose",
+    "operator_role",
+    "risk_tier",
+    "oversight_owner_name",
+)
+_HIGH_RISK_FIELDS = (
+    "intended_purpose",
+    "operator_role",
+    "risk_tier",
+    "annex_iii_point",
+    "oversight_owner_name",
+)
+_HIGH_RISK = "high_risk"
+
+
+def missing_fields(entry: AgentClassification | None) -> list[str]:
+    """Name what an entry still lacks — every required field when there is none.
+
+    A prefilled-but-unsaved purpose does not count: the operator has to record
+    the entry for it to be an assertion.
+    """
+    if entry is None:
+        return list(_REQUIRED_FIELDS)
+    required = _HIGH_RISK_FIELDS if entry.risk_tier == _HIGH_RISK else _REQUIRED_FIELDS
+    return [field for field in required if not getattr(entry, field)]
+
+
+async def get_classification(
+    session: AsyncSession, agent_id: str
+) -> AgentClassification | None:
+    """The agent's current entry, or None when the operator hasn't recorded one."""
+    stmt = select(AgentClassification).where(AgentClassification.agent_id == agent_id)
+    return (await session.exec(stmt)).first()
+
+
+async def manifest_intended_purpose(session: AsyncSession, agent: Agent) -> str | None:
+    """The registered manifest's description, for prefilling a fresh entry.
+
+    The SDK's manifest description is the closest thing the platform already
+    holds to an Art. 3(12) intended purpose, so the form opens on it rather
+    than on a blank field. It is a suggestion only — nothing is stored until
+    the operator PUTs the entry.
+    """
+    latest = (await get_latest_agent_versions_map(session, [agent.id])).get(agent.id)
+    if latest is None or not latest.manifest:
+        return None
+    description = latest.manifest.get("description")
+    return description or None
+
+
+def _apply(
+    entry: AgentClassification,
+    values: AgentClassificationWrite,
+    recorded_by_user_id: str,
+) -> None:
+    """Overwrite an entry's fields, then stamp the provenance server-side.
+
+    Provenance is never taken from the body: a caller cannot record an
+    assertion in someone else's name or backdate one.
+    """
+    for field, value in values.model_dump().items():
+        setattr(entry, field, value)
+    entry.recorded_by_user_id = recorded_by_user_id
+    entry.recorded_at = utcnow()
+
+
+async def upsert_classification(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    recorded_by_user_id: str,
+    values: AgentClassificationWrite,
+) -> AgentClassification:
+    """Replace the agent's entry with ``values``, stamped with who and when.
+
+    A full replace, matching the PUT: a field the operator left out is cleared,
+    not kept from the previous entry.
+    """
+    entry = await get_classification(session, agent_id)
+    if entry is not None:
+        _apply(entry, values, recorded_by_user_id)
+        await session.commit()
+        return entry
+
+    # No entry yet, so this is an INSERT and it can lose a race — a
+    # double-clicked Save, or two tabs (or two members) saving at once. Both
+    # requests read "no entry", both INSERT, and ``uq_agent_classification``
+    # rejects the second.
+    #
+    # The INSERT goes inside a SAVEPOINT rather than straight onto the request's
+    # transaction. A plain ``session.rollback()`` here would recover the write
+    # but expire every object the request had already loaded — the route's
+    # ``Agent`` among them — so the next attribute read on one of those raises
+    # MissingGreenlet and the operator gets a 500 on a write that landed. The
+    # savepoint rolls back only the failed INSERT and leaves the rest of the
+    # request's identity map untouched.
+    fresh = AgentClassification(
+        id=new_id(AgentClassification),
+        agent_id=agent_id,
+        recorded_by_user_id=recorded_by_user_id,
+    )
+    _apply(fresh, values, recorded_by_user_id)
+    try:
+        async with session.begin_nested():
+            session.add(fresh)
+    except IntegrityError:
+        # Take the row that won and write our values onto it: last write wins,
+        # and the provenance stamp follows the values it recorded.
+        winner = await get_classification(session, agent_id)
+        if winner is None:
+            raise  # Not the race — some other constraint; don't swallow it.
+        _apply(winner, values, recorded_by_user_id)
+        await session.commit()
+        return winner
+    await session.commit()
+    return fresh

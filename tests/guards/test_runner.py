@@ -13,15 +13,16 @@ import pytest
 from hexgate.guards import after_tool, before_tool
 from hexgate.guards.runner import run_guarded_async, run_guarded_sync
 from hexgate.guards.types import (
-    Halt,
     Guard,
     GuardEvent,
+    Halt,
     Modification,
     Proceed,
     ToolCall,
     ToolOutcome,
     ToolPipeline,
 )
+from hexgate.runtime.run_facts import run_scope
 from hexgate.security.decision import DecisionOutcome
 from tests.guards.helpers import FakeEnforcer, RecordingInvoke, langchain_error
 
@@ -312,11 +313,53 @@ async def test_post_guard_arg_rewrite_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_guard_result_rewrite_is_rejected() -> None:
-    enf, inv = FakeEnforcer(), RecordingInvoke()
-    pipe = _pipe(post=[lambda call, out: Proceed(result="rewritten")])
-    with pytest.raises(ValueError, match="result rewrite"):
-        await _run(enf, pipe, {"x": 1}, invoke=inv)
+async def test_post_guard_result_rewrite_replaces_the_value() -> None:
+    """A post-guard's Proceed(result=...) rewrites the tool's return (R-GUARD-003);
+    the tool still ran, only its result is replaced."""
+    enf, inv = FakeEnforcer(), RecordingInvoke("leaked-secret")
+    pipe = _pipe(post=[lambda call, out: Proceed(result="[REDACTED]")])
+    out = await _run(enf, pipe, {"x": 1}, invoke=inv)
+    assert out == "[REDACTED]"
+    assert inv.calls == [{"x": 1}]  # the tool DID run
+
+
+@pytest.mark.asyncio
+async def test_post_guard_result_rewrite_chains_to_the_next_post_guard() -> None:
+    """A later post-guard sees the rewritten value, not the original."""
+    seen: list = []
+
+    def first(call, out):
+        return Proceed(result="one")
+
+    def second(call, out):
+        seen.append(out.value)
+        return None
+
+    enf, inv = FakeEnforcer(), RecordingInvoke("orig")
+    out = await _run(enf, _pipe(post=[first, second]), {"x": 1}, invoke=inv)
+    assert out == "one"
+    assert seen == ["one"]  # second saw the rewrite, not "orig"
+
+
+@pytest.mark.asyncio
+async def test_post_guard_result_rewrite_rejected_on_a_failed_call() -> None:
+    """There is no result to rewrite when the tool raised."""
+    enf = FakeEnforcer()
+
+    async def boom(_final):
+        raise RuntimeError("boom")
+
+    pipe = _pipe(post=[lambda call, out: Proceed(result="x")])
+    with pytest.raises(ValueError, match="no result to rewrite"):
+        await run_guarded_async(
+            "echo",
+            {"x": 1},
+            enforcer=enf,
+            pipeline=pipe,
+            approval_handler=None,
+            invoke=boom,
+            render_error=langchain_error,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -687,3 +730,65 @@ async def test_post_halt_records_both_the_allow_and_the_guard_denial() -> None:
     markers = [d.error_type for d in enf.recorded]
     assert DecisionOutcome.ALLOW in outcomes  # the tool genuinely ran
     assert "guard_denied" in markers  # and the halt is also on the trail
+
+
+# ---------------------------------------------------------------------------
+# Guard halts carry the run they happened in
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pre_halt_carries_the_enclosing_run_id() -> None:
+    """A halt and the call it interrupts must share a run_id, or a per-run
+    timeline shows the tool calls but not the guard that stopped them."""
+    enf, inv = FakeEnforcer(), RecordingInvoke()
+    pipe = _pipe(pre=[lambda call: Halt(reason="blocked")])
+
+    with run_scope("agent") as facts:
+        await _run(enf, pipe, {"x": 1}, invoke=inv)
+
+    assert enf.recorded[0].run.run_id == facts.id
+
+
+@pytest.mark.asyncio
+async def test_post_halt_counts_the_tool_that_already_ran() -> None:
+    """A post-guard halt withholds the result, but the side effect happened —
+    so the call stays counted."""
+    enf, inv = FakeEnforcer(), RecordingInvoke("val")
+    pipe = _pipe(post=[lambda call, out: Halt(reason="withheld")])
+
+    with run_scope("agent") as facts:
+        await _run(enf, pipe, {"x": 1}, invoke=inv)
+
+    halt = next(d for d in enf.recorded if d.error_type == "guard_denied")
+    assert halt.run.run_id == facts.id
+    assert halt.run.tool_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_halt_outside_a_run_scope_is_detached() -> None:
+    enf, inv = FakeEnforcer(), RecordingInvoke()
+    pipe = _pipe(pre=[lambda call: Halt(reason="blocked")])
+
+    await _run(enf, pipe, {"x": 1}, invoke=inv)
+
+    assert enf.recorded[0].run.run_id == ""
+
+
+def test_sync_halt_carries_the_enclosing_run_id() -> None:
+    """The sync path builds the same Decision as the async one."""
+    enf, inv = FakeEnforcer(), RecordingInvoke()
+    pipe = _pipe(pre=[lambda call: Halt(reason="blocked")])
+
+    with run_scope("agent") as facts:
+        run_guarded_sync(
+            "echo",
+            {"x": 1},
+            enforcer=enf,
+            pipeline=pipe,
+            approval_handler=None,
+            invoke=inv.sync,
+            render_error=langchain_error,
+        )
+
+    assert enf.recorded[0].run.run_id == facts.id

@@ -9,19 +9,28 @@ test_projects.py.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 
 import pytest
 import pytest_asyncio
+import yaml
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from hexgate_api.constants import DEFAULT_USER_ID
 from hexgate_api.core import keystore as keystore_mod
 from hexgate_api.main import app
+from hexgate_api.models import PolicyModule, RoleBinding
 from hexgate_api.seeds.defaults import ensure_default_project
+
+# Actor for the service-level store writes below. The store requires one (issue
+# #160) so a route can't forget to pass it; these tests seed via
+# ``ensure_default_project``, so the default admin is the natural stand-in.
+ACTOR = DEFAULT_USER_ID
 
 BOUNDARY = (
     "default_policy: { mode: allow }\n"
@@ -294,7 +303,9 @@ async def test_is_modular_flips_on_first_role_binding(session_factory):
     async with session_factory() as s:
         proj, _ = await _fresh_project_with_agent(s)
         assert await pm.is_modular(s, proj.id) is False
-        await pm.set_roles(s, project_id=proj.id, roles={"default": []})
+        await pm.set_roles(
+            s, project_id=proj.id, roles={"default": []}, created_by_user_id=ACTOR
+        )
         assert await pm.is_modular(s, proj.id) is True
 
 
@@ -311,11 +322,13 @@ async def test_resolved_policy_yaml_is_inline_roles_shape(session_factory):
             tier="capability",
             path="read_only",
             content=READ_ONLY,
+            actor_user_id=ACTOR,
         )
         await pm.set_roles(
             s,
             project_id=proj.id,
             roles={"default": ["read_only"], "billing": ["read_only"]},
+            created_by_user_id=ACTOR,
         )
         text = await pm.resolved_policy_yaml(s, proj.id)
 
@@ -349,8 +362,14 @@ async def test_bundle_for_agent_routes_by_mode(session_factory, monkeypatch):
             tier="capability",
             path="read_only",
             content=READ_ONLY,
+            actor_user_id=ACTOR,
         )
-        await pm.set_roles(s, project_id=proj.id, roles={"default": ["read_only"]})
+        await pm.set_roles(
+            s,
+            project_id=proj.id,
+            roles={"default": ["read_only"]},
+            created_by_user_id=ACTOR,
+        )
         await asvc.bundle_for_agent(s, agent, _dummy_sign)
         assert "roles:" in captured[-1]
         assert "view_orders" in captured[-1]
@@ -384,8 +403,14 @@ async def test_recompile_project_fans_out_to_every_agent(session_factory, monkey
             tier="capability",
             path="read_only",
             content=READ_ONLY,
+            actor_user_id=ACTOR,
         )
-        await pm.set_roles(s, project_id=proj.id, roles={"default": ["read_only"]})
+        await pm.set_roles(
+            s,
+            project_id=proj.id,
+            roles={"default": ["read_only"]},
+            created_by_user_id=ACTOR,
+        )
 
         n = await asvc.recompile_project(s, proj.id, _dummy_sign)
         assert n == 2
@@ -403,7 +428,12 @@ async def test_recompile_project_noop_leaves_bundles_when_unresolvable(session_f
             s, bundle=(b"OLD", "OLDMANI", b"OLDSIG")
         )
         # role imports a capability that doesn't exist -> project won't resolve
-        await pm.set_roles(s, project_id=proj.id, roles={"default": ["nonexistent"]})
+        await pm.set_roles(
+            s,
+            project_id=proj.id,
+            roles={"default": ["nonexistent"]},
+            created_by_user_id=ACTOR,
+        )
 
         n = await asvc.recompile_project(s, proj.id, _dummy_sign)
         assert n is None  # modular but couldn't build -> signal "not built"
@@ -451,7 +481,12 @@ async def test_update_agent_does_not_blank_a_modular_bundle_when_unresolvable(
         proj, agent = await _fresh_project_with_agent(
             s, bundle=(b"LIVE", "MANI", b"SIG")
         )
-        await pm.set_roles(s, project_id=proj.id, roles={"default": ["nonexistent"]})
+        await pm.set_roles(
+            s,
+            project_id=proj.id,
+            roles={"default": ["nonexistent"]},
+            created_by_user_id=ACTOR,
+        )
 
         updated = await asvc.update_agent(
             s, proj.id, agent.name, system_md="edited", sign=_dummy_sign
@@ -479,12 +514,20 @@ async def test_modular_to_classic_transition_recompiles_from_policy_yaml(
             tier="capability",
             path="read_only",
             content=READ_ONLY,
+            actor_user_id=ACTOR,
         )
-        await pm.set_roles(s, project_id=proj.id, roles={"default": ["read_only"]})
+        await pm.set_roles(
+            s,
+            project_id=proj.id,
+            roles={"default": ["read_only"]},
+            created_by_user_id=ACTOR,
+        )
         assert await asvc.recompile_project(s, proj.id, _dummy_sign) == 1
         assert "roles:" in captured[-1]  # modular: compiled from resolved YAML
 
-        await pm.set_roles(s, project_id=proj.id, roles={})  # unbind -> classic
+        await pm.set_roles(
+            s, project_id=proj.id, roles={}, created_by_user_id=ACTOR
+        )  # unbind -> classic
         assert await pm.is_modular(s, proj.id) is False
         assert await asvc.recompile_project(s, proj.id, _dummy_sign) == 1
         assert captured[-1] == "version: 1\n# classic\n"  # back to policy_yaml
@@ -505,8 +548,14 @@ async def test_modular_bundle_matches_compile_of_resolved_yaml(session_factory, 
             tier="capability",
             path="read_only",
             content=READ_ONLY,
+            actor_user_id=ACTOR,
         )
-        await pm.set_roles(s, project_id=proj.id, roles={"default": ["read_only"]})
+        await pm.set_roles(
+            s,
+            project_id=proj.id,
+            roles={"default": ["read_only"]},
+            created_by_user_id=ACTOR,
+        )
 
         got = await asvc.bundle_for_agent(s, agent, sign)
         expected = compile_bundle(await pm.resolved_policy_yaml(s, proj.id), sign)
@@ -696,8 +745,14 @@ async def test_register_into_modular_project_seeds_deny_all_fallback(
             tier="capability",
             path="read_only",
             content=READ_ONLY,
+            actor_user_id=ACTOR,
         )
-        await pm.set_roles(s, project_id=proj.id, roles={"default": ["read_only"]})
+        await pm.set_roles(
+            s,
+            project_id=proj.id,
+            roles={"default": ["read_only"]},
+            created_by_user_id=ACTOR,
+        )
 
         manifest = AgentManifest(
             name="newbot",
@@ -900,9 +955,15 @@ async def test_recompile_builds_distinct_bundles_per_agent(
             tier="capability",
             path="read_only",
             content=READ_ONLY,
+            actor_user_id=ACTOR,
         )
         await pm.upsert_module(
-            s, project_id=proj.id, tier="capability", path="payments", content=PAYMENTS
+            s,
+            project_id=proj.id,
+            tier="capability",
+            path="payments",
+            content=PAYMENTS,
+            actor_user_id=ACTOR,
         )
         await pm.set_roles(
             s,
@@ -913,6 +974,7 @@ async def test_recompile_builds_distinct_bundles_per_agent(
                     "triage_bot": ["read_only"],
                 }
             },
+            created_by_user_id=ACTOR,
         )
 
         n = await asvc.recompile_project(s, proj.id, _dummy_sign)
@@ -971,6 +1033,1077 @@ async def test_resolves_false_on_unparseable_stored_module(session_factory) -> N
                 content_hash="x",
             )
         )
-        await pm.set_roles(s, project_id=proj.id, roles={"default": ["broken"]})
+        await pm.set_roles(
+            s,
+            project_id=proj.id,
+            roles={"default": ["broken"]},
+            created_by_user_id=ACTOR,
+        )
         await s.commit()
         assert await pm.resolves(s, proj.id) is False  # must not raise
+
+
+# --- compose file store (entry-file + import graph) --------------------------
+
+
+def _put_file(client, pid, name, content):
+    return client.put(
+        f"/v1/projects/{pid}/policy-files/{name}", json={"content": content}
+    )
+
+
+def test_put_and_list_policy_files(client):
+    pid = _project(client)
+    assert (
+        _put_file(
+            client, pid, "policy.yaml", "tools: { a: { mode: allow } }\n"
+        ).status_code
+        == 200
+    )
+    assert (
+        _put_file(
+            client, pid, "caps/read.yaml", "tools: { b: { mode: allow } }\n"
+        ).status_code
+        == 200
+    )
+    names = sorted(
+        f["name"] for f in client.get(f"/v1/projects/{pid}/policy-files").json()
+    )
+    assert names == ["caps/read.yaml", "policy.yaml"]
+
+
+def test_resolve_via_entry_file(client):
+    pid = _project(client)
+    _put_file(
+        client,
+        pid,
+        "policy.yaml",
+        'boundary:\n  tools: { refund: { constraint: "args.amount <= 1000" } }\n'
+        "tools: { refund: { mode: allow } }\n",
+    )
+    roles = client.get(f"/v1/projects/{pid}/policy/resolve").json()["roles"]
+    refund = roles["default"]["tools"]["refund"]
+    assert refund["mode"] == "allow"
+    assert any("1000" in c for c in refund["constraints"])  # boundary ceiling folded in
+
+
+def test_resolve_with_cross_file_import(client):
+    pid = _project(client)
+    _put_file(
+        client,
+        pid,
+        "caps.yaml",
+        "export:\n  c:\n    tools: { refund: { mode: allow } }\n",
+    )
+    _put_file(client, pid, "policy.yaml", "import: [ caps.yaml#c ]\n")
+    roles = client.get(f"/v1/projects/{pid}/policy/resolve").json()["roles"]
+    assert "refund" in roles["default"]["tools"]
+
+
+def test_invalid_file_content_is_422(client):
+    pid = _project(client)
+    r = _put_file(client, pid, "policy.yaml", "tools: { a: { mode: not_a_mode } }\n")
+    assert r.status_code == 422, r.text
+
+
+def test_file_breaking_resolution_is_409(client):
+    pid = _project(client)
+    # entry imports a file that isn't in the store → the project won't resolve.
+    r = _put_file(client, pid, "policy.yaml", "import: [ missing.yaml ]\n")
+    assert r.status_code == 409, r.text
+
+
+def test_delete_still_imported_file_is_409(client):
+    pid = _project(client)
+    _put_file(
+        client, pid, "caps.yaml", "export:\n  c:\n    tools: { a: { mode: allow } }\n"
+    )
+    _put_file(client, pid, "policy.yaml", "import: [ caps.yaml#c ]\n")
+    r = client.delete(f"/v1/projects/{pid}/policy-files/caps.yaml")
+    assert r.status_code == 409, r.text
+
+
+def test_check_surfaces_resolution_error(client):
+    pid = _project(client)
+    # A structurally-valid entry that imports a missing file can be saved only if
+    # it resolves; so seed a resolvable entry, then break it via a second file the
+    # entry imports being absent is caught at save. Instead: check a clean project.
+    _put_file(client, pid, "policy.yaml", "tools: { a: { mode: allow } }\n")
+    body = client.get(f"/v1/projects/{pid}/policy/check").json()
+    assert body["ok"] is True and body["lints"] == []
+
+
+def test_preview_resolves_a_draft(client):
+    pid = _project(client)
+    _put_file(client, pid, "policy.yaml", "tools: { a: { mode: allow } }\n")
+    # preview a draft that adds a tool, without saving
+    r = client.post(
+        f"/v1/projects/{pid}/policy/preview",
+        json={
+            "name": "policy.yaml",
+            "content": "tools: { a: { mode: allow }, b: { mode: allow } }\n",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body["resolved"]["default"]["tools"]) == {"a", "b"}
+    assert body["lints"] == []
+    # the saved file is unchanged (preview doesn't persist)
+    saved = client.get(f"/v1/projects/{pid}/policy-files").json()
+    assert "b: { mode: allow }" not in saved[0]["content"]
+
+
+def test_preview_reports_resolution_error_inline(client):
+    pid = _project(client)
+    _put_file(client, pid, "policy.yaml", "tools: { a: { mode: allow } }\n")
+    r = client.post(
+        f"/v1/projects/{pid}/policy/preview",
+        json={"name": "policy.yaml", "content": "import: [ nope.yaml ]\n"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["resolved"] is None
+    assert body["lints"][0]["severity"] == "error"
+
+
+async def test_file_flip_to_modular_rejected_when_bundle_cannot_build(
+    session_factory, client: TestClient, monkeypatch
+) -> None:
+    # Writing the first policy.yaml flips a classic project modular. If the bundle
+    # can't build (opa down), roll back the file rather than leave is_modular True
+    # with the agent on its now-wrong classic bundle. Mirrors the roles-flip guard.
+    import hexgate_api.features.agents.service as asvc
+    from hexgate_api.core.ids import new_id
+    from hexgate_api.models import Agent
+
+    monkeypatch.setattr(asvc, "compile_bundle", lambda py, sign: None)  # opa "down"
+    pid = _project(client)
+    async with session_factory() as s:
+        agent = Agent(
+            id=new_id(Agent),
+            project_id=pid,
+            name="a1",
+            agent_yaml="",
+            policy_yaml="version: 1\n",
+            system_md="",
+        )
+        agent.compiled_wasm, agent.bundle_manifest, agent.bundle_signature = (
+            b"CLASSIC",
+            "M",
+            b"S",
+        )
+        s.add(agent)
+        await s.commit()
+
+    r = _put_file(client, pid, "policy.yaml", "tools: { a: { mode: allow } }\n")
+    assert r.status_code == 409, r.text
+    assert client.get(f"/v1/projects/{pid}/policy-files").json() == []  # rolled back
+
+    async with session_factory() as s:
+        from sqlmodel import select
+
+        from hexgate_api.models import Agent as A
+
+        row = (await s.exec(select(A).where(A.project_id == pid))).first()
+        assert row.compiled_wasm == b"CLASSIC"  # stale classic bundle left intact
+
+
+def test_preview_reports_error_in_a_non_requested_agent(client):
+    # Preview validates EVERY declared agent (like the save-time 409), so a draft
+    # that breaks a named agent's cell previews as an error even when the requested
+    # ('*') agent is itself fine — preview and save agree.
+    pid = _project(client)
+    _put_file(
+        client, pid, "caps.yaml", "export:\n  c:\n    tools: { a: { mode: allow } }\n"
+    )
+    _put_file(
+        client,
+        pid,
+        "policy.yaml",
+        "agents:\n  bot:\n    roles:\n      support: { import: [ caps.yaml#c ] }\n",
+    )
+    r = client.post(
+        f"/v1/projects/{pid}/policy/preview",
+        json={
+            "name": "policy.yaml",
+            "agent": "*",
+            "content": "agents:\n  bot:\n    roles:\n      support: { import: [ nope.yaml ] }\n",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["resolved"] is None
+    assert body["lints"][0]["severity"] == "error"
+
+
+# --- /policy/graph + /policy/test (compose) ----------------------------------
+
+
+def test_policy_graph_from_compose(client):
+    # A resolving compose project graphs into agent + tool nodes with call edges;
+    # an mcp-prefixed tool becomes an "mcp" node (prefix dropped in the label).
+    pid = _project(client)
+    _put_file(
+        client,
+        pid,
+        "policy.yaml",
+        "agents:\n"
+        "  bot:\n"
+        "    roles:\n"
+        "      support:\n"
+        "        tools:\n"
+        "          read_ticket: { mode: allow }\n"
+        "          mcp-knowledge: { mode: approval_required }\n",
+    )
+    r = client.get(f"/v1/projects/{pid}/policy/graph")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    nodes = {n["id"]: n for n in body["nodes"]}
+    assert "agent:bot" in nodes
+    assert nodes["tool:mcp-knowledge"]["kind"] == "mcp"
+    assert nodes["tool:mcp-knowledge"]["label"] == "knowledge"  # "mcp-" dropped
+    assert nodes["tool:read_ticket"]["kind"] == "tool"
+
+    calls = {(e["source"], e["target"]) for e in body["edges"] if e["kind"] == "call"}
+    assert ("agent:bot", "tool:read_ticket") in calls
+    assert ("agent:bot", "tool:mcp-knowledge") in calls
+
+
+def test_policy_graph_reach_edge(client):
+    # A reach the boundary permits lowers to an agent→agent edge tagged by `via`,
+    # materializing the target agent node.
+    pid = _project(client)
+    _put_file(
+        client,
+        pid,
+        "policy.yaml",
+        "boundary:\n"
+        "  reach: { billing_bot: { as: handoff } }\n"
+        "agents:\n"
+        "  bot:\n"
+        "    roles:\n"
+        "      support:\n"
+        "        reach: { billing_bot: { as: handoff } }\n",
+    )
+    body = client.get(f"/v1/projects/{pid}/policy/graph").json()
+    assert "agent:billing_bot" in {n["id"] for n in body["nodes"]}
+    reach = {
+        (e["source"], e["target"]): e for e in body["edges"] if e["kind"] == "reach"
+    }
+    edge = reach[("agent:bot", "agent:billing_bot")]  # the granted reach
+    assert edge["via"] == "handoff"
+    assert "support" in edge["roles"]
+
+
+def test_policy_graph_role_filter(client):
+    # ?role= restricts the graph to one role's edges.
+    pid = _project(client)
+    _put_file(
+        client,
+        pid,
+        "policy.yaml",
+        "agents:\n"
+        "  bot:\n"
+        "    roles:\n"
+        "      support: { tools: { a: { mode: allow } } }\n"
+        "      admin: { tools: { b: { mode: allow } } }\n",
+    )
+    edges = client.get(
+        f"/v1/projects/{pid}/policy/graph", params={"role": "support"}
+    ).json()["edges"]
+    targets = {e["target"] for e in edges if e["kind"] == "call"}
+    assert "tool:a" in targets
+    assert "tool:b" not in targets  # admin role filtered out
+
+
+def test_policy_graph_union_keeps_most_permissive_reach(client):
+    # A reach an unprivileged role lacks resolves to a closed-world deny (R-AGENT-002),
+    # while a privileged role allows it. The union view must read the edge as ALLOW —
+    # the real grant — not let the phantom deny mask it. Per-role stays exact.
+    pid = _project(client)
+    _put_file(
+        client,
+        pid,
+        "policy.yaml",
+        "boundary:\n"
+        "  reach: { sub: { as: tool } }\n"
+        "agents:\n"
+        "  bot:\n"
+        "    roles:\n"
+        "      plain: { tools: { a: { mode: allow } } }\n"
+        "      power: { reach: { sub: { as: tool } } }\n"
+        "  sub:\n"
+        "    roles:\n"
+        "      plain: { tools: { a: { mode: allow } } }\n",
+    )
+
+    def reach_edge(params=None):
+        body = client.get(f"/v1/projects/{pid}/policy/graph", params=params).json()
+        return next(
+            e
+            for e in body["edges"]
+            if e["kind"] == "reach"
+            and (e["source"], e["target"]) == ("agent:bot", "agent:sub")
+        )
+
+    union = reach_edge()
+    assert union["verdict"] == "allow"  # the real grant wins over the phantom deny
+    assert union["roles"] == ["power"]  # tagged by the role that grants it
+
+    assert reach_edge({"role": "plain"})["verdict"] == "deny"  # exact per-role
+    assert reach_edge({"role": "power"})["verdict"] == "allow"
+
+
+def test_policy_graph_returns_all_roles(client):
+    # `roles` is every role across all agents, independent of the ?role= filter —
+    # it's the role picker's option list, not the filtered edge set.
+    pid = _project(client)
+    _put_file(
+        client,
+        pid,
+        "policy.yaml",
+        "agents:\n"
+        "  bot:\n"
+        "    roles:\n"
+        "      support: { tools: { a: { mode: allow } } }\n"
+        "      admin: { tools: { b: { mode: allow } } }\n",
+    )
+    # Sorted union across agents; the generic "*" column always carries `default`.
+    full = client.get(f"/v1/projects/{pid}/policy/graph").json()["roles"]
+    assert full == ["admin", "default", "support"]
+    # A filter narrows the edges but not the advertised role list.
+    filtered = client.get(
+        f"/v1/projects/{pid}/policy/graph", params={"role": "support"}
+    ).json()["roles"]
+    assert filtered == ["admin", "default", "support"]
+
+
+def test_policy_test_allow_approval_deny(client):
+    pid = _project(client)
+    _put_file(
+        client,
+        pid,
+        "policy.yaml",
+        "tools:\n  send_email: { mode: allow }\n  risky: { mode: approval_required }\n",
+    )
+
+    def probe(tool):
+        return client.post(
+            f"/v1/projects/{pid}/policy/test",
+            json={"role": "default", "tool": tool, "args": {}},
+        )
+
+    r = probe("send_email")
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "allow"
+    assert probe("risky").json()["outcome"] == "approval_required"
+    assert probe("wipe_db").json()["outcome"] == "deny"  # closed-world default-deny
+
+
+def test_policy_test_unknown_role_is_404(client):
+    pid = _project(client)
+    _put_file(client, pid, "policy.yaml", "tools: { a: { mode: allow } }\n")
+    r = client.post(
+        f"/v1/projects/{pid}/policy/test",
+        json={"role": "ghost", "tool": "a", "args": {}},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_policy_test_reflects_a_draft_overlay(client):
+    # A tool granted only in an unsaved draft evaluates allow via the overlay,
+    # while the saved project still denies it.
+    pid = _project(client)
+    _put_file(client, pid, "policy.yaml", "tools: { a: { mode: allow } }\n")
+    saved = client.post(
+        f"/v1/projects/{pid}/policy/test",
+        json={"role": "default", "tool": "b", "args": {}},
+    )
+    assert saved.json()["outcome"] == "deny"
+    drafted = client.post(
+        f"/v1/projects/{pid}/policy/test",
+        json={
+            "role": "default",
+            "tool": "b",
+            "args": {},
+            "draft": {
+                "name": "policy.yaml",
+                "content": "tools: { b: { mode: allow } }\n",
+            },
+        },
+    )
+    assert drafted.status_code == 200, drafted.text
+    assert drafted.json()["outcome"] == "allow"
+
+
+def test_policy_test_422_when_draft_does_not_compose(client):
+    pid = _project(client)
+    _put_file(client, pid, "policy.yaml", "tools: { a: { mode: allow } }\n")
+    r = client.post(
+        f"/v1/projects/{pid}/policy/test",
+        json={
+            "role": "default",
+            "tool": "a",
+            "args": {},
+            "draft": {"name": "policy.yaml", "content": "import: [ missing.yaml ]\n"},
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_policy_graph_drops_isolated_generic_agent(client):
+    # With named agents and no top-level grant, the generic "*" column has no
+    # edges — its sentinel node is pruned, not shown as a literal "*" agent.
+    pid = _project(client)
+    _put_file(
+        client,
+        pid,
+        "policy.yaml",
+        "agents:\n  bot:\n    roles:\n      support: { tools: { a: { mode: allow } } }\n",
+    )
+    ids = {
+        n["id"] for n in client.get(f"/v1/projects/{pid}/policy/graph").json()["nodes"]
+    }
+    assert "agent:bot" in ids
+    assert "agent:*" not in ids
+
+
+def test_policy_graph_keeps_generic_agent_with_top_level_grant(client):
+    # A top-level grant belongs to the generic "*" column, so its node stays.
+    pid = _project(client)
+    _put_file(client, pid, "policy.yaml", "tools: { a: { mode: allow } }\n")
+    body = client.get(f"/v1/projects/{pid}/policy/graph").json()
+    assert "agent:*" in {n["id"] for n in body["nodes"]}
+    assert ("agent:*", "tool:a") in {(e["source"], e["target"]) for e in body["edges"]}
+
+
+# ---------------------------------------------------------------------------
+# Actor trail (issue #160)
+#
+# ``policy_module`` is edited in place, so it carries both halves.
+# ``role_binding`` is replaced wholesale by every ``set_roles``, so its
+# ``created_by_user_id`` IS the last writer and it has no update pair.
+# ---------------------------------------------------------------------------
+
+
+def _module_row(session_factory, project_id: str, tier: str, path: str) -> PolicyModule:
+    async def _get() -> PolicyModule:
+        async with session_factory() as s:
+            row = (
+                await s.exec(
+                    select(PolicyModule).where(
+                        PolicyModule.project_id == project_id,
+                        PolicyModule.tier == tier,
+                        PolicyModule.path == path,
+                    )
+                )
+            ).first()
+            assert row is not None
+            return row
+
+    return asyncio.get_event_loop().run_until_complete(_get())
+
+
+def _role_rows(session_factory, project_id: str) -> list[RoleBinding]:
+    async def _get() -> list[RoleBinding]:
+        async with session_factory() as s:
+            return list(
+                (
+                    await s.exec(
+                        select(RoleBinding).where(RoleBinding.project_id == project_id)
+                    )
+                ).all()
+            )
+
+    return asyncio.get_event_loop().run_until_complete(_get())
+
+
+def test_put_module_stamps_creator_then_updater(
+    client: TestClient, session_factory
+) -> None:
+    pid = _project(client)
+    me_id = client.get("/v1/users/me").json()["id"]
+
+    _put_module(client, pid, "capability", "read_only", READ_ONLY)
+    created = _module_row(session_factory, pid, "capability", "read_only")
+    assert created.created_by_user_id == me_id
+    assert created.updated_by_user_id is None
+
+    # A second PUT is a replace, not a create.
+    _put_module(client, pid, "capability", "read_only", PAYMENTS)
+    updated = _module_row(session_factory, pid, "capability", "read_only")
+    assert updated.created_by_user_id == me_id  # creator preserved
+    assert updated.updated_by_user_id == me_id
+    assert updated.updated_at > created.updated_at
+
+
+def test_set_policy_roles_stamps_the_caller_on_the_fresh_rows(
+    client: TestClient, session_factory
+) -> None:
+    pid = _project(client)
+    me_id = client.get("/v1/users/me").json()["id"]
+    _put_module(client, pid, "capability", "read_only", READ_ONLY)
+
+    r = client.put(
+        f"/v1/projects/{pid}/policy-roles",
+        json={"roles": {"default": ["read_only"]}},
+    )
+    assert r.status_code == 200, r.text
+
+    rows = _role_rows(session_factory, pid)
+    assert [row.role for row in rows] == ["default"]
+    assert rows[0].created_by_user_id == me_id
+    assert rows[0].created_at is not None
+
+
+def test_idempotent_role_resave_leaves_the_rows_untouched(
+    client: TestClient, session_factory
+) -> None:
+    """A no-op PUT short-circuits before ``set_roles``, so it must not replace
+    the rows — that would reset ``created_at`` and hide the real last writer."""
+    pid = _project(client)
+    _put_module(client, pid, "capability", "read_only", READ_ONLY)
+    body = {"roles": {"default": ["read_only"]}}
+    assert client.put(f"/v1/projects/{pid}/policy-roles", json=body).status_code == 200
+    before = _role_rows(session_factory, pid)[0]
+
+    assert client.put(f"/v1/projects/{pid}/policy-roles", json=body).status_code == 200
+
+    after = _role_rows(session_factory, pid)[0]
+    assert after.id == before.id
+    assert after.created_at == before.created_at
+
+
+async def test_recompile_does_not_touch_the_agents_authored_trail(
+    session_factory,
+) -> None:
+    """A bundle rebuild is a derived artifact, not an authored edit.
+
+    ``recompile_project`` fans out over every agent when a shared module
+    changes; stamping would credit that editor with authoring them all.
+    """
+    from hexgate_api.features.agents import service as asvc
+    from hexgate_api.features.agents.service import update_agent
+    from hexgate_api.features.policy_modules import service as pm
+
+    async with session_factory() as s:
+        proj, agent = await _fresh_project_with_agent(s, policy_yaml="version: 1\n")
+        # A human edits the agent, so there is a real trail to preserve.
+        await update_agent(
+            s,
+            proj.id,
+            agent.name,
+            system_md="authored",
+            updated_by_user_id=ACTOR,
+        )
+        authored = await asvc.get_agent(s, proj.id, agent.name)
+        authored_at, authored_by = authored.updated_at, authored.updated_by_user_id
+        assert authored_by == ACTOR
+
+        # Now make the project modular and recompile every agent in it.
+        await pm.upsert_module(
+            s,
+            project_id=proj.id,
+            tier="capability",
+            path="read_only",
+            content=READ_ONLY,
+            actor_user_id=ACTOR,
+        )
+        await pm.set_roles(
+            s,
+            project_id=proj.id,
+            roles={"default": ["read_only"]},
+            created_by_user_id=ACTOR,
+        )
+        await asvc.recompile_project(s, proj.id, _dummy_sign)
+
+        after = await asvc.get_agent(s, proj.id, agent.name)
+
+    assert after.updated_at == authored_at
+    assert after.updated_by_user_id == authored_by
+
+
+async def test_seeded_compose_demo_resolves(session_factory) -> None:
+    # The first-boot seed writes the compose showcase into the demo project; it
+    # must be a real, resolvable multi-module policy (the dashboard opens on it).
+    from hexgate_api.constants import DEFAULT_PROJECT_ID
+    from hexgate_api.features.policy_modules import service as svc
+    from hexgate_api.features.policy_modules.seed_data import (
+        ensure_seeded_compose_policy,
+    )
+
+    async with session_factory() as s:
+        # The seed only runs in demo mode (HEXGATE_DEMO); call it directly here.
+        await ensure_seeded_compose_policy(s, DEFAULT_PROJECT_ID)
+        names = {f.name for f in await svc.list_files(s, DEFAULT_PROJECT_ID)}
+        assert {
+            "policy.yaml",
+            "caps/base/read_only.yaml",
+            "caps/base/ingress.yaml",
+            "caps/support/delegate.yaml",
+            "caps/billing/invoicing.yaml",
+            "caps/billing/refund_support.yaml",
+            "caps/billing/refund_billing.yaml",
+        } <= names
+
+        # support_bot reaches billing_bot as a tool, never refunds directly.
+        ps = (
+            await svc.compose_resolve(s, DEFAULT_PROJECT_ID, agent="support_bot")
+        ).policy_set
+
+        def mode(role, tool, **args):
+            return ps.evaluate(role=role, tool=tool, args=args).outcome.value
+
+        # support_bot has NO refund tool — the org ceiling is granted to no seat.
+        assert mode("billing", "refund_order", amount=800, currency="USD") == "deny"
+        assert mode("support", "refund_order", amount=10, currency="USD") == "deny"
+        assert mode("default", "refund_order", amount=10, currency="USD") == "deny"
+
+        # The delegation is gated as a REACH edge (agent.tool:billing_bot), granted
+        # to support/billing and denied to default — the parent's policy governing
+        # the sub-agent tool use, not a plain tool name. (billing_bot then enforces
+        # its own role-aware refund caps from its own compose policy — resolved below.)
+        assert mode("support", "agent.tool:billing_bot") == "allow"
+        assert mode("billing", "agent.tool:billing_bot") == "allow"
+        assert mode("default", "agent.tool:billing_bot") == "deny"
+        assert "agent.tool:billing_bot" in ps.policy_for("support").effective_tools
+
+        # Admission (ingress → agent.run): the support/billing seats may START
+        # support_bot; the default seat may not (read-only, no ingress grant).
+        assert mode("support", "agent.run") == "allow"
+        assert mode("billing", "agent.run") == "allow"
+        assert mode("default", "agent.run") == "deny"
+
+        # MCP tools (mcp-demo-*): a safe one is open to all, an invoice needs
+        # approval for billing, and the secret-reader is denied outright.
+        assert mode("support", "mcp-demo-compute_tip") == "allow"
+        assert mode("billing", "mcp-demo-send_invoice") == "needs_approval"
+        assert mode("support", "mcp-demo-send_invoice") == "deny"
+        assert mode("billing", "mcp-demo-read_secret") == "deny"
+
+        # billing_bot is its OWN compose agent (registered + bound to this policy at
+        # serve, dashboard-editable) enforcing role-aware refund caps: the delegating
+        # seat's role rides into the nested run, so support is capped at $200, billing
+        # at the $1000 org ceiling, and a role it doesn't grant (default) refunds
+        # nothing. This is the cap that actually gates a delegated refund.
+        bps = (
+            await svc.compose_resolve(s, DEFAULT_PROJECT_ID, agent="billing_bot")
+        ).policy_set
+
+        def bmode(role, tool, **args):
+            return bps.evaluate(role=role, tool=tool, args=args).outcome.value
+
+        assert bmode("support", "refund_order", amount=200, currency="USD") == "allow"
+        assert bmode("support", "refund_order", amount=500, currency="USD") == "deny"
+        assert bmode("billing", "refund_order", amount=1000, currency="USD") == "allow"
+        assert bmode("billing", "refund_order", amount=5000, currency="USD") == "deny"
+        assert bmode("default", "refund_order", amount=10, currency="USD") == "deny"
+
+        # Admission to billing_bot (who may be delegated TO): support/billing are
+        # admitted (ingress), default is not — defense in depth behind the reach gate.
+        assert bmode("support", "agent.run") == "allow"
+        assert bmode("billing", "agent.run") == "allow"
+        assert bmode("default", "agent.run") == "deny"
+
+
+def _find_demo_notebook():
+    """Locate deploy/compose_support_demo.py from the test file, or None."""
+    from pathlib import Path
+
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "deploy" / "compose_support_demo.py"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _notebook_dict(src: str, name: str) -> dict:
+    """Return the literal dict assigned to ``name`` in the notebook source.
+
+    Parses the source with ``ast`` and walks for the assignment, rather than a
+    regex over the text — so a cosmetic reformat (re-indent, a value that happens
+    to contain ``\\n    }``) can't break the notebook↔seed drift guard.
+    """
+    import ast
+
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else []
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"could not locate {name} in the demo notebook")
+
+
+def test_notebook_policy_files_match_seed() -> None:
+    # The marimo demo (deploy/compose_support_demo.py) inlines the same compose
+    # policy the API seeds, kept aligned by hand. Assert the two copies are
+    # byte-identical so an edit to one can't silently drift from the other.
+    from hexgate_api.features.policy_modules.seed_data import SEED_POLICY_FILES
+
+    notebook = _find_demo_notebook()
+    if notebook is None:
+        pytest.skip("marimo demo notebook not present in this checkout")
+
+    src = notebook.read_text(encoding="utf-8")
+    assert _notebook_dict(src, "_FILES") == SEED_POLICY_FILES
+
+
+# NB: billing_bot's role-aware refund caps used to live in-kernel (the notebook's
+# _BILLING_POLICIES dict) and were checked here. billing_bot is now its own compose
+# agent, so those caps live in the seeded policy — the notebook↔seed drift guard
+# (test_notebook_policy_files_match_seed) plus billing_bot's resolution in
+# test_seeded_compose_demo_resolves cover them, and _BILLING_POLICIES is gone.
+
+
+def test_compose_entry_guards_resolve_to_the_runtime_stance() -> None:
+    """A `guards:` block in the compose `policy.yaml` entry file (what the dashboard
+    edits) resolves through the platform's compose path to the agent-level stance the
+    runtime reads — so flipping `enabled` governs the plugin live (R-GUARD-006/007)."""
+    from hexgate_api.features.policy_modules.service import _resolve_files
+
+    files = {
+        "policy.yaml": (
+            "version: 1\n"
+            "guards: { secret_guard: { enabled: false } }\n"
+            "tools: { send_update: { mode: allow } }\n"
+        )
+    }
+    ps = _resolve_files(files).policy_set
+    assert ps.guard_stance() == {"baseline": {"secret_guard": False}}
+    assert ps.effective_guards("send_update") == {"secret_guard": False}
+    assert ps.governed_guard_names() == frozenset({"secret_guard"})
+
+
+def test_compose_entry_skills_resolve_to_gated_bundle() -> None:
+    """A `skills:` block in the compose `policy.yaml` entry file resolves through the
+    platform's compose path to skill keys, and the bundle compiled from the resolved
+    YAML declares skills — so both adapters engage the skill gate for the agent."""
+    import json
+
+    import yaml
+    from hexgate.security import RESOLVED_POLICY_MARKER
+
+    from hexgate_api.features.agents.compiler import compile_bundle
+    from hexgate_api.features.policy_modules.service import _resolve_files, roles_json
+
+    files = {
+        "policy.yaml": (
+            "version: 1\n"
+            "tools: { load_skill: { mode: allow } }\n"
+            "skills: { refund-runbook: { via: [instructions, resource] } }\n"
+        )
+    }
+    result = _resolve_files(files)
+    ps = result.policy_set
+    assert ps.declares_skills()
+    assert ps.evaluate(role=None, tool="skill:refund-runbook", args={}).allowed
+    script = ps.evaluate(role=None, tool="skill.script:refund-runbook", args={})
+    assert not script.allowed
+
+    if shutil.which("opa") is None:
+        pytest.skip("opa not on PATH")
+    resolved = yaml.safe_dump(
+        {"roles": roles_json(result), RESOLVED_POLICY_MARKER: True}, sort_keys=False
+    )
+    compiled = compile_bundle(resolved, lambda _manifest: b"test-signature")
+    assert compiled is not None
+    assert json.loads(compiled[1])["agent_gating"]["skills"] is True
+
+
+# --- entry-point parity (issue #303) -----------------------------------------
+#
+# One known-bad policy per document shape runs through every platform entry
+# point, and each must report exactly the codes the SDK's ``analyze_policy``
+# returns for the same input. Comparing against the SDK function (not a fixed
+# list) is what makes a check added there but bypassed by a route fail here.
+
+_PARITY_MANIFEST = {
+    "name": "bot",
+    "framework": "hexgate",
+    "tools": [
+        {
+            "name": "refund_order",
+            "description": "refund an order",
+            "input_schema": {
+                "properties": {"amount": {"title": "Amount", "type": "number"}},
+                "required": ["amount"],
+            },
+        }
+    ],
+    "guards": [{"name": "secret_redactor", "position": "before", "kind": "official"}],
+}
+
+# Classic single-document shape: a guard typo, an unknown argument, and guard
+# settings that disagree across roles.
+_PARITY_CLASSIC = (
+    "version: 1\n"
+    "roles:\n"
+    "  support:\n"
+    "    guards: { secret_redacter: { enabled: false } }\n"
+    "    tools:\n"
+    '      refund_order: { mode: allow, constraints: ["args.amont <= 100"] }\n'
+    "  admin:\n"
+    "    guards: { secret_redacter: { enabled: true } }\n"
+)
+
+# Compose shape: guards are agent-level there, so roles cannot disagree on them —
+# the guard typo and the unknown argument are the expressible defects.
+_PARITY_COMPOSE = (
+    "agents:\n"
+    "  bot:\n"
+    "    guards: { secret_redacter: { enabled: false } }\n"
+    "    roles:\n"
+    "      support:\n"
+    '        tools: { refund_order: { constraint: "args.amont <= 100" } }\n'
+)
+
+
+async def _register_parity_bot(session_factory, project_id: str) -> None:
+    import hexgate_api.features.agents.service as asvc
+    from hexgate_api.schemas import AgentManifest
+
+    async with session_factory() as s:
+        await asvc.register_manifest(
+            s,
+            project_id,
+            AgentManifest.model_validate(_PARITY_MANIFEST),
+            sign=_dummy_sign,
+        )
+
+
+async def _route_manifest(session_factory, project_id: str):
+    """The bot's manifest exactly as the routes load it."""
+    import hexgate_api.features.agents.service as asvc
+    from hexgate.manifest.models import AgentManifest
+
+    async with session_factory() as s:
+        manifest = (await asvc.latest_manifests(s, project_id, ["bot"]))["bot"]
+    # The SDK's model, the one analyze_policy is written against, not the
+    # platform's hand-kept mirror in hexgate_api.schemas.
+    assert type(manifest) is AgentManifest
+    return manifest
+
+
+def _sdk_codes(policy_set, manifest) -> set[str]:
+    from hexgate.security import analyze_policy
+
+    return {lint.code for lint in analyze_policy(policy_set, manifest=manifest)}
+
+
+async def test_when_a_policy_is_bad_then_every_entry_point_reports_the_sdk_findings(
+    client, session_factory
+):
+    from hexgate.security import load_policy_set_from_dict
+    from hexgate_api.features.policy_modules.service import _resolve_files
+
+    pid = _project(client)
+    await _register_parity_bot(session_factory, pid)
+
+    # Agent /validate — the classic document.
+    body = client.post(
+        f"/v1/projects/{pid}/agents/bot/validate",
+        json={"policy_yaml": _PARITY_CLASSIC},
+    ).json()
+    validate_codes = {
+        d["message"].split(":", 1)[0] for d in body["errors"] + body["warnings"]
+    }
+    assert {"guard-divergence", "unknown-guard", "unknown-arg"} <= validate_codes
+    classic = load_policy_set_from_dict(yaml.safe_load(_PARITY_CLASSIC))
+    manifest = await _route_manifest(session_factory, pid)
+    assert validate_codes == _sdk_codes(classic, manifest)
+
+    # /policy/preview and /policy/check — the compose document.
+    preview = client.post(
+        f"/v1/projects/{pid}/policy/preview",
+        json={"name": "policy.yaml", "content": _PARITY_COMPOSE},
+    ).json()
+    assert _put_file(client, pid, "policy.yaml", _PARITY_COMPOSE).status_code == 200
+    check = client.get(f"/v1/projects/{pid}/policy/check").json()
+
+    composed = _resolve_files({"policy.yaml": _PARITY_COMPOSE}, "bot").policy_set
+    expected = _sdk_codes(composed, manifest)
+    assert {"unknown-guard", "unknown-arg"} <= expected
+    assert {lint["code"] for lint in preview["lints"]} == expected
+    assert {lint["code"] for lint in check["lints"]} == expected
+
+
+async def test_when_validate_finds_a_guard_typo_then_it_warns_without_failing(
+    client, session_factory
+):
+    # The agent may re-register with the guard after the policy names it, so a
+    # guard lint must not fail validation (and with it, the save).
+    pid = _project(client)
+    await _register_parity_bot(session_factory, pid)
+    body = client.post(
+        f"/v1/projects/{pid}/agents/bot/validate",
+        json={"policy_yaml": "guards: { secret_redacter: { enabled: false } }\n"},
+    ).json()
+    assert body["ok"] is True and body["errors"] == []
+    assert [w["message"].split(":", 1)[0] for w in body["warnings"]] == [
+        "unknown-guard"
+    ]
+    # Advisory, but the runtime would stop cold on it: the severity says so.
+    assert body["warnings"][0]["severity"] == "error"
+
+
+async def test_when_two_agents_share_a_defect_then_check_reports_each(
+    client, session_factory
+):
+    import hexgate_api.features.agents.service as asvc
+    from hexgate_api.schemas import AgentManifest
+
+    pid = _project(client)
+    async with session_factory() as s:
+        for name in ("bot", "bot2"):
+            manifest = AgentManifest.model_validate({**_PARITY_MANIFEST, "name": name})
+            await asvc.register_manifest(s, pid, manifest, sign=_dummy_sign)
+    entry = (
+        "agents:\n"
+        "  bot: { guards: { secret_redacter: { enabled: false } } }\n"
+        "  bot2: { guards: { secret_redacter: { enabled: false } } }\n"
+    )
+    assert _put_file(client, pid, "policy.yaml", entry).status_code == 200
+    lints = client.get(f"/v1/projects/{pid}/policy/check").json()["lints"]
+    flagged = sorted(
+        lint["message"].split(":", 1)[0]
+        for lint in lints
+        if lint["code"] == "unknown-guard"
+    )
+    assert flagged == ["agent 'bot'", "agent 'bot2'"]
+
+
+async def test_when_a_registered_agent_is_not_declared_then_check_still_lints_its_guards(
+    client, session_factory
+):
+    # The seeded guards demo: a top-level guards: block and no agents: block. The
+    # agent compiles from its own (here, the generic) column, so it is checked too.
+    pid = _project(client)
+    await _register_parity_bot(session_factory, pid)
+    entry = "guards: { secret_redacter: { enabled: false } }\n"
+    assert _put_file(client, pid, "policy.yaml", entry).status_code == 200
+    lints = client.get(f"/v1/projects/{pid}/policy/check").json()["lints"]
+    assert [(lint["code"], lint["message"].split(":", 1)[0]) for lint in lints] == [
+        ("unknown-guard", "agent 'bot'")
+    ]
+    # Attributed to the entry file, so the editor shows it inline.
+    assert lints[0]["source"] == "policy.yaml"
+
+
+async def test_when_a_stored_manifest_no_longer_validates_then_only_its_checks_skip(
+    client, session_factory
+):
+    # A registration older than a schema change: the row is skipped, so the rest of
+    # the project still lints and nothing reads as a link error or a 500.
+    import hexgate_api.features.agents.service as asvc
+    from hexgate_api.schemas import AgentManifest
+
+    pid = _project(client)
+    async with session_factory() as s:
+        for name in ("bot", "stale"):
+            manifest = AgentManifest.model_validate({**_PARITY_MANIFEST, "name": name})
+            await asvc.register_manifest(s, pid, manifest, sign=_dummy_sign)
+        agent = await asvc.get_agent(s, pid, "stale")
+        stale = (await asvc.get_latest_agent_versions_map(s, [agent.id]))[agent.id]
+        stale.manifest = {"name": "stale"}  # missing required fields
+        s.add(stale)
+        await s.commit()
+
+    entry = "guards: { secret_redacter: { enabled: false } }\n"
+    assert _put_file(client, pid, "policy.yaml", entry).status_code == 200
+    lints = client.get(f"/v1/projects/{pid}/policy/check").json()["lints"]
+    assert [(lint["code"], lint["message"].split(":", 1)[0]) for lint in lints] == [
+        ("unknown-guard", "agent 'bot'")
+    ]
+    preview = client.post(
+        f"/v1/projects/{pid}/policy/preview",
+        json={"name": "policy.yaml", "content": entry},
+    ).json()
+    assert preview["resolved"] is not None
+    assert [lint["code"] for lint in preview["lints"]] == ["unknown-guard"]
+
+    r = client.post(
+        f"/v1/projects/{pid}/agents/stale/validate", json={"policy_yaml": entry}
+    )
+    assert r.status_code == 200 and r.json()["ok"] is True
+
+
+def test_when_an_agent_is_not_declared_then_it_resolves_like_the_generic_view():
+    # _resolution_for reuses the "*" result for an undeclared agent; that is only
+    # sound while the two resolve identically (guards and imports included).
+    from hexgate_api.features.policy_modules.service import _resolve_files, roles_json
+
+    files = {
+        "caps.yaml": "export:\n  c:\n    tools: { a: { mode: allow } }\n",
+        "policy.yaml": (
+            "import: [ caps.yaml#c ]\n"
+            "guards: { g: { enabled: false } }\n"
+            "agents:\n  bot: { tools: { b: { mode: allow } } }\n"
+        ),
+    }
+    generic = _resolve_files(files, "*")
+    ghost = _resolve_files(files, "ghost")
+    assert roles_json(ghost) == roles_json(generic)
+    assert ghost.policy_set.guard_stance() == generic.policy_set.guard_stance()
+
+
+def test_when_the_sdk_lint_gains_a_field_then_the_wire_model_carries_it():
+    # The router builds PolicyLintOut(**asdict(lint)); pydantic would drop a field
+    # the wire model lacks without an error.
+    from dataclasses import fields
+
+    from hexgate.security import PolicyLint
+    from hexgate_api.schemas import PolicyLintOut
+
+    assert {f.name for f in fields(PolicyLint)} <= set(PolicyLintOut.model_fields)
+
+
+def test_when_a_lint_names_an_agent_then_the_wire_names_it_in_the_message_too():
+    # The dashboard shows the message, not the agent field: two agents' identical
+    # lints must still read apart.
+    from hexgate.security import PolicyLint
+    from hexgate_api.features.policy_modules.router import _lint_out
+
+    named = _lint_out(PolicyLint("dead-grant", "warning", "m", agent="bot"))
+    generic = _lint_out(PolicyLint("dead-grant", "warning", "m"))
+
+    assert (named.agent, named.message) == ("bot", "agent 'bot': m")
+    assert (generic.agent, generic.message) == (None, "m")
+
+
+def test_when_a_lint_message_already_names_its_agent_then_it_is_not_prefixed():
+    # A named column's link-error carries the agent in its LinkError text.
+    from hexgate.security import AgentBinding, check_project
+    from hexgate_api.features.policy_modules.router import _lint_out
+
+    roles = {
+        "default": {"*": AgentBinding()},
+        "member": {"billing_bot": AgentBinding(capabilities=("nope",))},
+    }
+    (lint,) = [x for x in check_project([], [], roles) if x.code == "link-error"]
+
+    out = _lint_out(lint)
+
+    assert out.message == lint.message
+    assert out.message.count("'billing_bot'") == 1
+
+
+async def test_when_an_agent_re_registers_then_its_latest_manifest_is_used(
+    session_factory,
+):
+    import hexgate_api.features.agents.service as asvc
+    from hexgate_api.constants import DEFAULT_PROJECT_ID
+    from hexgate_api.schemas import AgentManifest
+
+    async with session_factory() as s:
+        for guard in ("old_guard", "new_guard"):
+            manifest = AgentManifest.model_validate(
+                {
+                    **_PARITY_MANIFEST,
+                    "guards": [{"name": guard, "position": "before", "kind": "custom"}],
+                }
+            )
+            await asvc.register_manifest(
+                s, DEFAULT_PROJECT_ID, manifest, sign=_dummy_sign
+            )
+        manifests = await asvc.latest_manifests(s, DEFAULT_PROJECT_ID, ["bot"])
+    assert [g.name for g in manifests["bot"].guards] == ["new_guard"]

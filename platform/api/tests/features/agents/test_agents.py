@@ -21,13 +21,19 @@ import yaml
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
-from sqlmodel import SQLModel
+from sqlalchemy import text
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from hexgate_api.core import keystore as keystore_mod
+from hexgate_api.core.ids import new_id
 from hexgate_api.main import app
+from hexgate_api.models import Agent, AgentVersion, Skill
 from hexgate_api.seeds.defaults import ensure_default_project
 from hexgate_api.constants import DEFAULT_PROJECT_ID, DEFAULT_USER_ID
+
+_OPA_AVAILABLE = shutil.which("opa") is not None
+_needs_opa = pytest.mark.skipif(not _OPA_AVAILABLE, reason="opa not on PATH")
 
 
 @pytest_asyncio.fixture
@@ -160,6 +166,74 @@ def test_put_agent_partial_update_preserves_other_fields(
     assert after["agent_yaml"] == before["agent_yaml"]
 
 
+def test_put_agent_rejects_a_policy_that_does_not_load(client: TestClient) -> None:
+    """A broken policy fails the save instead of nulling the bundle behind a 200.
+
+    ``compile_bundle`` degrades any compile failure to "no bundle", so this used
+    to save, drop the agent's bundle, and fall back to the pydantic engine with
+    nothing on the wire to say so.
+    """
+    before = client.get(f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot").json()
+
+    resp = client.put(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot",
+        json={
+            "policy_yaml": (
+                "version: 1\n"
+                "roles:\n"
+                "  default:\n"
+                "    tools:\n"
+                "      refund_order:\n"
+                "        mode: allow\n"
+                "        constraints:\n"
+                "          - args.amount ~~ 50\n"
+            )
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "nothing was saved" in detail["message"]
+    assert detail["errors"][0]["role"] == "default"
+
+    after = client.get(f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot").json()
+    assert after["policy_yaml"] == before["policy_yaml"]
+
+
+def test_put_agent_rejects_a_mistyped_tool_level_fence(client: TestClient) -> None:
+    """``contraints:`` on a tool is a dropped cap, so the save must fail.
+
+    The document- and role-level guards never saw this one — it parsed as an
+    ``allow`` with no constraints at all.
+    """
+    resp = client.put(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot",
+        json={
+            "policy_yaml": (
+                "version: 1\n"
+                "roles:\n"
+                "  default:\n"
+                "    tools:\n"
+                "      refund_order:\n"
+                "        mode: allow\n"
+                "        contraints:\n"
+                "          - args.amount <= 500\n"
+            )
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_put_agent_without_policy_yaml_skips_the_policy_gate(
+    client: TestClient,
+) -> None:
+    """The gate reads ``policy_yaml``; an update that omits it still saves."""
+    resp = client.put(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot",
+        json={"system_md": "Only the prompt changed."},
+    )
+    assert resp.status_code == 200
+
+
 def test_list_agents_returns_three_string_fields(client: TestClient) -> None:
     """The /agents collection endpoint returns the same three-field shape."""
     resp = client.get(f"/v1/projects/{DEFAULT_PROJECT_ID}/agents")
@@ -228,6 +302,20 @@ def test_validate_reports_yaml_parse_error_with_line(client: TestClient) -> None
     assert "YAML parse" in err["message"]
 
 
+def test_validate_reports_a_non_mapping_document(client: TestClient) -> None:
+    """Valid YAML that isn't a mapping has no keys to walk — report it rather
+    than raising on the first lookup."""
+    resp = client.post(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot/validate",
+        json={"policy_yaml": "- refund_order\n- web_search\n"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    [err] = body["errors"]
+    assert "must be a YAML mapping" in err["message"]
+
+
 def test_validate_reports_constraint_grammar_error_inside_role(
     client: TestClient,
 ) -> None:
@@ -252,6 +340,52 @@ def test_validate_reports_constraint_grammar_error_inside_role(
     [err] = body["errors"]
     assert err["role"] == "billing"
     assert "no recognised operator" in err["message"]
+
+
+def test_validate_reports_divergent_guard_stance(client: TestClient) -> None:
+    """A cross-role guard divergence is surfaced by /validate (R-GUARD-007). It is
+    lazy on the PolicySet, so _load_document forces it; without that the document
+    would validate here and then crash the SDK at construction (review #3)."""
+    resp = client.post(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot/validate",
+        json={
+            "policy_yaml": (
+                "version: 1\n"
+                "roles:\n"
+                "  support:\n"
+                "    guards:\n"
+                "      secret_guard: { enabled: false }\n"
+                "  admin:\n"
+                "    guards:\n"
+                "      secret_guard: { enabled: true }\n"
+            )
+        },
+    )
+    body = resp.json()
+    assert body["ok"] is False
+    assert any("same value across all roles" in e["message"] for e in body["errors"])
+
+
+def test_validate_reports_divergent_usage_fail_mode(client: TestClient) -> None:
+    """A cross-role usage.on_unavailable divergence is reported by /validate. The
+    check is eager in PolicySet, so a regression to a lazy one would let the platform
+    store a policy the SDK then refuses to load."""
+    resp = client.post(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot/validate",
+        json={
+            "policy_yaml": (
+                "version: 1\n"
+                "roles:\n"
+                "  support:\n"
+                "    usage: { on_unavailable: deny }\n"
+                "  admin:\n"
+                "    usage: { on_unavailable: allow }\n"
+            )
+        },
+    )
+    body = resp.json()
+    assert body["ok"] is False
+    assert any("same value across all roles" in e["message"] for e in body["errors"])
 
 
 def test_validate_accumulates_errors_across_roles(client: TestClient) -> None:
@@ -395,9 +529,80 @@ def test_validate_reports_no_warnings_when_the_document_has_errors(
     assert body["warnings"] == []
 
 
+def test_validate_rejects_an_unknown_sibling_of_roles(client: TestClient) -> None:
+    """A mistyped file-level key is a load error, so validate must not pass it.
+
+    The per-role pass only walks what sits under ``roles:``. Answering ``ok``
+    here sent the operator on to save a document the compiler drops the bundle
+    for, leaving the agent unable to load its policy at all.
+    """
+    resp = client.post(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot/validate",
+        json={
+            "policy_yaml": (
+                "contraints:\n"
+                "  - run.tool_calls < 5\n"
+                "roles:\n"
+                "  default:\n"
+                "    default_policy: { mode: allow }\n"
+            )
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert "contraints" in body["errors"][0]["message"]
+
+
+def test_validate_rejects_a_malformed_file_level_constraints_block(
+    client: TestClient,
+) -> None:
+    """The file-level fence is grammar-checked, not just the per-role ones."""
+    resp = client.post(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot/validate",
+        json={
+            "policy_yaml": (
+                "constraints: run.tool_calls < 5\n"
+                "roles:\n"
+                "  default:\n"
+                "    default_policy: { mode: allow }\n"
+            )
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert "constraints" in body["errors"][0]["message"]
+
+
+def test_validate_accepts_a_file_level_constraints_block(client: TestClient) -> None:
+    """The hoisted fence is legal — the guards above must not reject the shape
+    the SDK now supports."""
+    resp = client.post(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot/validate",
+        json={
+            "policy_yaml": (
+                "version: 1\n"
+                "constraints:\n"
+                "  - run.tool_calls < 20\n"
+                "roles:\n"
+                "  default:\n"
+                "    tools:\n"
+                "      read_ticket: { mode: allow }\n"
+            )
+        },
+    )
+    body = resp.json()
+    assert body["ok"] is True, body
+    assert body["errors"] == []
+
+
 def test_validate_unresolvable_inheritance_does_not_500(client: TestClient) -> None:
     """Roles that each parse but whose inheritance can't resolve reach the
-    PolicySet build and must degrade to "no lint", never a crash."""
+    PolicySet build and must be reported there, never crash.
+
+    The per-role pass can't see a link failure, so this used to answer ``ok``
+    for a document the compiler and the SDK both reject."""
     resp = client.post(
         f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/support_bot/validate",
         json={
@@ -417,8 +622,8 @@ def test_validate_unresolvable_inheritance_does_not_500(client: TestClient) -> N
     )
     assert resp.status_code == 200
     body = resp.json()
-    # Unchanged error contract: the per-role checks passed, so ok stays True.
-    assert body["ok"] is True
+    assert body["ok"] is False
+    assert "does_not_exist" in body["errors"][0]["message"]
     assert body["warnings"] == []
 
 
@@ -434,14 +639,22 @@ def _sample_manifest(
     description: str | None = None,
     model: str | None = None,
     system_prompt: str | None = None,
+    skills: list[dict] | None = None,
+    guards: list[dict] | None = None,
 ) -> dict:
-    """Minimal AgentManifest payload for register_manifest in tests."""
+    """Minimal AgentManifest payload for register_manifest in tests.
+
+    ``skills`` / ``guards`` stay out of the payload entirely when None — the shape
+    an agent that declares none sends.
+    """
     return {
         "name": name,
         "description": description,
         "framework": "hexgate",
         "model": model,
         "system_prompt": system_prompt,
+        **({"skills": skills} if skills is not None else {}),
+        **({"guards": guards} if guards is not None else {}),
         "tools": [
             {
                 "name": "echo",
@@ -495,6 +708,70 @@ async def test_manifest_endpoint_returns_registered_manifest_with_tools(
     assert row["manifest"]["description"] == "customer support"
     assert [t["name"] for t in row["manifest"]["tools"]] == ["echo"]
     assert row["manifest"]["tools"][0]["input_schema"]["required"] == ["msg"]
+
+
+async def test_manifest_endpoint_round_trips_declared_guards(
+    client: TestClient, session_factory
+) -> None:
+    """A registered manifest's guards survive parse → store → view, so the dashboard
+    can show which guards an agent declares (R-GUARD, guards surfaced for governance)."""
+    from hexgate_api.schemas import AgentManifest
+    from hexgate_api.features.agents.service import register_manifest
+
+    guards = [
+        {
+            "name": "secret_guard",
+            "position": "before",
+            "tool_names": ["send_update"],
+            "observe": False,
+            "kind": "official",
+            "plugin_id": "secret_guard",
+        },
+        {
+            "name": "secret_watch",
+            "position": "after",
+            "tool_names": None,
+            "observe": True,
+            "kind": "official",
+            "plugin_id": "secret_watch",
+        },
+    ]
+    async with session_factory() as session:
+        manifest = AgentManifest.model_validate(
+            _sample_manifest("support_bot", guards=guards)
+        )
+        await register_manifest(
+            session, DEFAULT_PROJECT_ID, manifest, sign=keystore_mod.keystore.sign
+        )
+
+    resp = client.get(f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/manifest")
+    row = next(r for r in resp.json() if r["name"] == "support_bot")
+    got = row["manifest"]["guards"]
+    assert [g["name"] for g in got] == ["secret_guard", "secret_watch"]
+    assert got[0]["position"] == "before"
+    assert got[0]["tool_names"] == ["send_update"]
+    assert got[0]["kind"] == "official"
+    assert got[1]["observe"] is True
+    assert got[1]["tool_names"] is None
+
+
+async def test_manifest_endpoint_guards_absent_when_none_declared(
+    client: TestClient, session_factory
+) -> None:
+    """An agent that declares no guards registers with guards omitted → the view
+    returns null (not []), keeping the content hash stable (exclude_none)."""
+    from hexgate_api.schemas import AgentManifest
+    from hexgate_api.features.agents.service import register_manifest
+
+    async with session_factory() as session:
+        manifest = AgentManifest.model_validate(_sample_manifest("support_bot"))
+        await register_manifest(
+            session, DEFAULT_PROJECT_ID, manifest, sign=keystore_mod.keystore.sign
+        )
+
+    resp = client.get(f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/manifest")
+    row = next(r for r in resp.json() if r["name"] == "support_bot")
+    assert row["manifest"]["guards"] is None
 
 
 async def test_manifest_endpoint_returns_latest_version(
@@ -572,7 +849,7 @@ def test_manifest_endpoint_unregistered_agents_have_no_leakage(
 
 
 def test_register_endpoint_accepts_legacy_shape_without_new_fields(
-    client: TestClient,
+    client: TestClient, session_factory
 ) -> None:
     """A manifest from an older SDK (no model / system_prompt keys) still 201s.
 
@@ -581,6 +858,7 @@ def test_register_endpoint_accepts_legacy_shape_without_new_fields(
     the new platform. The new fields are Optional with `None` defaults, so
     Pydantic validation should accept payloads that omit them entirely.
     """
+    token = _mint_owned_token(session_factory, owner_user_id=DEFAULT_USER_ID)
     payload = {
         "manifest": {
             "name": "legacy_agent",
@@ -590,14 +868,14 @@ def test_register_endpoint_accepts_legacy_shape_without_new_fields(
         }
     }
     resp = client.post(
-        "/v1/agents",
-        json=payload,
-        headers={"Authorization": "Bearer fake-but-unauthenticated"},
+        "/v1/agents", json=payload, headers={"Authorization": f"Bearer {token}"}
     )
-    # The legacy-shape body validates; the request itself fails auth (401)
-    # rather than schema validation (422). 422 here would mean we broke
-    # backwards compatibility.
-    assert resp.status_code != 422, resp.text
+    # Authenticated on purpose. This used to send an unauthenticated bearer and
+    # assert ``!= 422`` on the belief that the body validates first and only
+    # auth fails — it does not. FastAPI resolves dependencies BEFORE validating
+    # the body, so that request 401s with the schema never reached, and the
+    # assertion held even for a manifest missing every required field.
+    assert resp.status_code == 201, resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -710,15 +988,129 @@ def test_bearer_get_agent_returns_304_on_matching_etag(
     assert second.status_code == 304
 
 
+@_needs_opa
+def test_get_agent_etag_changes_when_only_the_guard_stance_changes(
+    client: TestClient, session_factory
+) -> None:
+    """A guards-only policy edit must invalidate the bundle ETag (R-GUARD-007).
+
+    Regression: the ETag was ``sha256(compiled_wasm)``, which is byte-identical
+    whether a guard is enabled or disabled — guards are read from the signed manifest
+    at runtime, never compiled into the policy wasm. So the SDK's per-turn
+    ``If-None-Match`` got a 304 and a live agent kept running a guard the dashboard had
+    just set ``enabled: false``. The ETag is over the signed manifest now, so flipping
+    a guard yields a new ETag → a 200 carrying the new stance, not a 304.
+    """
+    import json
+
+    enabled = (
+        "version: 1\n"
+        "guards:\n  secret_guard: { enabled: true }\n"
+        "tools: { send_update: { mode: allow } }\n"
+    )
+    disabled = enabled.replace("enabled: true", "enabled: false")
+
+    def _put(policy_yaml: str) -> None:
+        r = client.put(
+            f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/default",
+            headers={"X-Dev-User": DEFAULT_USER_ID},
+            json={"policy_yaml": policy_yaml},
+        )
+        assert r.status_code == 200, r.text
+
+    token = _mint_token_for_test(session_factory)
+    _put(enabled)
+    first = client.get(
+        "/v1/agents/default", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert first.status_code == 200, first.text
+    etag1 = first.headers.get("etag")
+    assert etag1 is not None, first.headers
+    assert json.loads(first.json()["bundle_manifest"])["guards"]["baseline"][
+        "secret_guard"
+    ]  # enabled
+
+    # Flip the guard off and re-save → recompile. The wasm is unchanged.
+    _put(disabled)
+    second = client.get(
+        "/v1/agents/default",
+        headers={"Authorization": f"Bearer {token}", "If-None-Match": etag1},
+    )
+    assert second.status_code == 200, (
+        "a guards-only edit returned 304 — the stale (enabled) bundle is still served, "
+        "so a live agent never sees the disable"
+    )
+    etag2 = second.headers.get("etag")
+    assert etag2 is not None and etag2 != etag1
+    assert (
+        json.loads(second.json()["bundle_manifest"])["guards"]["baseline"][
+            "secret_guard"
+        ]
+        is False
+    )
+
+
+@_needs_opa
+def test_get_agent_etag_changes_when_only_the_usage_fail_mode_changes(
+    client: TestClient, session_factory
+) -> None:
+    """A usage-only edit must reach the signed manifest and be served, not 304'd.
+
+    The fail mode is read from the manifest, never compiled into the wasm. The 200 and
+    new-ETag checks only prove no stale 304 is served: any policy_yaml edit moves the
+    manifest's ``source_hash``, and so the ETag. The ``usage`` manifest assertion is
+    the real guard that ``on_unavailable: deny`` is signed in."""
+    import json
+
+    allow = (
+        "version: 1\n"
+        "usage: { on_unavailable: allow }\n"
+        "tools: { send_update: { mode: allow } }\n"
+    )
+    deny = allow.replace("on_unavailable: allow", "on_unavailable: deny")
+
+    def _put(policy_yaml: str) -> None:
+        r = client.put(
+            f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/default",
+            headers={"X-Dev-User": DEFAULT_USER_ID},
+            json={"policy_yaml": policy_yaml},
+        )
+        assert r.status_code == 200, r.text
+
+    token = _mint_token_for_test(session_factory)
+    _put(allow)
+    first = client.get(
+        "/v1/agents/default", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert first.status_code == 200, first.text
+    etag1 = first.headers.get("etag")
+    assert etag1 is not None, first.headers
+    assert "usage" not in json.loads(first.json()["bundle_manifest"])
+
+    _put(deny)
+    second = client.get(
+        "/v1/agents/default",
+        headers={"Authorization": f"Bearer {token}", "If-None-Match": etag1},
+    )
+    assert second.status_code == 200, (
+        "a usage-only edit returned 304, so a live agent never sees the deny"
+    )
+    etag2 = second.headers.get("etag")
+    assert etag2 is not None and etag2 != etag1
+    assert json.loads(second.json()["bundle_manifest"])["usage"] == {
+        "on_unavailable": "deny"
+    }
+
+
 def _trivial_policy_yaml() -> str:
     """A policy that compiles cleanly — enough to trigger bundle signing."""
     return (
         "version: 1\n"
-        "name: default\n"
-        "rules:\n"
-        "  - effect: allow\n"
-        "    when:\n"
-        "      tool: any\n"
+        "default_policy:\n"
+        "  mode: deny\n"
+        "tools:\n"
+        "  read_ticket:\n"
+        "    mode: allow\n"
     )
 
 
@@ -759,10 +1151,6 @@ def test_me_key_rejects_missing_bearer(client: TestClient) -> None:
 # Re-registers of an existing agent leave the operator's policy_yaml
 # alone — only the AgentVersion snapshot history grows.
 # ---------------------------------------------------------------------------
-
-
-_OPA_AVAILABLE = shutil.which("opa") is not None
-_needs_opa = pytest.mark.skipif(not _OPA_AVAILABLE, reason="opa not on PATH")
 
 
 def _register_payload(name: str, tools: list[str]) -> dict:
@@ -1020,3 +1408,548 @@ def test_require_project_accepts_valid_signed_token(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert r.status_code == 201, r.text
+
+
+# ---------------------------------------------------------------------------
+# Actor trail (issue #160)
+#
+# Two writers land here: the cookie-authed PUT (a human) and the SDK's
+# bearer-authed register (a token, bridged back to a person through
+# ``ApiKey.owner_user_id``).
+# ---------------------------------------------------------------------------
+
+
+def _mint_owned_token(session_factory, *, owner_user_id: str | None) -> str:
+    """Mint a key for the seed project with a given owner (or none)."""
+    import asyncio
+
+    from hexgate_api.features.tokens.service import mint_api_key
+
+    async def _mint() -> str:
+        async with session_factory() as session:
+            _row, full = await mint_api_key(
+                session,
+                DEFAULT_PROJECT_ID,
+                name=f"actor-{owner_user_id or 'system'}",
+                scopes=["read"],
+                env="live",
+                signing_key_bytes=keystore_mod.keystore._private_key_bytes(),
+                created_by_user_id=owner_user_id,
+                owner_user_id=owner_user_id,
+            )
+            await session.commit()
+            return full
+
+    return asyncio.get_event_loop().run_until_complete(_mint())
+
+
+def _read_agent(session_factory, *, project_id: str, name: str) -> Agent:
+    import asyncio
+
+    from hexgate_api.features.agents.service import get_agent
+
+    async def _get() -> Agent:
+        async with session_factory() as session:
+            row = await get_agent(session, project_id, name)
+            assert row is not None
+            return row
+
+    return asyncio.get_event_loop().run_until_complete(_get())
+
+
+def _read_latest_version(session_factory, agent_id: str) -> AgentVersion:
+    import asyncio
+
+    async def _get() -> AgentVersion:
+        async with session_factory() as session:
+            rows = (
+                await session.exec(
+                    select(AgentVersion)
+                    .where(AgentVersion.agent_id == agent_id)
+                    .order_by(AgentVersion.version.desc())
+                )
+            ).all()
+            assert rows
+            return rows[0]
+
+    return asyncio.get_event_loop().run_until_complete(_get())
+
+
+def _manifest(name: str) -> dict:
+    return {
+        "manifest": {
+            "name": name,
+            "framework": "hexgate",
+            "tools": [
+                {
+                    "name": "ping",
+                    "input_schema": {
+                        "properties": {"q": {"title": "Q", "type": "string"}},
+                        "required": ["q"],
+                    },
+                }
+            ],
+        }
+    }
+
+
+def test_put_agent_stamps_the_editing_user(client: TestClient, session_factory) -> None:
+    before = _read_agent(session_factory, project_id=DEFAULT_PROJECT_ID, name="default")
+    assert before.updated_by_user_id is None
+
+    r = client.put(
+        f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/default",
+        json={"system_md": "edited by a human"},
+        headers={"X-Dev-User": DEFAULT_USER_ID},
+    )
+    assert r.status_code == 200, r.text
+
+    after = _read_agent(session_factory, project_id=DEFAULT_PROJECT_ID, name="default")
+    assert after.updated_by_user_id == DEFAULT_USER_ID
+    assert after.updated_at > before.updated_at
+
+
+def test_seeded_agents_carry_no_actor(session_factory) -> None:
+    """``ensure_seeded_agents`` is a system write — NULL, not a sentinel."""
+    row = _read_agent(session_factory, project_id=DEFAULT_PROJECT_ID, name="default")
+    assert row.created_by_user_id is None
+
+
+def test_register_agent_stamps_the_keys_owner(
+    client: TestClient, session_factory
+) -> None:
+    """The bearer path: ``ApiKey.owner_user_id`` is the only bridge from a
+    token back to a person."""
+    token = _mint_owned_token(session_factory, owner_user_id=DEFAULT_USER_ID)
+
+    r = client.post(
+        "/v1/agents",
+        json=_manifest("owned_agent"),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 201, r.text
+
+    agent = _read_agent(
+        session_factory, project_id=DEFAULT_PROJECT_ID, name="owned_agent"
+    )
+    assert agent.created_by_user_id == DEFAULT_USER_ID
+    version = _read_latest_version(session_factory, agent.id)
+    assert version.created_by_user_id == DEFAULT_USER_ID
+
+
+def test_register_agent_with_an_ownerless_key_stamps_null(
+    client: TestClient, session_factory
+) -> None:
+    """A key with no owner still writes; it records NULL rather than a guess."""
+    token = _mint_owned_token(session_factory, owner_user_id=None)
+
+    r = client.post(
+        "/v1/agents",
+        json=_manifest("unowned_agent"),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 201, r.text
+
+    agent = _read_agent(
+        session_factory, project_id=DEFAULT_PROJECT_ID, name="unowned_agent"
+    )
+    assert agent.created_by_user_id is None
+    assert _read_latest_version(session_factory, agent.id).created_by_user_id is None
+
+
+def test_re_register_does_not_rewrite_the_original_creator(
+    client: TestClient, session_factory
+) -> None:
+    """An agent's creator is whoever first registered it."""
+    first = _mint_owned_token(session_factory, owner_user_id=DEFAULT_USER_ID)
+    client.post(
+        "/v1/agents",
+        json=_manifest("stable_creator"),
+        headers={"Authorization": f"Bearer {first}"},
+    )
+    second = _mint_owned_token(session_factory, owner_user_id=None)
+
+    # Same name, different manifest → a new version under the same Agent.
+    payload = _manifest("stable_creator")
+    payload["manifest"]["description"] = "changed"
+    r = client.post(
+        "/v1/agents", json=payload, headers={"Authorization": f"Bearer {second}"}
+    )
+    assert r.status_code in (200, 201), r.text
+
+    agent = _read_agent(
+        session_factory, project_id=DEFAULT_PROJECT_ID, name="stable_creator"
+    )
+    assert agent.created_by_user_id == DEFAULT_USER_ID
+
+
+async def test_register_stores_subagents_and_preserves_hash_continuity(
+    client: TestClient, session_factory
+) -> None:
+    """subagents round-trip into the stored manifest; an agent without them hashes
+    as before (dedup no-op), and adding them yields a new content_hash + version."""
+    from hexgate_api.schemas import AgentManifest
+    from hexgate_api.features.agents.service import register_manifest
+
+    async with session_factory() as session:
+        base = _sample_manifest("support_bot")
+        m1 = AgentManifest.model_validate(base)
+        v1, created1 = await register_manifest(
+            session, DEFAULT_PROJECT_ID, m1, sign=keystore_mod.keystore.sign
+        )
+        # Re-register the identical (sub-agent-less) manifest → dedup no-op, same hash.
+        v1b, created1b = await register_manifest(
+            session, DEFAULT_PROJECT_ID, m1, sign=keystore_mod.keystore.sign
+        )
+        assert created1 is True and created1b is False
+        assert v1b.content_hash == v1.content_hash
+        # Stored as None (NOT []): a sub-agent-less manifest must carry no subagents key
+        # so exclude_none drops it and the hash is unchanged. `is None` (not `in (None,
+        # [])`) so a schema default of `[]` — which would remint a version for every
+        # already-registered agent — fails here.
+        assert (v1.manifest or {}).get("subagents") is None
+
+        # Guard the continuity contract itself: an explicit `[]` is NOT excluded by
+        # exclude_none, so it hashes differently from the None (field-absent) manifest —
+        # i.e. defaulting the field to `[]` would break dedup for every existing agent.
+        m_empty = AgentManifest.model_validate({**base, "subagents": []})
+        v_empty, _ = await register_manifest(
+            session, DEFAULT_PROJECT_ID, m_empty, sign=keystore_mod.keystore.sign
+        )
+        assert v_empty.content_hash != v1.content_hash
+
+        # Now register with a sub-agent edge → different hash, new version, stored.
+        m2 = AgentManifest.model_validate(
+            {**base, "subagents": [{"name": "billing_bot", "via": "tool"}]}
+        )
+        v2, created2 = await register_manifest(
+            session, DEFAULT_PROJECT_ID, m2, sign=keystore_mod.keystore.sign
+        )
+        assert created2 is True
+        assert v2.content_hash != v1.content_hash
+        assert v2.manifest["subagents"] == [{"name": "billing_bot", "via": "tool"}]
+
+    # And the read view surfaces the sub-agent edge for the dashboard.
+    resp = client.get(f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/manifest")
+    row = next(r for r in resp.json() if r["name"] == "support_bot")
+    assert row["manifest"]["subagents"] == [{"name": "billing_bot", "via": "tool"}]
+
+
+# ---------------------------------------------------------------------------
+# M2 — skills carried on the manifest
+#
+# The platform mirrors the SDK's three shapes and writes one ``skill`` row per
+# definition per version, inside the same transaction as the tools. It caps
+# nothing and dedupes nothing: the SDK truncates before it sends, and the
+# unique constraint is the backstop.
+# ---------------------------------------------------------------------------
+
+
+def _skill_payload(name: str, **overrides: object) -> dict:
+    """A fully populated SkillDefinition payload, field-by-field overridable."""
+    return {
+        "name": name,
+        "description": f"what {name} does",
+        "source": ".claude/skills",
+        "resources": {
+            "references": ["reference.md"],
+            "assets": ["logo.png"],
+            "scripts": ["run.sh"],
+        },
+        "allowed_tools": ["Read", "Grep"],
+        "additional_tools": ["issue_refund"],
+        "content_hash": "sha256-of-the-body",
+        **overrides,
+    }
+
+
+async def _skills_of(session_factory, agent_version_id: str) -> list[Skill]:
+    async with session_factory() as session:
+        rows = await session.exec(
+            select(Skill).where(Skill.agent_version_id == agent_version_id)
+        )
+        return sorted(rows.all(), key=lambda row: row.name)
+
+
+def _skills_of_sync(session_factory, agent_version_id: str) -> list[Skill]:
+    """``_skills_of`` for the sync (TestClient + minted token) tests."""
+    import asyncio
+
+    return asyncio.get_event_loop().run_until_complete(
+        _skills_of(session_factory, agent_version_id)
+    )
+
+
+async def _register(session_factory, payload: dict):
+    from hexgate_api.schemas import AgentManifest
+    from hexgate_api.features.agents.service import register_manifest
+
+    async with session_factory() as session:
+        return await register_manifest(
+            session,
+            DEFAULT_PROJECT_ID,
+            AgentManifest.model_validate(payload),
+            sign=keystore_mod.keystore.sign,
+        )
+
+
+async def test_register_manifest_persists_skill_rows(session_factory) -> None:
+    """One row per definition, every field round-tripping through the JSON."""
+    version, created = await _register(
+        session_factory,
+        _sample_manifest(
+            "skilled_bot",
+            skills=[_skill_payload("refunds"), _skill_payload("escalation")],
+        ),
+    )
+    assert created
+
+    rows = await _skills_of(session_factory, version.id)
+    assert [row.name for row in rows] == ["escalation", "refunds"]
+
+    refunds = rows[1]
+    assert refunds.description == "what refunds does"
+    assert refunds.source == ".claude/skills"
+    assert refunds.resources == {
+        "references": ["reference.md"],
+        "assets": ["logo.png"],
+        "scripts": ["run.sh"],
+    }
+    assert refunds.allowed_tools == ["Read", "Grep"]
+    assert refunds.additional_tools == ["issue_refund"]
+    assert refunds.content_hash == "sha256-of-the-body"
+    assert refunds.id.startswith("skl_")
+
+
+async def test_register_manifest_without_skills_writes_no_skill_rows(
+    session_factory,
+) -> None:
+    """``skills=None`` — every framework with no skill concept — is a no-op."""
+    version, created = await _register(
+        session_factory, _sample_manifest("skill_less_bot")
+    )
+    assert created
+    assert await _skills_of(session_factory, version.id) == []
+
+
+def test_register_endpoint_accepts_manifest_without_skills_key(
+    client: TestClient, session_factory
+) -> None:
+    """A body omitting ``skills`` entirely registers — the compat guarantee.
+
+    Authenticated on purpose. FastAPI resolves dependencies before it
+    validates the body, so an unauthenticated request 401s without the schema
+    ever being reached: asserting ``!= 422`` there would pass even against a
+    manifest missing every required field.
+    """
+    token = _mint_owned_token(session_factory, owner_user_id=DEFAULT_USER_ID)
+    payload = {
+        "manifest": {
+            "name": "no_skills_key",
+            "framework": "hexgate",
+            "tools": [],
+        }
+    }
+    resp = client.post(
+        "/v1/agents", json=payload, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 201, resp.text
+
+    version_id = resp.json()["agent_version_id"]
+    assert _skills_of_sync(session_factory, version_id) == []
+
+
+def test_manifest_hash_is_unchanged_by_the_new_field() -> None:
+    """The G2 guard: adding ``skills`` mints no version for agents without any.
+
+    ``compute_manifest_hash`` excludes None, so a pre-skills payload and the
+    same payload carrying an explicit ``skills: null`` hash identically — an
+    old SDK re-registering against the new platform matches its existing
+    version rather than duplicating it.
+    """
+    from hexgate_api.schemas import AgentManifest
+    from hexgate_api.features.agents.service import compute_manifest_hash
+
+    payload = _sample_manifest("hash_stability")
+    before = compute_manifest_hash(AgentManifest.model_validate(payload))
+    after = compute_manifest_hash(
+        AgentManifest.model_validate({**payload, "skills": None})
+    )
+    assert before == after
+
+
+async def test_register_manifest_preserves_resources_none_vs_empty(
+    session_factory,
+) -> None:
+    """NULL and ``{}`` mean different things and must read back distinct.
+
+    NULL: the framework does not enumerate L3 contents at all. ``{}``: it does,
+    and this skill ships none. M6 renders the two differently.
+    """
+    version, _ = await _register(
+        session_factory,
+        _sample_manifest(
+            "resource_bot",
+            skills=[
+                _skill_payload("not_enumerated", resources=None),
+                _skill_payload("enumerated_empty", resources={}),
+            ],
+        ),
+    )
+
+    enumerated, not_enumerated = await _skills_of(session_factory, version.id)
+    assert not_enumerated.resources is None
+    assert enumerated.resources == {"references": [], "assets": [], "scripts": []}
+
+    # And distinct in SQL, not just after the ORM decodes them. Without
+    # ``none_as_null`` on the column, None persists as the JSON scalar
+    # ``'null'`` — the ORM still reads back None, so the assertions above pass
+    # while ``IS NULL`` silently matches nothing.
+    async with session_factory() as session:
+        rows = dict(
+            (
+                await session.exec(
+                    text(
+                        "SELECT name, resources IS NULL FROM skill "
+                        "WHERE agent_version_id = :v"
+                    ).bindparams(v=version.id)
+                )
+            ).all()
+        )
+    assert rows == {"not_enumerated": 1, "enumerated_empty": 0}
+
+
+async def test_duplicate_skill_names_in_one_version_are_rejected(
+    session_factory,
+) -> None:
+    """The service rejects duplicates before the DB has to.
+
+    The SDK collapses same-name skills before sending, so this only fires for
+    a caller that bypasses it. Pre-checked rather than left to UNIQUE because
+    nothing registers an exception handler — an IntegrityError escaping the
+    route would be a 500 with no usable message.
+    """
+    from hexgate_api.features.agents.service import DuplicateSkillNameError
+
+    with pytest.raises(DuplicateSkillNameError):
+        await _register(
+            session_factory,
+            _sample_manifest(
+                "duplicate_bot",
+                skills=[_skill_payload("twice"), _skill_payload("twice")],
+            ),
+        )
+
+
+def test_duplicate_skill_names_surface_as_409(
+    client: TestClient, session_factory
+) -> None:
+    """What the caller actually sees: a 409, not the default 500."""
+    token = _mint_owned_token(session_factory, owner_user_id=DEFAULT_USER_ID)
+    payload = {
+        "manifest": _sample_manifest(
+            "duplicate_over_http",
+            skills=[_skill_payload("twice"), _skill_payload("twice")],
+        )
+    }
+    resp = client.post(
+        "/v1/agents", json=payload, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 409, resp.text
+    assert "twice" in resp.json()["detail"]
+
+
+async def test_unique_constraint_backstops_duplicate_skill_names(
+    session_factory,
+) -> None:
+    """The DB guard behind the pre-check, asserted directly.
+
+    The service can only refuse what it sees in one manifest; the constraint
+    is what stops two rows an agent could never tell apart from ever existing.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    async with session_factory() as session:
+        for _ in range(2):
+            session.add(
+                Skill(
+                    id=new_id(Skill),
+                    agent_version_id="agv_backstop",
+                    name="twice",
+                    allowed_tools=[],
+                    additional_tools=[],
+                )
+            )
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+
+async def test_agent_manifest_view_surfaces_skills(
+    client: TestClient, session_factory
+) -> None:
+    """The read path M6 consumes: skills come back inside ``manifest``."""
+    await _register(
+        session_factory,
+        _sample_manifest(
+            "support_bot",
+            skills=[_skill_payload("refunds", resources=None)],
+        ),
+    )
+
+    resp = client.get(f"/v1/projects/{DEFAULT_PROJECT_ID}/agents/manifest")
+    row = next(r for r in resp.json() if r["name"] == "support_bot")
+    (skill,) = row["manifest"]["skills"]
+    assert skill["name"] == "refunds"
+    assert skill["resources"] is None
+    assert skill["allowed_tools"] == ["Read", "Grep"]
+    assert skill["additional_tools"] == ["issue_refund"]
+
+
+async def test_re_register_with_new_skills_creates_a_new_version(
+    session_factory,
+) -> None:
+    """The flip side of the hash guard: a real skill change is a real version."""
+    first, _ = await _register(session_factory, _sample_manifest("evolving_bot"))
+    second, created = await _register(
+        session_factory,
+        _sample_manifest("evolving_bot", skills=[_skill_payload("refunds")]),
+    )
+
+    assert created
+    assert second.version == first.version + 1
+    assert second.content_hash != first.content_hash
+    assert await _skills_of(session_factory, first.id) == []
+    assert [row.name for row in await _skills_of(session_factory, second.id)] == [
+        "refunds"
+    ]
+
+
+async def test_register_first_time_generates_skills_in_the_starter_policy(
+    session_factory,
+) -> None:
+    """The generator is reached from ``register_manifest``, not just in isolation."""
+    await _register(
+        session_factory,
+        _sample_manifest(
+            "starter_skills_bot",
+            skills=[
+                _skill_payload("runbook", resources=None, additional_tools=[]),
+                _skill_payload("refunds"),
+            ],
+        ),
+    )
+
+    async with session_factory() as session:
+        agent = (
+            await session.exec(
+                select(Agent).where(
+                    Agent.project_id == DEFAULT_PROJECT_ID,
+                    Agent.name == "starter_skills_bot",
+                )
+            )
+        ).one()
+
+    roles = yaml.safe_load(agent.policy_yaml)["roles"]
+    assert roles["read_only"]["skills"] == {"runbook": {"mode": "allow"}}
+    assert roles["member"]["skills"] == {"refunds": {"mode": "approval_required"}}
+    assert roles["admin"]["skills"] == {"refunds": {"mode": "allow"}}

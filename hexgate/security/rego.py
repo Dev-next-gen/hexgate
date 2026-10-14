@@ -88,6 +88,7 @@ from hexgate.security.constraints import (
 from hexgate.security.models import (
     AGENT_REACH_PREFIXES,
     AGENT_RUN_TOOL,
+    SKILL_PREFIXES,
     AgentPolicy,
     BaseToolPolicy,
     FileToolPolicy,
@@ -285,6 +286,8 @@ def _rules_for_role(
     """
     effective = policy.effective_tools
     listed = sorted(effective)
+    # Applied to every rule this role emits, mirroring the pydantic engine.
+    policy_constraints = list(policy.constraints)
     out: list[str] = []
     for tool_name in listed:
         tool_guard = [f'    input.tool == "{_escape_string(tool_name)}"']
@@ -296,9 +299,19 @@ def _rules_for_role(
                 effective[tool_name],
                 tool_name,
                 helpers,
+                policy_constraints=policy_constraints,
             )
         )
-    out.extend(_default_rules(role, role_guard, policy.default_policy, listed, helpers))
+    out.extend(
+        _default_rules(
+            role,
+            role_guard,
+            policy.default_policy,
+            listed,
+            helpers,
+            policy_constraints=policy_constraints,
+        )
+    )
     return out
 
 
@@ -308,6 +321,8 @@ def _default_rules(
     default_policy: BaseToolPolicy,
     listed: list[str],
     helpers: dict[str, list[str]],
+    *,
+    policy_constraints: list[str],
 ) -> list[str]:
     """Catch-all rules for ``default_policy`` — any tool not explicitly listed.
 
@@ -317,21 +332,28 @@ def _default_rules(
     """
     if default_policy.mode == "deny":
         return []
-    # Agent keys are closed-world: a permissive default must not grant an unlisted
-    # agent key, so exclude them from the catch-all (an unlisted agent key then
-    # matches no rule and denies). Excludes exactly the reserved shapes — agent.run
-    # and the reach prefixes — so an authored tool merely named "agent.foo" still
-    # follows the default, matching is_agent_key in the pydantic engine (R-AGENT-002).
+    # Agent and skill keys are closed-world: a permissive default must not grant an
+    # unlisted one, so exclude them from the catch-all (it then matches no rule and
+    # denies). Excludes exactly the reserved shapes — agent.run, the reach prefixes
+    # and the skill prefixes — so an authored tool merely named "agent.foo" still
+    # follows the default, matching is_agent_key / is_skill_key in the pydantic
+    # engine (R-AGENT-002).
     tool_guard = [f"    input.tool != {json.dumps(AGENT_RUN_TOOL)}"]
     tool_guard += [
         f"    not startswith(input.tool, {json.dumps(prefix)})"
-        for prefix in AGENT_REACH_PREFIXES
+        for prefix in (*AGENT_REACH_PREFIXES, *SKILL_PREFIXES)
     ]
     if listed:
         members = ", ".join(json.dumps(name) for name in listed)
         tool_guard.append(f"    not input.tool in {{{members}}}")
     return _gated_rules(
-        role, role_guard, tool_guard, default_policy, "<default>", helpers
+        role,
+        role_guard,
+        tool_guard,
+        default_policy,
+        "<default>",
+        helpers,
+        policy_constraints=policy_constraints,
     )
 
 
@@ -342,12 +364,18 @@ def _gated_rules(
     tool_policy: BaseToolPolicy,
     label: str,
     helpers: dict[str, list[str]],
+    *,
+    policy_constraints: list[str],
 ) -> list[str]:
     """Render the positive + per-constraint violation rules for one policy.
 
     ``role_guard`` / ``tool_guard`` are the body line(s) selecting which
     caller(s) and tool(s) the rule applies to. ``label`` names the tool (or
     ``<default>``) for constraint parse errors.
+
+    ``policy_constraints`` are the role's policy-level constraints, applied to
+    every tool. Required and keyword-only: there are two call sites, and a
+    missed one is silent engine drift rather than a crash.
 
     ``deny`` mode emits nothing — absence of a rule IS the deny.
     """
@@ -369,8 +397,10 @@ def _gated_rules(
     head = "allow" if tool_policy.mode == "allow" else "requires_approval"
 
     # Parse all constraints up-front — surfaces bad grammar at compile time.
+    # Policy-level first, matching evaluate_tool_call. An empty list renders
+    # byte-identically to before the field existed, so no source_hash moves.
     parsed: list[tuple[str, Node]] = []
-    for raw_constraint in tool_policy.constraints:
+    for raw_constraint in (*policy_constraints, *tool_policy.constraints):
         try:
             parsed.append((raw_constraint, parse_constraint(raw_constraint)))
         except Exception as exc:

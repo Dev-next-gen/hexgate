@@ -1,5 +1,6 @@
 """Public surface for the agents package — factory, policy enforcement, loaders."""
 
+from hexgate.agents.enumeration import SubagentLink, enumerate_subagents
 from hexgate.agents.factory import (
     create_agent,
     enforce_policy,
@@ -10,13 +11,13 @@ from hexgate.agents.factory import (
 from hexgate.agents.loader import (
     clear_registered_agents,
     list_available_agents,
+    list_local_agents,
+    list_registered_agents,
     load_agent,
     load_hexgate_agent,
     load_local_agent,
     load_local_agent_policy,
     load_local_agent_spec,
-    list_local_agents,
-    list_registered_agents,
     load_registered_agent,
     register_agent_factory,
     resolve_agent_source,
@@ -24,9 +25,13 @@ from hexgate.agents.loader import (
     unregister_agent_factory,
 )
 from hexgate.agents.models import AgentSpec
+from hexgate.agents.subagents import SubagentEdge
 
 __all__ = [
     "AgentSpec",
+    "SubagentEdge",
+    "SubagentLink",
+    "enumerate_subagents",
     "clear_registered_agents",
     "create_agent",
     "enforce_policy",

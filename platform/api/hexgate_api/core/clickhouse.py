@@ -5,12 +5,14 @@ Single shared Client — clickhouse-connect manages its own HTTP pool internally
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import KW_ONLY, dataclass
 from functools import lru_cache
-from typing import Generic, Protocol, TypeVar
+from typing import Final, Generic, Protocol, TypeVar
+from uuid import UUID
 
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
@@ -19,6 +21,13 @@ from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError
 from hexgate_api.settings import get_settings
 
 _log = logging.getLogger(__name__)
+
+# The `run_id` columns on policy_decision / llm_invocation are UUID, not
+# Nullable(UUID) — matching every other advisory column in this schema. This
+# is what a decision/invocation outside any run scope, or from an SDK that
+# does not yet send it, writes: "not attributed to a run" is a value, not an
+# absence.
+ZERO_RUN_ID: Final[UUID] = UUID(int=0)
 
 
 @lru_cache
@@ -48,6 +57,22 @@ def ping() -> bool:
     except Exception as exc:
         _log.warning("ClickHouse ping failed: %s", exc)
         return False
+
+
+def decode_json_column(raw: str) -> object:
+    """Decode a stored JSON string ("" -> None); leave malformed values as-is.
+
+    Every event table stores its structured payloads as JSON text (arguments,
+    hint, attributes, the gen_ai.* message content), so the read paths share
+    one decoder. Malformed text is returned unchanged rather than raising: a
+    row that predates a serialization change must still be readable.
+    """
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
 
 
 def table_columns(client: Client, table: str) -> set[str]:

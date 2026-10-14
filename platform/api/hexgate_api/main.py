@@ -14,6 +14,8 @@ from hexgate_api.core.db import async_session_factory, init_db
 from hexgate_api.core.keystore import keystore
 from hexgate_api.features.agents.router import router as agents_router
 from hexgate_api.features.agents.service import backfill_bundles
+from hexgate_api.features.ai_act.render.router import router as ai_act_pdf_router
+from hexgate_api.features.ai_act.router import router as ai_act_router
 from hexgate_api.features.audit.router import router as audit_router
 from hexgate_api.features.audit.service import verify_schema as verify_audit_schema
 from hexgate_api.features.auth.router import include_auth_routers, mount_oauth_routers
@@ -24,11 +26,17 @@ from hexgate_api.features.llm_invocations.router import router as llm_invocation
 from hexgate_api.features.llm_invocations.service import (
     verify_schema as verify_llm_schema,
 )
+from hexgate_api.features.llm_messages.router import router as llm_messages_router
+from hexgate_api.features.llm_messages.service import (
+    verify_schema as verify_messages_schema,
+)
 from hexgate_api.features.members.router import router as members_router
 from hexgate_api.features.orgs.router import router as orgs_router
 from hexgate_api.features.policy_modules.router import router as policy_modules_router
 from hexgate_api.features.projects.router import router as projects_router
 from hexgate_api.features.tokens.router import router as tokens_router
+from hexgate_api.features.usage.router import router as usage_router
+from hexgate_api.features.usage.service import verify_schema as verify_usage_schema
 
 # Load .env into os.environ before any HEXGATE_* read (CORS resolves at import
 # time). Real env vars still take precedence.
@@ -116,6 +124,7 @@ def _build_v1_router() -> APIRouter:
     v1.include_router(tokens_router)
     v1.include_router(audit_router)
     v1.include_router(llm_invocations_router)
+    v1.include_router(llm_messages_router)
     v1.include_router(agents_router)
     v1.include_router(chat_router)
     v1.include_router(orgs_router)
@@ -124,6 +133,9 @@ def _build_v1_router() -> APIRouter:
     v1.include_router(projects_router)
     v1.include_router(policy_modules_router)
     v1.include_router(bans_router)
+    v1.include_router(usage_router)
+    v1.include_router(ai_act_router)
+    v1.include_router(ai_act_pdf_router)
     include_auth_routers(v1)
     return v1
 
@@ -161,10 +173,21 @@ async def lifespan(app_: FastAPI):
         )
     else:
         # Behind this build, every insert is rejected and dropped by the SDK —
-        # silently, from this side. Refuse to boot so the previous deployment
-        # keeps serving. Each feature checks the tables it writes; combined so
-        # one boot names every gap rather than one per restart.
-        verify_all(get_clickhouse(), (verify_audit_schema, verify_llm_schema))
+        # silently, from this side. Refuse to boot rather than serve against a
+        # schema this build cannot write. Each feature checks the tables it
+        # writes or reads (llm_message is enricher-written and read back by
+        # the transcript endpoint here, and its migration is hand-shipped —
+        # see platform/DEPLOY.md §6); combined so one boot names every gap
+        # rather than one per restart.
+        verify_all(
+            get_clickhouse(),
+            (
+                verify_audit_schema,
+                verify_llm_schema,
+                verify_messages_schema,
+                verify_usage_schema,
+            ),
+        )
     # Surface deployment config at startup so a misconfig shows in logs
     # rather than as a silent browser CORS/cookie failure.
     from hexgate_api.features.auth.service import _cookie_secure, _dashboard_url

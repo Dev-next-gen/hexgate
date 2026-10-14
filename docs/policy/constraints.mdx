@@ -68,8 +68,9 @@ a quantifier body.
 Besides `args.*`, constraints can reference two **call-scope facts**: `role`
 (the caller's role) and `tool` (the tool being invoked) — e.g.
 `role == "admin"` or `tool == "refund_order"`. These mirror Rego's
-`input.role` / `input.tool`. Two further namespaces follow below: `ctx.*` (who
-is calling) and `run.*` (what this invocation has done so far).
+`input.role` / `input.tool`. Three further namespaces follow below: `ctx.*` (who
+is calling), `run.*` (what this invocation has done so far) and `agent_usage.*`
+(what this agent has done across runs).
 
 ## Caller attributes (`ctx.*`)
 
@@ -209,11 +210,267 @@ deliberate: an unwired boundary should not brick the agent. The cases:
   `asyncio.gather`, `asyncio.to_thread` and LangChain's own executor all carry
   the run correctly; only a hand-rolled `threading.Thread` loses it.
 
+### What a denied model is told
+
+On a `run.*` denial the model sees the constraint text — `run.tool_calls < 20`
+— so it learns the threshold and that it was crossed. It is never told the
+current counter value, and the run's id and counters are not in the payload the
+model receives. Budget *pressure* is deliberately not surfaced to the agent.
+
 One more, if you consume streams: two `astream()` generators consumed
 round-robin **in the same task** will cross-contaminate, because Python has no
 per-generator context. Consume one at a time, or put each in its own task. (This
 already affects caller identity via `HexgateContext`, so it isn't new to
 `run.*`.)
+
+## Agent usage (`agent_usage.*`)
+
+`run.*` caps one invocation. `agent_usage.*` caps **this agent across runs**, over a
+rolling window: "100 invocations per hour", "2M tokens per day". Each path is
+`<metric>_<window>`, such as `agent_usage.invocations_1h` or
+`agent_usage.total_tokens_24h`.
+
+```yaml
+consts:
+  hourly_runs: 100
+  daily_tokens: 2000000
+
+admission:
+  mode: allow
+  constraints:
+    - agent_usage.invocations_1h < consts.hourly_runs
+    - agent_usage.total_tokens_24h < consts.daily_tokens
+
+tools:
+  send_email:
+    mode: allow
+    constraints:
+      - agent_usage.tool_calls_5m < 30   # burst cap across runs
+```
+
+### The paths
+
+Seven metrics, each over five windows (`5m`, `1h`, `24h`, `7d`, `30d`), for 35 paths:
+
+| Metric | Counts | `run.*` twin |
+|---|---|---|
+| `invocations` | Admitted runs | — |
+| `tool_calls` | Tools that executed | `run.tool_calls` |
+| `denials` | Calls the policy or a guard refused, inside a run | `run.denials` |
+| `llm_calls` | Model requests | `run.llm_calls` |
+| `input_tokens` | Prompt tokens | `run.input_tokens` |
+| `output_tokens` | Completion tokens | `run.output_tokens` |
+| `total_tokens` | `input_tokens + output_tokens` | `run.total_tokens` |
+
+Like `run.*`, a typo'd path (`agent_usage.tool_call_1h`), an unknown window
+(`agent_usage.tool_calls_2h`) or a path with no window is **rejected when the policy
+loads**.
+
+### Local to this process, today
+
+The values are what **this process** has counted since it started:
+
+- a restart resets them;
+- two replicas of the same agent each count their own;
+- nothing is fetched from the platform.
+
+That is exact for an agent that runs in a single process and admits one run at a
+time, and it is what `hexgate policy test` simulates. A run is counted when it starts,
+not when it is admitted, so admissions that overlap (sync runs on separate threads, or
+a run waiting on an approval) can all read the same count and each pass: an
+`invocations_*` cap can overshoot by the number of admissions in flight. Counts shared
+across processes, and hard reserved limits, are planned and will come with their own
+documentation.
+
+### Where to put a limit
+
+Put invocation and budget caps on `admission`: they then refuse the run before it
+starts. The run being admitted is not counted yet, so use `<`:
+`agent_usage.invocations_1h < 100` admits 100 runs per hour when runs are admitted
+one at a time. A top-level
+`constraints:` entry also reaches every tool call inside a run, not only admission.
+
+### What the counters mean
+
+Each metric counts exactly what its `run.*` twin counts, summed over the window.
+The differences:
+
+- **`invocations` counts admitted runs, other than the current one.** A run refused
+  at admission is not counted. Inside a run, `invocations_*` leaves that run out, so
+  a top-level cap reads the same at admission and at every tool call in the run:
+  under `agent_usage.invocations_1h < 100`, the 100th run is admitted and can still
+  call its tools.
+- **`denials` counts denials inside a run.** Admission and ban refusals are decided
+  before the run starts, so they are not counted, the same as for `run.denials`.
+- **Tokens trail.** They are known only once the model answers, so a token cap
+  stops the next admission or call, not the one that crossed it. On the Pydantic AI
+  adapter, usage is reported when each run finishes. So `agent_usage.*_tokens_*`
+  **does** cap later runs there, unlike `run.*_tokens`.
+- **Rolling, not latching.** A denial clears as usage ages out of the window. There
+  are no calendar resets. This is the opposite of `run.*`, which only ever grows.
+- **Windows round up, never down.** The oldest bucket counts whole, so a window can
+  read slightly *more* than its nominal length: under a second more for `5m`, under
+  a minute for `1h` and `24h`, under an hour for `7d` and `30d`.
+
+### Dry-running a quota
+
+`hexgate policy test` takes `--agent-usage`. Unset paths read zero, as in a fresh
+process:
+
+```bash
+hexgate policy test policy.yaml --role default --tool agent.run \
+  --args '{"agent": "billing"}' --agent-usage '{"invocations_1h": 100}'
+```
+
+In a pytest suite, build the namespace with `agent_usage_namespace`:
+
+```python
+from hexgate.security import agent_usage_namespace, assert_denies
+
+assert_denies(
+    policy, "agent.run", {"agent": "billing"},
+    agent_usage=agent_usage_namespace(invocations_1h=100),
+)
+```
+
+## Where a constraint can live
+
+Three places, widening in reach:
+
+| Location | Applies to |
+|---|---|
+| `tools.<name>.constraints` | that one tool |
+| `default_policy.constraints` | tools **not** listed under `tools:` |
+| `constraints:` (top level) | **every** tool the role can reach, the synthetic `agent.*` and `skill*:` keys included |
+
+`default_policy.constraints` is the common trap. It is the *catch-all* policy,
+not a floor: once a tool is listed under `tools:`, the default no longer applies
+to it, so a run cap written there silently misses every tool you named.
+
+```yaml
+constraints:
+  - run.tool_calls < 20        # applies to read_file AND refund_order
+
+default_policy:
+  mode: deny
+
+tools:
+  read_file:
+    mode: allow
+  refund_order:
+    mode: allow
+    constraints:
+      - args.amount <= 500     # plus this one, on refund_order only
+```
+
+Policy-level constraints can only **narrow**. A tool with `mode: deny` is denied
+before constraints are consulted, so nothing here can grant access.
+
+### `args.*` at policy level reaches admission and reach
+
+"Every tool the role can reach" includes the synthetic keys `admission:` and
+`agents:` lower to — `agent.run`, plus `agent.handoff:<target>` and
+`agent.tool:<target>`. Those gates pass only their own arguments (`args.agent`
+for admission; `args.agent` / `args.target` / `args.via` for reach), so an
+`args.*` constraint written with tools in mind reads a missing field there, and
+**a missing ref fails closed**: the agent is refused before it starts, and every
+handoff and agent-as-tool call is denied.
+
+<Warning>
+**This policy denies its own agent at ingress.**
+
+```yaml
+constraints:
+  - args.amount <= 500     # no `amount` on agent.run → admission denied
+                           # ...nor on agent.handoff:billing → handoff denied
+
+admission:
+  mode: allow
+
+agents:
+  billing: { via: [handoff], mode: allow }
+
+tools:
+  refund_order: { mode: allow }
+```
+
+Not an admission quirk — the same constraint denies *any* tool that doesn't take
+an `amount`. Policy level is the place for predicates every reachable key can
+answer: `run.*`, `ctx.*`, `role`. Keep `args.*` on the tool that defines the
+argument.
+</Warning>
+
+When you do want one argument fenced role-wide, exempt the whole reserved
+namespace — `tool` is a fact like any other, and the grammar has `or`:
+
+```yaml
+constraints:
+  - startswith(tool, "agent.") or args.amount <= 500
+```
+
+Use the prefix, not `tool == "agent.run"`: naming the admission key alone still
+leaves `agent.handoff:<target>` and `agent.tool:<target>` denied.
+
+A `skills:` block lowers the same way, and skill decisions carry `skill`, `via`,
+`file_path` and `content_hash` (plus the script's invocation args on Google ADK;
+see [below](#pinning-a-skills-content)) — none of them `amount`, so the same
+`args.amount` fence denies every
+skill activation too. Exempt both skill prefixes alongside `agent.`:
+
+```yaml
+constraints:
+  - startswith(tool, "agent.") or startswith(tool, "skill:") or startswith(tool, "skill.") or args.amount <= 500
+```
+
+### Inheritance unions them
+
+Every other field overrides through `inherits:` — a child's `tools` entry
+replaces its parent's. Policy-level constraints are the exception: they
+**accumulate**, so a child cannot drop a fence a mixin declared.
+
+```yaml
+# policies/read_only.yaml
+is_mixin: true
+constraints:
+  - run.tool_calls < 50
+
+# policies/billing.yaml
+inherits: [read_only]
+constraints:
+  - run.elapsed_seconds < 120
+# → both apply. Duplicates across a diamond are collapsed.
+```
+
+<Note>
+  Policy-level constraints belong in a single-file policy — flat, or role-keyed
+  under `roles:`, where a top-level block unions into every role. Composed module
+  policies (`policies/boundaries/`, `policies/capabilities/`) reject them at
+  load: the fold composes per-tool rules only, and silently dropping a
+  role-wide fence would be fail-open.
+</Note>
+
+### Upgrading
+
+Top-level `constraints:` is new. Single-file policies ignore keys they don't
+recognise, so before this release the block parsed and was silently dropped —
+after it, the same YAML is enforced against every tool the role can reach. If
+you wrote one speculatively, it starts denying on upgrade, and the bundle's
+`rego_hash` and `wasm_hash` change with it. Note that `source_hash` does **not**
+move — it is the sha256 of your policy's raw YAML bytes, which the upgrade
+leaves untouched, so diffing it will tell you nothing changed. Grep your
+policies for a top-level `constraints:` before you roll forward — `hexgate
+policy show-rego` prints the compiled rules if you want to diff exactly what
+moved. (Composed module policies are unaffected: they rejected the key outright,
+then and now.)
+
+**Role-keyed documents activate one release later.** A document with a top-level
+`roles:` key validated only what sat *inside* each role, so a `constraints:`
+sibling was dropped there even after the release above — including a malformed
+expression, which `hexgate policy validate` could not see either, since there was
+nothing left to validate. It now unions into every role, so the same upgrade note
+applies: grep role-keyed policies too. Any
+*other* unrecognised sibling of `roles:` is now a load error rather than a silent
+drop, naming the key and telling you to move it inside a role.
 
 ## Named constants
 
@@ -234,6 +491,53 @@ Change a value in one place and every tool/role that references it updates.
 Constants merge through `inherits:` like `tools`, so shared constants belong in
 a mixin. A `consts.<name>` that isn't defined is rejected at build (and denies
 on the pydantic engine); across roles a name must map to a single value.
+
+### Pinning a skill's content
+
+A [skill](/concepts/skills) is matched by name, so editing an approved skill does
+not revoke its approval. Every skill decision carries these arguments, so pinning
+needs no new syntax — just a constraint and a constant:
+
+| Argument | Value |
+| --- | --- |
+| `args.skill` | the skill's name |
+| `args.via` | `instructions`, `resource` or `script` |
+| `args.file_path` | the file requested — the resource or script path, or the `SKILL.md` path on deepagents |
+| `args.content_hash` | `sha256:` + the hex digest of the `SKILL.md` body (frontmatter excluded) |
+
+```yaml
+consts:
+  refunder_approved: "sha256:3f2a9c0e…"   # the full 64-hex-digit digest
+
+skills:
+  refunder:
+    mode: allow
+    constraints: ["args.content_hash == consts.refunder_approved"]
+```
+
+- **The value carries a `sha256:` prefix.** A bare hex digest never matches —
+  and the digest Hexgate records is bare. Take the skill's `content_hash` from the
+  agent's registered manifest and write it as `"sha256:<content_hash>"`, or compute
+  it from the file with the same helpers the adapters use:
+
+  ```python
+  from pathlib import Path
+  from hexgate.manifest.skill_hash import skill_content_hash, skill_md_body
+
+  body = skill_md_body(Path("skills/refunder/SKILL.md").read_text())
+  print(f"sha256:{skill_content_hash(body)}")
+  ```
+- **It fails closed.** If the hash cannot be computed, `content_hash` is null,
+  the constraint does not match, and the pinned skill denies rather than passes.
+- **It closes drift, not prompt injection.** A pinned skill whose approved
+  content was already hostile is still allowed. Review the text before you pin it.
+
+The hash covers the `SKILL.md` body at every level, so a pin on a rule whose `via`
+includes `resource` or `script` also stops those when the instructions change —
+but it does not cover the resource and script files themselves. On
+[Google ADK](/adapters/google-adk#skills), a `script` decision also carries the
+script's invocation as `args.script_args`, `args.short_options` and
+`args.positional_args`.
 
 ## Boolean composition
 

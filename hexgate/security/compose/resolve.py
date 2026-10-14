@@ -10,16 +10,18 @@ what lets a per-agent / per-role ``boundary`` apply only to its own cell.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from hexgate.security.compose.grammar import Entry
-from hexgate.security.compose.lower import lower
+from hexgate.security.compose.imports import Loader, resolve_imports
+from hexgate.security.compose.lower import agent_guards, agent_usage_policy, lower
 from hexgate.security.compose.parse import parse_entry
 from hexgate.security.constraints import ConstraintParseError
 from hexgate.security.linker import link_policy_set
-from hexgate.security.models import AgentPolicy
+from hexgate.security.models import USAGE_FIELD, AgentPolicy
 from hexgate.security.modules import (
     DEFAULT_AGENT,
     LinkError,
@@ -28,20 +30,51 @@ from hexgate.security.modules import (
 )
 from hexgate.security.policy_set import DEFAULT_ROLE_NAME, PolicySet, PolicySetError
 
+_GUARDS_FIELD = "guards"
+
+
+def file_loader(base_dir: str | Path) -> Loader:
+    """A filesystem loader rooted at ``base_dir``, sandboxed to that tree.
+
+    The resolver's lexical guard already rejects ``..``/absolute refs; this also
+    resolves real paths (following symlinks) and rejects a target that escapes
+    ``base_dir`` — e.g. a symlink inside the project pointing outside it.
+    """
+    base = Path(base_dir).resolve()
+
+    def load(rel_path: str) -> str:
+        target = (base / rel_path).resolve()
+        if not target.is_relative_to(base):
+            raise LinkError(
+                f"import escapes the project directory: {rel_path!r} → {target}"
+            )
+        return target.read_text(encoding="utf-8")
+
+    return load
+
 
 def resolve_entry(
-    entry: Entry, *, agent: str = DEFAULT_AGENT, source: str = "policy.yaml"
+    entry: Entry,
+    *,
+    agent: str = DEFAULT_AGENT,
+    source: str = "policy.yaml",
+    loader: Loader | None = None,
+    entry_path: str | None = None,
 ) -> ProjectLinkResult:
     """Resolve an already-parsed :class:`Entry` for one executing ``agent``.
 
     Split from :func:`resolve_text` so a caller that already parsed (the CLI, to
-    read the declared agents for a hint) resolves without parsing twice.
+    read the declared agents for a hint) resolves without parsing twice. ``loader``
+    resolves ``import:`` refs; a policy that imports without one errors.
+    ``entry_path`` is the entry's own project-relative path, so a fragment that
+    imports the entry back is caught as a cycle.
     """
-    if entry.imports or entry.exports:
-        raise LinkError(
-            f"{source}: 'import:'/'export:' are not supported yet — the import "
-            f"graph lands in the next increment; inline the fragments for now"
-        )
+    # Splice imported leaf fragments onto each scope's ``_imported`` first — only
+    # the scopes this agent resolves, so an unrelated agent's bad import can't
+    # abort us. Raises a source-named LinkError on a bad ref, cycle, or missing loader.
+    resolve_imports(
+        entry, agent=agent, loader=loader, source=source, entry_path=entry_path
+    )
 
     # lower()/link build the SDK models, whose own validators (a bad constraint,
     # a reserved agent.* tool key, an empty `as:`) raise pydantic/constraint
@@ -49,10 +82,16 @@ def resolve_entry(
     # that parse/resolve failures come back as LinkError with the file named.
     try:
         per_role = lower(entry, agent)
+        # Guards and usage are agent-level and NOT composed through the fold (they
+        # are not a capability/boundary) — inject the one agent-wide value onto every
+        # folded role identically, so no role can diverge (R-GUARD-006 / R-GUARD-007).
         by_role: dict[str, LinkResult] = {}
         effective: dict[str, AgentPolicy] = {}
         for role, (boundaries, caps) in per_role.items():
             result = link_policy_set(boundaries, caps)
+            agent_level = _agent_level_fields(entry, agent)
+            if agent_level:
+                result = _with_agent_level(result, agent_level)
             by_role[role] = result
             effective[role] = result.effective[DEFAULT_ROLE_NAME]
         return ProjectLinkResult(policy_set=PolicySet(effective), by_role=by_role)
@@ -62,14 +101,68 @@ def resolve_entry(
         raise LinkError(f"{source}: {exc}") from exc
 
 
+def _with_agent_level(result: LinkResult, fields: dict[str, object]) -> LinkResult:
+    """``result`` with the agent-wide fields on its folded policy, in every view:
+    its own ``policy_set``, and ``effective`` — which ``effective_policy_by_role``
+    serializes for the platform's resolved-policy YAML and the CLI."""
+    patched = result.effective[DEFAULT_ROLE_NAME].model_copy(update=fields)
+    return replace(
+        result,
+        policy_set=PolicySet({DEFAULT_ROLE_NAME: patched}),
+        effective={DEFAULT_ROLE_NAME: patched},
+    )
+
+
+def _agent_level_fields(entry: Entry, agent: str) -> dict[str, object]:
+    """The agent-wide ``AgentPolicy`` fields to inject onto one folded role.
+
+    Built per role, with fresh ``GuardRule`` copies, so the roles never share mutable
+    state. ``UsagePolicy`` is frozen, so it is shared."""
+    fields: dict[str, object] = {}
+    guards = agent_guards(entry, agent)
+    if guards:
+        fields[_GUARDS_FIELD] = {
+            name: rule.model_copy() for name, rule in guards.items()
+        }
+    usage = agent_usage_policy(entry, agent)
+    if usage is not None:
+        fields[USAGE_FIELD] = usage
+    return fields
+
+
 def resolve_text(
-    text: str, *, agent: str = DEFAULT_AGENT, source: str = "policy.yaml"
+    text: str,
+    *,
+    agent: str = DEFAULT_AGENT,
+    source: str = "policy.yaml",
+    loader: Loader | None = None,
+    entry_path: str | None = None,
 ) -> ProjectLinkResult:
-    """Resolve one policy document's text for one executing ``agent``."""
-    return resolve_entry(parse_entry(text, source=source), agent=agent, source=source)
+    """Resolve one policy document's text for one executing ``agent``.
+
+    ``loader`` (import-ref path → text) resolves ``import:``; omit it for a
+    self-contained policy, or pass one to resolve imports in memory (tests).
+    """
+    return resolve_entry(
+        parse_entry(text, source=source),
+        agent=agent,
+        source=source,
+        loader=loader,
+        entry_path=entry_path,
+    )
 
 
 def resolve_file(path: str | Path, *, agent: str = DEFAULT_AGENT) -> ProjectLinkResult:
-    """Resolve the ``policy.yaml`` at ``path`` for one executing ``agent``."""
+    """Resolve the ``policy.yaml`` at ``path`` for one executing ``agent``.
+
+    ``import:`` refs resolve relative to the entry file's directory, sandboxed to
+    that tree.
+    """
     p = Path(path)
-    return resolve_text(p.read_text(encoding="utf-8"), agent=agent, source=str(p))
+    return resolve_text(
+        p.read_text(encoding="utf-8"),
+        agent=agent,
+        source=str(p),
+        loader=file_loader(p.parent),
+        entry_path=p.name,
+    )

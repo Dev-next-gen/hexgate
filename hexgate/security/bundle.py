@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,9 +26,16 @@ from typing import Any
 
 import yaml
 
+from hexgate.runtime.agent_usage import KNOWN_AGENT_USAGE_PATHS, OnUnavailable
 from hexgate.security.decision import Verdict
 from hexgate.security.signing import SignatureError, verify_bytes
 from hexgate.security.wasm_engine import WasmPolicy
+
+_log = logging.getLogger(__name__)
+
+_AGENT_USAGE_KEY = "agent_usage"
+_USAGE_KEY = "usage"
+_ON_UNAVAILABLE_KEY = "on_unavailable"
 
 
 class BundleIntegrityError(RuntimeError):
@@ -293,13 +301,15 @@ class PolicyBundle:
         args: Mapping[str, Any],
         attributes: Mapping[str, Any] | None = None,
         run: Mapping[str, Any] | None = None,
+        agent_usage: Mapping[str, Any] | None = None,
     ) -> Verdict:
         """:class:`~hexgate.security.decision.PolicyEngine` entry point.
 
         Runs the compiled WASM module; ``None`` role falls back to the
         ``default`` role, matching the pydantic engine. ``attributes`` become
-        the ``input.ctx`` document the compiled ``ctx.*`` conditions read, and
-        ``run`` the ``input.run`` document the ``run.*`` ones read."""
+        the ``input.ctx`` document the compiled ``ctx.*`` conditions read,
+        ``run`` the ``input.run`` document the ``run.*`` ones read, and
+        ``agent_usage`` the ``input.agent_usage`` one."""
         from hexgate.security.policy import evaluate_tool_call_wasm
         from hexgate.security.policy_set import DEFAULT_ROLE_NAME
 
@@ -310,6 +320,7 @@ class PolicyBundle:
             dict(args),
             attributes=attributes,
             run=run,
+            agent_usage=agent_usage,
         )
 
     def declares_admission(self) -> bool:
@@ -323,6 +334,79 @@ class PolicyBundle:
     def declares_reach(self) -> bool:
         """Read the reach-configured flag from the signed manifest (reach counterpart)."""
         return bool(self.manifest.get("agent_gating", {}).get("reach", False))
+
+    def declares_tool_reach(self) -> bool:
+        """Read the agent-as-tool reach flag from the signed manifest. Absent (an
+        older bundle) reads False, so no spurious warning fires."""
+        return bool(self.manifest.get("agent_gating", {}).get("reach_tool", False))
+
+    def declares_skills(self) -> bool:
+        """Read the skills-configured flag from the signed manifest. Absent (an
+        older bundle) reads False — safe, those predate skill gating."""
+        return bool(self.manifest.get("agent_gating", {}).get("skills", False))
+
+    def agent_usage_paths(self) -> frozenset[str]:
+        """Read the referenced ``agent_usage.*`` paths from the signed manifest.
+        Absent (a usage-free policy, or an older bundle) reads empty.
+
+        Paths this SDK doesn't know (a bundle built by a newer one) are dropped, so
+        they read as missing: a plain comparison on one denies, a negated one passes."""
+        listed = frozenset(self.manifest.get(_AGENT_USAGE_KEY, ()))
+        unknown = listed - KNOWN_AGENT_USAGE_PATHS
+        if unknown:
+            _log.warning(
+                "bundle references agent_usage.* path(s) %s this SDK does not know; "
+                "they read as missing, so plain comparisons on them deny and negated ones "
+                "(not ...) pass. Upgrade the SDK.",
+                sorted(unknown),
+            )
+        return listed - unknown
+
+    def usage_on_unavailable(self) -> OnUnavailable:
+        """Read the fail mode from the signed manifest. Absent (the default, or an
+        older bundle) reads ``allow`` (G3). A value this SDK doesn't know (a newer
+        builder) also reads ``allow``, with a warning: an unknown mode must not turn
+        a platform blip into an outage."""
+        section = self.manifest.get(_USAGE_KEY)
+        if not isinstance(section, dict):
+            return OnUnavailable.ALLOW
+        raw = section.get(_ON_UNAVAILABLE_KEY)
+        try:
+            return OnUnavailable(raw)
+        except ValueError:
+            _log.warning(
+                "bundle sets usage.on_unavailable=%r, which this SDK does not know; "
+                "reading 'allow'. Upgrade the SDK.",
+                raw,
+            )
+            return OnUnavailable.ALLOW
+
+    def effective_guards(self, tool_name: str) -> dict[str, bool]:
+        """The guard enable/disable stance (R-GUARD-007). Baseline-only in v1, so
+        uniform for every tool — ``tool_name`` is accepted for a signature shared with
+        :meth:`AgentPolicy.effective_guards` but does not change the result.
+
+        The signed ``guards`` section's baseline, as ``{guard_name: enabled}``. Absent
+        (a guards-free policy, or an older bundle) reads ``{}``: every declared guard
+        runs as coded, the safe default. Read per call by the guarded runner to skip a
+        disabled guard.
+        """
+        section = self.manifest.get("guards")
+        if not isinstance(section, dict):
+            return {}
+        return dict(section.get("baseline", {}))
+
+    def governed_guard_names(self) -> frozenset[str]:
+        """Every guard name the policy's ``guards`` section references (R-GUARD-007).
+
+        The baseline keys, used for the closed-world check: a policy naming a guard the
+        agent's manifest does not declare stops cold. Empty for a guards-free or older
+        bundle, so the check is a no-op there.
+        """
+        section = self.manifest.get("guards")
+        if not isinstance(section, dict):
+            return frozenset()
+        return frozenset(section.get("baseline", {}))
 
     # ---- Metadata ------------------------------------------------------
 
@@ -404,7 +488,19 @@ def build_signed_bundle(
     agent_gating = {
         "admission": resolved.declares_admission(),
         "reach": resolved.declares_reach(),
+        "reach_tool": resolved.declares_tool_reach(),
+        "skills": resolved.declares_skills(),
     }
+    # The guard enable/disable stance (R-GUARD-007), read back per call in the guarded
+    # runner to skip a disabled guard. Agent-level and signed like agent_gating;
+    # None when no role configures a guard, so the key is omitted and a guards-free
+    # policy's manifest bytes / source_hash stay identical (no bundle drift).
+    guard_stance = resolved.guard_stance()
+    # The agent_usage.* paths the enforcer must supply, so it knows to enable the
+    # usage ledgers. Signed, so stripping it can't switch quotas off.
+    usage_paths = resolved.agent_usage_paths()
+    # Signed so a caller can't strip a deny and fail open.
+    on_unavailable = resolved.usage_on_unavailable()
 
     wasm_bytes: bytes | None = None
     wasm_hash: str | None = None
@@ -420,6 +516,16 @@ def build_signed_bundle(
         "wasm_hash": wasm_hash,
         "agent_gating": agent_gating,
     }
+    # Omit when absent so a guards-free policy's manifest is byte-identical to before
+    # the block existed — the signature/source_hash must not move (R-GUARD-007).
+    if guard_stance is not None:
+        manifest["guards"] = guard_stance
+    # Omitted when empty for the same reason: a usage-free policy's bytes must not move.
+    if usage_paths:
+        manifest[_AGENT_USAGE_KEY] = sorted(usage_paths)
+    # Omitted at the default, so a usage-free policy's manifest bytes don't move.
+    if on_unavailable is not OnUnavailable.ALLOW:
+        manifest[_USAGE_KEY] = {_ON_UNAVAILABLE_KEY: on_unavailable.value}
     # The one canonical serialization. Sign these exact bytes.
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"

@@ -247,7 +247,11 @@ _JSON_KEYWORDS = ("true", "false", "null")
 # Call-scope facts usable as a bare (undotted) identifier. Every other bare
 # word is either a field (must be dotted, e.g. args.x) or a forgotten-quotes
 # string — so a lone non-fact identifier is rejected rather than read as a ref.
-_FACTS = ("role", "tool")
+FACTS = ("role", "tool")
+# The other roots a path can start from: the call's ``args``, the caller's
+# ``ctx`` and the run's ``run`` (the context :func:`check_constraints` builds).
+# Facts are plain strings, so a path dotted into one is never set either.
+PATH_ROOTS = ("args", "ctx", "run")
 
 _FUNCS = ("startswith", "endswith", "contains", "matches")
 _FUNC_RE = re.compile(r"^([a-z]+)\((.*)\)$", re.DOTALL)
@@ -453,7 +457,7 @@ def _parse_operand(text: str, source: str, side: str) -> Operand:
         # A lone identifier is only valid as a fact (role/tool); anything else
         # is a forgotten-quotes typo (`== USD`) that would otherwise parse as a
         # ref to an absent field and fail closed with no config-time error.
-        if len(path) == 1 and path[0] not in _FACTS:
+        if len(path) == 1 and path[0] not in FACTS:
             raise ConstraintParseError(
                 f"bare identifier {text!r} in {source!r} is neither a field path "
                 f'nor a fact — did you forget quotes? Use "{text}" for a string '
@@ -544,28 +548,36 @@ def iter_arg_refs(node: Node):
     refs (``.`` inside a quantifier) bind to a collection element, not a named
     field, so they're skipped.
     """
+    for path, _negated in iter_arg_refs_negated(node):
+        yield path
+
+
+def iter_arg_refs_negated(node: Node, negated: bool = False):
+    """:func:`iter_arg_refs`, paired with whether each path sits under an odd
+    number of ``not``. A comparison on a missing field is False, so a negated one
+    is True: that tells a typo that fails closed from one that fails open."""
 
     def _operand(op):
         if isinstance(op, Ref):
-            yield op.path
+            yield op.path, negated
         elif isinstance(op, Count) and isinstance(op.ref, Ref):
-            yield op.ref.path
+            yield op.ref.path, negated
 
     if isinstance(node, Cmp):
         yield from _operand(node.left)
         yield from _operand(node.right)
     elif isinstance(node, Call):
         if isinstance(node.arg, Ref):
-            yield node.arg.path
+            yield node.arg.path, negated
     elif isinstance(node, Quant):
         if isinstance(node.ref, Ref):
-            yield node.ref.path
-        yield from iter_arg_refs(node.body)
+            yield node.ref.path, negated
+        yield from iter_arg_refs_negated(node.body, negated)
     elif isinstance(node, (And, Or)):
         for part in node.parts:
-            yield from iter_arg_refs(part)
+            yield from iter_arg_refs_negated(part, negated)
     elif isinstance(node, Not):
-        yield from iter_arg_refs(node.inner)
+        yield from iter_arg_refs_negated(node.inner, not negated)
 
 
 LEFT = "left"
@@ -940,6 +952,7 @@ def check_constraints(
     consts: dict[str, Any] | None = None,
     attributes: Mapping[str, Any] | None = None,
     run: Mapping[str, Any] | None = None,
+    agent_usage: Mapping[str, Any] | None = None,
 ) -> None:
     """Evaluate every constraint; raise on the first failure.
 
@@ -949,9 +962,11 @@ def check_constraints(
 
     ``role`` and the tool name are exposed as top-level ``role`` / ``tool``
     facts, mirroring Rego's ``input.role`` / ``input.tool``. ``consts``
-    supplies ``consts.<name>``. ``attributes`` and ``run`` are exposed under
-    ``ctx.<key>`` / ``run.<path>``, mirroring ``input.ctx`` / ``input.run``. A
-    missing ``ctx.<key>`` or ``run.<path>`` fails closed like any other ref.
+    supplies ``consts.<name>``. ``attributes``, ``run`` and ``agent_usage`` are
+    exposed under ``ctx.<key>`` / ``run.<path>`` / ``agent_usage.<path>``,
+    mirroring ``input.ctx`` / ``input.run`` / ``input.agent_usage``. A missing
+    ``ctx.<key>``, ``run.<path>`` or ``agent_usage.<path>`` fails closed like any
+    other ref.
     """
     if not constraints:
         return
@@ -961,6 +976,7 @@ def check_constraints(
         "tool": tool_name,
         "ctx": dict(attributes or {}),
         "run": dict(run or {}),
+        "agent_usage": dict(agent_usage or {}),
         _CONSTS_KEY: consts or {},
     }
     for entry in constraints:

@@ -6,15 +6,18 @@ two routes that compile+sign a bundle (update, register).
 
 import base64
 import hashlib
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from hexgate_api.core.db import get_session
 from hexgate_api.deps.org import require_org_member
-from hexgate_api.deps.tokens import require_project
-from hexgate_api.models import Agent, AgentVersion
+from hexgate_api.deps.tokens import TokenActor, require_project, require_project_actor
+from hexgate_api.models import Agent, AgentClassification, AgentVersion, User
 from hexgate_api.schemas import (
+    AgentClassificationRead,
+    AgentClassificationWrite,
     AgentManifest,
     AgentManifestView,
     AgentRead,
@@ -26,15 +29,44 @@ from hexgate_api.schemas import (
     ValidatePolicyResponse,
 )
 from hexgate_api.features.agents.service import (
+    DuplicateSkillNameError,
     get_agent,
+    get_classification,
     get_latest_agent_versions_map,
+    latest_manifests,
     list_agents,
+    manifest_intended_purpose,
+    missing_fields,
     register_manifest,
     update_agent,
+    upsert_classification,
 )
 from hexgate_api.seeds.defaults import ensure_default_project
 
+if TYPE_CHECKING:
+    from hexgate.manifest.models import AgentManifest as SdkAgentManifest
+    from hexgate.security.policy_set import PolicySet
+
 router = APIRouter()
+
+
+def _bundle_etag(agent: Agent) -> str | None:
+    """The conditional-GET ETag for an agent's served bundle.
+
+    Hashes the signed manifest bytes, not the wasm. The manifest carries the guard
+    enable/disable stance (R-GUARD-007) *and* the wasm_hash, so it is the one artifact
+    that changes on **any** policy edit. Keying the ETag on the wasm alone made a
+    guards-only change a no-op ETag: the wasm is byte-identical whether a guard is
+    enabled or disabled (guards are read from the manifest at runtime, never compiled
+    into the policy wasm), so the SDK's per-turn ``If-None-Match`` got a 304 and a live
+    agent kept running a guard the dashboard had just disabled. Falls back to the wasm
+    hash for an older bundle stored without its manifest, and ``None`` when nothing is
+    compiled (the pydantic-fallback path keys its own refresh off ``policy_yaml``)."""
+    if agent.bundle_manifest is not None:
+        return hashlib.sha256(agent.bundle_manifest.encode("utf-8")).hexdigest()
+    if agent.compiled_wasm is not None:
+        return hashlib.sha256(agent.compiled_wasm).hexdigest()
+    return None
 
 
 def _agent_read(agent: Agent) -> AgentRead:
@@ -139,23 +171,19 @@ async def api_get_agent(
     /v1/agents/{name}`` — same response shape, project derived from
     the token instead of the URL.
 
-    Supports ETag-based conditional GETs: the response carries the
-    bundle's ``wasm_hash`` as an ``ETag`` header. A subsequent request
-    with ``If-None-Match: <wasm_hash>`` returns ``304 Not Modified``
-    when the bundle hasn't changed.
+    Supports ETag-based conditional GETs: the response carries a hash of the
+    signed manifest as an ``ETag`` header — over the manifest, not the wasm, so a
+    guards-only edit still invalidates it (see :func:`_bundle_etag`). A subsequent
+    request with a matching ``If-None-Match`` returns ``304 Not Modified``.
     """
     await ensure_default_project(session)
     agent = await get_agent(session, project_id, name)
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
 
-    # ETag is a quoted opaque string per RFC 7232. We use the wasm_hash
-    # (a sha256 hex digest); falls back to None when no bundle is stored.
-    bundle_hash = (
-        hashlib.sha256(agent.compiled_wasm).hexdigest()
-        if agent.compiled_wasm is not None
-        else None
-    )
+    # ETag is a quoted opaque string per RFC 7232, over the signed manifest so a
+    # guards-only edit still invalidates it (see _bundle_etag). None when unbuilt.
+    bundle_hash = _bundle_etag(agent)
     etag = f'"{bundle_hash}"' if bundle_hash else None
 
     if etag and if_none_match and if_none_match.strip() == etag:
@@ -170,18 +198,22 @@ async def api_get_agent(
 @router.put(
     "/projects/{project_id}/agents/{name}",
     response_model=AgentRead,
-    dependencies=[Depends(require_org_member)],
 )
 async def api_update_agent(
     project_id: str,
     name: str,
     body: AgentUpdate,
+    user: User = Depends(require_org_member),
     session: AsyncSession = Depends(get_session),
 ) -> AgentRead:
+    """Save an agent's YAMLs. ``require_org_member`` moves out of the
+    decorator so its ``User`` can be stamped as the author."""
     from hexgate_api.core.keystore import keystore
     from hexgate_api.core.locks import project_lock
 
     await ensure_default_project(session)
+    if body.policy_yaml is not None:
+        _reject_unloadable_policy(body.policy_yaml)
     # Hold the project lock: this compiles + writes a bundle, so it must not
     # interleave with recompile_project (a concurrent policy write) and commit
     # out of order. See core.locks.
@@ -196,10 +228,125 @@ async def api_update_agent(
             # Compile + sign the policy into a WASM bundle at save time, using
             # the platform's root key (same key that signs biscuits).
             sign=keystore.sign,
+            updated_by_user_id=user.id,
         )
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
     return _agent_read(agent)
+
+
+# ---------------------------------------------------------------------------
+# AI Act classification — the operator's own entry for an agent. Same
+# cookie-authed org gate as the sibling agent routes; no bearer/SDK
+# counterpart, because nothing in the enforcement path reads this.
+# ---------------------------------------------------------------------------
+
+
+def _classification_read(
+    *,
+    agent_name: str,
+    entry: AgentClassification | None,
+    prefilled_purpose: str | None = None,
+) -> AgentClassificationRead:
+    """Serialise an entry — or the empty entry when the operator has none.
+
+    ``prefilled_purpose`` is used only when there is no entry at all. Once an
+    entry exists, every value in the response is one the operator recorded:
+    filling a null purpose on a recorded entry would put the SDK manifest's
+    developer-written blurb on screen under ``recorded: true``, and the next
+    Save would stamp it as that operator's Art. 3(12) assertion.
+    """
+    missing = missing_fields(entry)
+    if entry is None:
+        return AgentClassificationRead(
+            agent_name=agent_name,
+            intended_purpose=prefilled_purpose,
+            recorded=False,
+            complete=False,
+            missing_fields=missing,
+        )
+    return AgentClassificationRead(
+        agent_name=agent_name,
+        intended_purpose=entry.intended_purpose,
+        operator_role=entry.operator_role,
+        risk_tier=entry.risk_tier,
+        annex_iii_point=entry.annex_iii_point,
+        oversight_owner_name=entry.oversight_owner_name,
+        oversight_owner_contact=entry.oversight_owner_contact,
+        checker_last_update_date=entry.checker_last_update_date,
+        recorded=True,
+        recorded_by_user_id=entry.recorded_by_user_id,
+        recorded_at=entry.recorded_at,
+        complete=not missing,
+        missing_fields=missing,
+    )
+
+
+@router.get(
+    "/projects/{project_id}/agents/{name}/classification",
+    response_model=AgentClassificationRead,
+    dependencies=[Depends(require_org_member)],
+    tags=["ai-act"],
+)
+async def api_get_agent_classification(
+    project_id: str,
+    name: str,
+    session: AsyncSession = Depends(get_session),
+) -> AgentClassificationRead:
+    """Read an agent's AI Act entry, or an empty one when none is recorded.
+
+    200 with ``recorded=false`` rather than 404: the dashboard's form needs
+    something to open on, and "no entry yet" is a normal state the report
+    reports (as *incomplete*) rather than an error. On that empty entry only,
+    ``intended_purpose`` is prefilled from the registered manifest's
+    description — a suggestion, stored only once the operator PUTs it.
+    """
+    await ensure_default_project(session)
+    agent = await get_agent(session, project_id, name)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+
+    entry = await get_classification(session, agent.id)
+    prefill = await manifest_intended_purpose(session, agent) if entry is None else None
+    # ``name``, not ``agent.name``: the path parameter is what ``get_agent``
+    # matched on, so the two are the same string. Belt-and-braces, not the fix
+    # — the savepoint in ``upsert_classification`` is what keeps the ORM
+    # instance loaded; this just removes the response's dependence on it.
+    return _classification_read(agent_name=name, entry=entry, prefilled_purpose=prefill)
+
+
+@router.put(
+    "/projects/{project_id}/agents/{name}/classification",
+    response_model=AgentClassificationRead,
+    tags=["ai-act"],
+)
+async def api_put_agent_classification(
+    project_id: str,
+    name: str,
+    body: AgentClassificationWrite,
+    # Out of the decorator and into a parameter so the gate's ``User`` can be
+    # stamped as the recorder — the shape the other authoring routes use.
+    user: User = Depends(require_org_member),
+    session: AsyncSession = Depends(get_session),
+) -> AgentClassificationRead:
+    """Record the operator's entry for an agent, replacing any previous one.
+
+    The platform stores what the operator asserts and says nothing about it:
+    a tier that looks inconsistent with the agent's tools is recorded as
+    given, and a partial entry is accepted and reported as incomplete.
+    """
+    await ensure_default_project(session)
+    agent = await get_agent(session, project_id, name)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+
+    entry = await upsert_classification(
+        session,
+        agent_id=agent.id,
+        recorded_by_user_id=user.id,
+        values=body,
+    )
+    return _classification_read(agent_name=name, entry=entry)
 
 
 @router.post(
@@ -208,27 +355,76 @@ async def api_update_agent(
     dependencies=[Depends(require_org_member)],
 )
 async def api_validate_policy(
-    project_id: str,  # noqa: ARG001 — routed by FastAPI, scope-checked by future auth
-    name: str,  # noqa: ARG001 — same
+    project_id: str,
+    name: str,
     body: ValidatePolicyRequest,
+    session: AsyncSession = Depends(get_session),
 ) -> ValidatePolicyResponse:
     """Parse ``policy.yaml`` end-to-end + check every ``constraints`` string.
 
     Server-side validation keeps one source of truth on grammar — the same
-    parsers the SDK enforces with at run time. Handles both shapes:
+    parsers the SDK enforces with at run time. See
+    :func:`_validate_policy_document` for what the pass covers; the save route
+    runs the identical check, so a policy that validates here is one that saves
+    and a policy that saves is one that validated.
+
+    The manifest-dependent findings (guard and drift lints) run against the
+    agent's latest registered manifest, and are skipped if it never registered.
+    """
+    manifest = (await latest_manifests(session, project_id, [name])).get(name)
+    return _validate_policy_document(body.policy_yaml, manifest=manifest)
+
+
+# A policy the loader rejects is the author's mistake, not a server fault, and
+# it is not a request-shape error FastAPI could have caught — 422 is the code
+# the /validate route's own contract already implies for a document it fails.
+POLICY_REJECTED_STATUS = 422
+
+
+def _reject_unloadable_policy(policy_yaml: str) -> None:
+    """Refuse a save whose policy would compile to nothing.
+
+    ``compile_bundle`` degrades *every* compile failure to "store no bundle",
+    which is right when ``opa`` is absent but wrong for a broken document: the
+    save returned 200, the agent's three bundle columns were nulled, and
+    enforcement silently dropped to the SDK's pydantic fallback with no
+    diagnostic on the wire. Gate on the same check ``/validate`` runs so the two
+    routes cannot disagree about which documents are loadable, and so a typo in
+    a fence is a failed request instead of a quietly unenforced policy.
+    """
+    result = _validate_policy_document(policy_yaml)
+    if result.ok:
+        return
+    raise HTTPException(
+        status_code=POLICY_REJECTED_STATUS,
+        detail={
+            "message": "policy_yaml did not validate; nothing was saved",
+            "errors": [error.model_dump() for error in result.errors],
+        },
+    )
+
+
+def _validate_policy_document(
+    policy_yaml: str, *, manifest: "SdkAgentManifest | None" = None
+) -> ValidatePolicyResponse:
+    """Validate a policy document the whole way down. Handles both shapes:
 
     * flat single-policy document → validated as one :class:`AgentPolicy`
     * inline-roles document (top-level ``roles:`` map) → each entry
       validated as an :class:`AgentPolicy`, then every constraint inside
       every tool is parsed against the M1 grammar.
 
+    Either way the document then goes through :func:`_load_document`, the same
+    loader the compiler and the SDK use, so ``ok`` can't report a document
+    those two reject — see that function for what the per-role pass misses.
+
     Returns a flat list of ``{role, line, message}`` diagnostics. ``role``
     is ``None`` for top-level YAML / schema errors; populated when the
     failure lives inside a specific role's section.
 
-    ``warnings`` carries authoring lints — grants reachable only through the
-    ``default`` fallback, i.e. by any caller carrying an undefined role name.
-    They never set ``ok`` to False.
+    ``warnings`` carries the SDK's ``analyze_policy`` findings (``manifest``
+    enables the guard and drift ones). They never set ``ok`` to False, except a
+    finding in :data:`_BLOCKING_FINDINGS`, which goes to ``errors``.
     """
     import yaml
     from pydantic import ValidationError
@@ -242,7 +438,7 @@ async def api_validate_policy(
 
     errors: list[PolicyValidationError] = []
     try:
-        parsed = yaml.safe_load(body.policy_yaml) or {}
+        parsed = yaml.safe_load(policy_yaml) or {}
     except MarkedYAMLError as exc:
         line = exc.problem_mark.line + 1 if exc.problem_mark else None
         return ValidatePolicyResponse(
@@ -251,6 +447,21 @@ async def api_validate_policy(
                 PolicyValidationError(
                     line=line,
                     message=f"YAML parse: {exc.problem or exc}",
+                )
+            ],
+        )
+
+    # Valid YAML that isn't a mapping (a bare list, a scalar) parses fine and
+    # then has no keys to walk — report it rather than letting every `.get`
+    # below raise.
+    if not isinstance(parsed, dict):
+        return ValidatePolicyResponse(
+            ok=False,
+            errors=[
+                PolicyValidationError(
+                    message=(
+                        f"policy must be a YAML mapping, got {type(parsed).__name__}"
+                    )
                 )
             ],
         )
@@ -297,52 +508,86 @@ async def api_validate_policy(
             )
         _check_policy(policy, None)
 
-    return ValidatePolicyResponse(
-        ok=not errors, errors=errors, warnings=_default_role_warnings(parsed, errors)
-    )
-
-
-def _default_role_warnings(
-    parsed: dict, errors: list[PolicyValidationError]
-) -> list[PolicyValidationError]:
-    """Authoring lints over the document as a whole (no-op if it didn't parse).
-
-    Needs a fully loaded :class:`PolicySet` — inheritance and mixins resolved —
-    which the per-role checks above don't build, validating roles in isolation.
-    """
+    policy_set, document_error = _load_document(parsed)
+    # Only when the per-role pass found nothing: the loader fails on the same
+    # cause, so reporting it too would just duplicate a diagnostic that already
+    # names the offending role.
+    if document_error is not None and not errors:
+        errors.append(document_error)
     if errors:
-        return []
+        return ValidatePolicyResponse(ok=False, errors=errors)
 
+    blocking, warnings = _policy_findings(policy_set, manifest)
+    return ValidatePolicyResponse(ok=not blocking, errors=blocking, warnings=warnings)
+
+
+def _load_document(
+    parsed: dict,
+) -> "tuple[PolicySet | None, PolicyValidationError | None]":
+    """Load the document the way the SDK does at run time — the final gate.
+
+    Returns the loaded set for the lints below, or the failure to report. The
+    per-role pass validates each role in isolation, so it never sees file-level
+    grammar (an unknown sibling of ``roles:``, a malformed top-level
+    ``constraints:`` block) or a failure needing the resolved set (inheritance,
+    mixins, ``consts`` references). Reporting these keeps ``ok`` from
+    disagreeing with the loader the compiler and the SDK both go through — a
+    document that validates here has to be one they accept.
+    """
     from pydantic import ValidationError
 
-    from hexgate.security.analyzer import check_default_role_exposure
     from hexgate.security.policy_set import (
         PolicySetError,
         load_policy_set_from_dict,
     )
 
     try:
-        policy_set = load_policy_set_from_dict(parsed)
-    except (PolicySetError, ValidationError):
-        # Inheritance/mixin failures the per-role checks don't cover. Surfacing
-        # them here would widen this endpoint's error contract, and dropping the
-        # lint can't make a broken document look clean — `ok` comes from
-        # `errors`, and the CLI and platform build both still reject these.
-        return []
-
-    return [
-        PolicyValidationError(
-            role=lint.role, tool=lint.tool, message=f"{lint.code}: {lint.message}"
+        return load_policy_set_from_dict(parsed), None
+    except PolicySetError as exc:
+        return None, PolicyValidationError(message=str(exc))
+    except ValidationError as exc:
+        return None, PolicyValidationError(
+            message=f"policy schema: {exc.errors()[0]['msg']}"
         )
-        for lint in check_default_role_exposure(policy_set)
-    ]
+
+
+# Findings that fail validation, and so block a save. A cross-role guard
+# divergence (R-GUARD-007) is lazy on the PolicySet, so the loader accepts it, but
+# the SDK crashes on it at construction whatever the manifest says. Every other
+# finding is advisory: a guard lint can name a guard before the agent re-registers
+# with a manifest that has it.
+_BLOCKING_FINDINGS = frozenset({"guard-divergence"})
+
+
+def _policy_findings(
+    policy_set: "PolicySet", manifest: "SdkAgentManifest | None"
+) -> tuple[list[PolicyValidationError], list[PolicyValidationError]]:
+    """The SDK's ``analyze_policy`` findings over the loaded document, split into
+    ``(errors, warnings)`` by :data:`_BLOCKING_FINDINGS`.
+
+    Needs a fully loaded :class:`PolicySet` — inheritance and mixins resolved —
+    which the per-role checks don't build, validating roles in isolation.
+    """
+    from hexgate.security import analyze_policy
+
+    errors: list[PolicyValidationError] = []
+    warnings: list[PolicyValidationError] = []
+    for lint in analyze_policy(policy_set, manifest=manifest):
+        finding = PolicyValidationError(
+            role=lint.role,
+            tool=lint.tool,
+            message=f"{lint.code}: {lint.message}",
+            severity=lint.severity,
+        )
+        (errors if lint.code in _BLOCKING_FINDINGS else warnings).append(finding)
+    return errors, warnings
 
 
 @router.post("/agents", response_model=RegisterAgentResponse)
 async def api_register_agent(
     body: RegisterAgentRequest,
     response: Response,
-    project_id: str = Depends(require_project),
+    actor: TokenActor = Depends(require_project_actor),
     session: AsyncSession = Depends(get_session),
 ) -> RegisterAgentResponse:
     """SDK-facing: register/upsert an agent manifest under the bearer's project.
@@ -351,25 +596,43 @@ async def api_register_agent(
     signed WASM bundle (and a starter role-aware policy) — re-registers
     don't touch the agent's policy_yaml, so the operator's dashboard
     edits are preserved.
+
+    The one bearer route that writes, hence ``require_project_actor``: the new
+    rows are attributed to the key's owner, or to NULL if it has none.
+
+    409 when the manifest declares two skills of one name — the SDK collapses
+    those before sending, so it only reaches here from a hand-rolled client.
     """
     from hexgate_api.core.keystore import keystore
     from hexgate_api.core.locks import project_lock
     from hexgate_api.features.agents.service import get_agent
 
-    # Only a FIRST registration compiles + writes a bundle; re-registering an
-    # existing agent just snapshots the manifest (no compile). Take the project
-    # lock only in that case — otherwise a fleet redeploy's no-op re-registers
-    # (`hexgate serve` auto-registers on startup) would all queue behind the lock
-    # and any in-flight recompile for nothing.
-    if await get_agent(session, project_id, body.manifest.name) is None:
-        async with project_lock(project_id):
+    project_id = actor.project_id
+    try:
+        # Only a FIRST registration compiles + writes a bundle; re-registering
+        # an existing agent just snapshots the manifest (no compile). Take the
+        # project lock only in that case — otherwise a fleet redeploy's no-op
+        # re-registers (`hexgate serve` auto-registers on startup) would all
+        # queue behind the lock and any in-flight recompile for nothing.
+        if await get_agent(session, project_id, body.manifest.name) is None:
+            async with project_lock(project_id):
+                version, created = await register_manifest(
+                    session,
+                    project_id,
+                    body.manifest,
+                    sign=keystore.sign,
+                    actor_user_id=actor.user_id,
+                )
+        else:
             version, created = await register_manifest(
-                session, project_id, body.manifest, sign=keystore.sign
+                session,
+                project_id,
+                body.manifest,
+                sign=keystore.sign,
+                actor_user_id=actor.user_id,
             )
-    else:
-        version, created = await register_manifest(
-            session, project_id, body.manifest, sign=keystore.sign
-        )
+    except DuplicateSkillNameError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     response.status_code = 201 if created else 200
     return RegisterAgentResponse(
         agent_id=version.agent_id,
@@ -397,19 +660,15 @@ async def api_get_agent_by_token(
     bearer-only via :func:`require_project`.
 
     ETag semantics mirror the cookie route — the SDK's per-run
-    conditional GET (``If-None-Match: <wasm_hash>`` → ``304``) costs
-    one short round-trip when the bundle hasn't changed.
+    conditional GET (``If-None-Match: <signed-manifest-hash>`` → ``304``)
+    costs one short round-trip when the bundle hasn't changed.
     """
     await ensure_default_project(session)
     agent = await get_agent(session, project_id, name)
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
 
-    bundle_hash = (
-        hashlib.sha256(agent.compiled_wasm).hexdigest()
-        if agent.compiled_wasm is not None
-        else None
-    )
+    bundle_hash = _bundle_etag(agent)
     etag = f'"{bundle_hash}"' if bundle_hash else None
 
     if etag and if_none_match and if_none_match.strip() == etag:

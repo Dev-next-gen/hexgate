@@ -5,11 +5,90 @@ from __future__ import annotations
 from functools import cached_property
 from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationInfo,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
+from hexgate.runtime.agent_usage import OnUnavailable
 from hexgate.security.constraints import parse_constraint
+from hexgate.security.naming import canonical_name, canonical_skill_name
 
 PolicyMode = Literal["allow", "deny", "approval_required"]
+
+USAGE_FIELD = "usage"
+
+
+def _parse_all(constraints: list[str]) -> list[str]:
+    """Parse every constraint at load — a malformed expression is a config
+    error, surfaced at ``model_validate`` time rather than at the first
+    matching tool call."""
+    for constraint in constraints:
+        parse_constraint(constraint)
+    return constraints
+
+
+def _drop_empty_guards(data: Any) -> Any:
+    """Remove an empty ``guards`` map from a serialized policy dict (R-GUARD-006).
+
+    ``guards`` defaults to ``{}`` on every :class:`BaseToolPolicy` and on
+    :class:`AgentPolicy`, so without this a guards-free policy would newly emit
+    ``guards: {}`` everywhere it serializes. The resolved-policy YAML is hashed into
+    the bundle manifest's ``source_hash``, so that noise would shift the hash of every
+    already-stored modular bundle for a field the policy does not use, and the AI Act
+    report would read the shift as an operator edit (``MATRIX_SOURCE_DRIFTED``) that
+    never happened. Dropping the empty map keeps the dump byte-identical to before the
+    field existed. A non-empty ``guards`` is left untouched, so this never hides a
+    real rule.
+    """
+    if isinstance(data, dict) and not data.get("guards"):
+        data.pop("guards", None)
+    return data
+
+
+def _drop_absent_usage(data: Any) -> Any:
+    """Remove ``usage: None`` from a serialized policy dict, for the same
+    byte-stability reason as :func:`_drop_empty_guards`: a usage-free policy must
+    dump exactly as it did before the field existed."""
+    if isinstance(data, dict) and data.get(USAGE_FIELD) is None:
+        data.pop(USAGE_FIELD, None)
+    return data
+
+
+class GuardRule(BaseModel):
+    """Enable or disable one manifest-declared guard (R-GUARD-006).
+
+    Version 1 is enable/disable only: the guard's behaviour lives in its plugin
+    code, and the policy only toggles it on or off. It is a model, not a bare
+    bool, so a later version can add fields without a grammar break, and so
+    ``extra="forbid"`` catches a typo'd key rather than silently dropping it.
+    ``enabled`` is required: a rule states an intent, never an implied default.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
+class UsagePolicy(BaseModel):
+    """Agent-wide settings for ``agent_usage.*`` constraints.
+
+    ``on_unavailable`` says what a decision reads when the platform's usage snapshot
+    is missing: ``allow`` reads this process's counts alone, ``deny`` leaves the
+    value absent so its constraints fail closed. A model, not a bare value, so a
+    later version can add fields without a grammar break; ``on_unavailable`` is
+    required because a block states an intent, never an implied default.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    on_unavailable: OnUnavailable
 
 
 class BaseToolPolicy(BaseModel):
@@ -21,25 +100,50 @@ class BaseToolPolicy(BaseModel):
     by :mod:`hexgate.security.constraints` — see that module for the full
     operator set. When the policy engine swaps to OPA/Rego in a later
     milestone, these strings carry through verbatim.
+
+    A tool entry carries no ``guards`` block: v1 governs guards only at the
+    policy baseline (the top-level ``guards:``), applied agent-wide — per-tool
+    (and per-caller) guard governance is deferred to v2 (R-GUARD-006). A
+    ``guards:`` on any tool / ``default_policy`` / ``admission`` / reach entry is
+    rejected loud so the author moves it to the baseline.
     """
+
+    # extra="forbid" for the same reason AgentPolicy sets it: a mistyped field
+    # (``contraints:``) would otherwise be dropped in silence, leaving
+    # ``mode: allow`` with no fence at all. Inherited by FileToolPolicy and
+    # AgentTargetPolicy, so it covers every nested policy scope.
+    model_config = ConfigDict(extra="forbid")
 
     mode: PolicyMode = "deny"
     constraints: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_per_tool_guards(cls, data: Any) -> Any:
+        """Per-tool guard overrides are deferred to v2 — v1 governs guards only at the
+        policy baseline (R-GUARD-006). Reject a ``guards:`` on any tool /
+        ``default_policy`` / ``admission`` / reach entry loud (this class backs all of
+        them), so the author moves it to the top-level baseline rather than having it
+        silently ignored. ``extra="forbid"`` would already reject the now-absent field,
+        but this gives a message that names the fix."""
+        if isinstance(data, dict) and data.get("guards"):
+            raise ValueError(
+                "per-tool 'guards:' is not supported in v1 (guards govern the agent "
+                "at the policy baseline, not per tool or per caller); move the guard "
+                "to the top-level 'guards:' baseline"
+            )
+        return data
+
     @field_validator("constraints")
     @classmethod
     def _validate_constraint_grammar(cls, value: list[str]) -> list[str]:
-        """Parse every constraint at load — a malformed expression is a config
-        error, surfaced here at ``model_validate`` time rather than lazily at
-        the first matching tool call. Keeps ``models.py`` (document schema) and
-        ``constraints.py`` (expression grammar) jointly the enforced spec."""
-        for constraint in value:
-            parse_constraint(constraint)
-        return value
+        return _parse_all(value)
 
 
 class FileScope(BaseModel):
     """Restrict a file-oriented tool to explicit path patterns."""
+
+    model_config = ConfigDict(extra="forbid")
 
     allowed_paths: list[str] = Field(default_factory=list)
     denied_paths: list[str] = Field(default_factory=list)
@@ -74,6 +178,14 @@ def agent_target_key(via: AgentVia, target: str) -> str:
     return f"agent.{via}:{target}"
 
 
+def is_agent_via_key(name: str, via: AgentVia) -> bool:
+    """True for a reach key of a specific ``via`` mode (``agent.<via>:``).
+
+    Lets a caller tell agent-as-tool reach from handoff reach, e.g. to warn only
+    about the mode a given adapter cannot enforce."""
+    return name.startswith(f"agent.{via}:")
+
+
 def is_agent_reach_key(name: str) -> bool:
     """True for an ``agent.tool:`` / ``agent.handoff:`` reach key.
 
@@ -85,6 +197,12 @@ def is_agent_reach_key(name: str) -> bool:
     return name.startswith(AGENT_REACH_PREFIXES)
 
 
+def agent_reach_target(name: str) -> str | None:
+    """The target a reach key (``agent.<via>:<target>``) names, the inverse of
+    :func:`agent_target_key`; ``None`` for any other key."""
+    return name.partition(":")[2] if is_agent_reach_key(name) else None
+
+
 def is_agent_key(name: str) -> bool:
     """True for any synthetic agent-level key (``agent.run`` or a reach key).
 
@@ -93,6 +211,76 @@ def is_agent_key(name: str) -> bool:
     only separates the two for callers that need to tell a handoff/tool reach from
     admission (e.g. per-adapter warnings), not because they enforce differently."""
     return name == AGENT_RUN_TOOL or is_agent_reach_key(name)
+
+
+SkillVia = Literal["instructions", "resource", "script"]
+
+# Key prefix per disclosure level. ``skill:`` is the bare activation key (the
+# instructions a skill discloses when it engages); the two deeper levels take a
+# dotted qualifier, spelled like the agent reach keys. Keep ``skill:`` last: it is
+# not a prefix of the other two (``skill.`` != ``skill:``), so the tuple order is
+# irrelevant to ``str.startswith`` today, but a first-match loop would want the
+# qualified spellings tried first.
+_SKILL_PREFIX_BY_VIA: dict[SkillVia, str] = {
+    "resource": "skill.resource:",
+    "script": "skill.script:",
+    "instructions": "skill:",
+}
+SKILL_PREFIXES = tuple(_SKILL_PREFIX_BY_VIA.values())
+
+
+def skill_key(via: SkillVia, name: str) -> str:
+    """Synthetic tool key for reaching one skill at one disclosure level.
+
+    The skill name is trimmed (:func:`~hexgate.security.naming.canonical_skill_name`)
+    for the same reason :meth:`AgentPolicy.lowered_agent_tools` trims a reach target:
+    the adapter builds this same key from the runtime skill's name, so a padded
+    authored name must normalize to the key the seam looks up or the rule is inert.
+    It deliberately does *not* borrow the reach path's blank → ``default`` fallback,
+    which would let ``skills: {"": ...}`` govern a real skill named ``default``.
+    """
+    return f"{_SKILL_PREFIX_BY_VIA[via]}{canonical_skill_name(name)}"
+
+
+def is_skill_key(name: str) -> bool:
+    """True for a ``skill:`` / ``skill.resource:`` / ``skill.script:`` key.
+
+    Reserves the namespace from authored tools, and (from M4) tells the engines
+    which keys evaluate closed-world. A tool literally named ``skills`` is not one:
+    the prefixes carry their separator."""
+    return name.startswith(SKILL_PREFIXES)
+
+
+def is_reserved_key(name: str) -> bool:
+    """True for a lowered agent or skill key: evaluated closed-world, and never
+    an authored tool name."""
+    return is_agent_key(name) or is_skill_key(name)
+
+
+# The arguments each gate decides its reserved key with, as EGRESS_TOOL_ARGS
+# (hexgate.security.network) is for the egress tools: what AgentGate and
+# ReachGate (hexgate.security.agent_gate) and the adapters' agent-as-tool seams
+# build, and the skill seams (hexgate.adapters.langchain.skills,
+# hexgate.adapters.google.tools). The
+# analyzer checks ``args.*`` in an admission, reach or skill rule against these.
+ADMISSION_ARGS = frozenset({"agent"})
+REACH_ARGS = frozenset({"agent", "target", "via"})
+SKILL_ARGS = frozenset({"skill", "via", "file_path", "content_hash"})
+# A script call also carries the invocation it forwards to the code executor.
+SKILL_SCRIPT_ARGS = SKILL_ARGS | {"script_args", "short_options", "positional_args"}
+
+
+def gate_args(key: str) -> frozenset[str]:
+    """The arguments the gate deciding reserved ``key`` passes."""
+    if key == AGENT_RUN_TOOL:
+        return ADMISSION_ARGS
+    if is_agent_reach_key(key):
+        return REACH_ARGS
+    if key.startswith(_SKILL_PREFIX_BY_VIA["script"]):
+        return SKILL_SCRIPT_ARGS
+    if is_skill_key(key):
+        return SKILL_ARGS
+    raise ValueError(f"{key!r} is not a reserved key")
 
 
 class AgentTargetPolicy(BaseToolPolicy):
@@ -115,6 +303,30 @@ class AgentTargetPolicy(BaseToolPolicy):
         return list(dict.fromkeys(value))
 
 
+class SkillPolicy(BaseToolPolicy):
+    """Authorize one named skill, per disclosure level.
+
+    ``via`` names the disclosure levels this rule governs: ``instructions`` (the
+    skill's prose is put in front of the model), ``resource`` (its bundled files
+    are readable) and ``script`` (its executables may run). A skill allowed for
+    ``instructions`` only can be read but its scripts cannot be run.
+    """
+
+    via: list[SkillVia] = Field(
+        default_factory=lambda: ["instructions", "resource", "script"]
+    )
+
+    @field_validator("via")
+    @classmethod
+    def _validate_via(cls, value: list[SkillVia]) -> list[SkillVia]:
+        if not value:
+            raise ValueError(
+                "via must list at least one of 'instructions', 'resource', 'script'"
+            )
+        # De-dup, order-preserving.
+        return list(dict.fromkeys(value))
+
+
 class AgentPolicy(BaseModel):
     """Define an agent-wide tool authorization policy.
 
@@ -126,6 +338,11 @@ class AgentPolicy(BaseModel):
     won't pick it as the effective policy for any HexgateContext scope; it can only
     be referenced via ``inherits``.
 
+    ``constraints`` apply to every tool this role can reach, not just those
+    falling through to ``default_policy`` — the place for a run-wide circuit
+    breaker. Alone among these fields they **union** across ``inherits``:
+    a child dropping a parent's fence would be fail-open.
+
     ``consts`` names reusable values referenced from constraints as
     ``consts.<name>`` (e.g. ``args.amount <= consts.max_refund``). Merged
     through ``inherits`` like ``tools`` — put shared constants in a mixin.
@@ -136,7 +353,12 @@ class AgentPolicy(BaseModel):
     * ``agents`` — egress. Which *other* agents may this role reach, keyed by
       target name, each an :class:`AgentTargetPolicy`.
 
-    Both lower into synthetic tool keys via :attr:`effective_tools`, which both
+    ``skills`` is the third block that lowers this way: which named skills may this
+    role reach, keyed by skill name, each a :class:`SkillPolicy` naming the
+    disclosure levels it governs. Nothing decides on a ``skill:`` key yet — no
+    adapter produces one, and an unlisted skill still falls to ``default_policy``.
+
+    All three lower into synthetic tool keys via :attr:`effective_tools`, which both
     policy engines read, so agent-level rules evaluate through the identical
     decision path as tools with no engine change. Agent keys are closed-world
     (R-AGENT-002): an unlisted ``agent.run`` / ``agent.<via>:<target>`` denies at
@@ -149,42 +371,106 @@ class AgentPolicy(BaseModel):
     # instances, nothing reassigns a field), which is what makes memoizing
     # effective_tools safe. cached_property is a plain descriptor, not a field,
     # so pydantic must leave it alone.
-    model_config = ConfigDict(frozen=True, ignored_types=(cached_property,))
+    # extra="forbid": a mistyped field (``contraints:``) would otherwise be
+    # dropped in silence, and a dropped fence is fail-open.
+    model_config = ConfigDict(
+        frozen=True, ignored_types=(cached_property,), extra="forbid"
+    )
 
     version: int = 1
     inherits: list[str] = Field(default_factory=list)
     is_mixin: bool = False
     default_policy: BaseToolPolicy = Field(default_factory=BaseToolPolicy)
+    # Applied to *every* tool this role can reach, before the tool's own.
+    # Unlike ``default_policy.constraints``, which only reaches tools that fall
+    # through to the default. Can only narrow: ``mode: deny`` short-circuits
+    # before constraints on both engines.
+    constraints: list[str] = Field(default_factory=list)
     tools: dict[str, ToolPolicy] = Field(default_factory=dict)
     consts: dict[str, Any] = Field(default_factory=dict)
     admission: BaseToolPolicy | None = None
     agents: dict[str, AgentTargetPolicy] = Field(default_factory=dict)
+    skills: dict[str, SkillPolicy] = Field(default_factory=dict)
+    # Baseline guard stance (R-GUARD-006): a manifest guard name -> GuardRule,
+    # enabling/disabling it agent-wide. v1 is baseline-only — there is no per-tool
+    # override (a `guards:` on a tool entry is rejected, see BaseToolPolicy). Not
+    # lowered into effective_tools: guards are a build-time toggle, not an allow/deny
+    # decision, so they are read via `effective_guards`.
+    guards: dict[str, GuardRule] = Field(default_factory=dict)
+    # Agent-wide, resolved to one value across roles by PolicySet. None means the
+    # author said nothing, which reads as OnUnavailable.ALLOW (G3).
+    usage: UsagePolicy | None = None
+
+    @field_validator("constraints")
+    @classmethod
+    def _validate_constraint_grammar(cls, value: list[str]) -> list[str]:
+        return _parse_all(value)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> Any:
+        # Drop an empty top-level `guards` baseline (R-GUARD-006): keep a guards-free
+        # policy's dump byte-identical so no stored bundle's source_hash shifts. A
+        # rejection of `guards:` on a tool / default_policy / admission / reach entry
+        # is enforced at load by BaseToolPolicy._reject_per_tool_guards (v1 is
+        # baseline-only), so nothing nested carries a guards block to drop.
+        # An unset `usage` block is dropped for the same byte-stability reason.
+        return _drop_absent_usage(_drop_empty_guards(handler(self)))
 
     @field_validator("tools")
     @classmethod
     def _reject_reserved_tool_names(
         cls, value: dict[str, ToolPolicy], info: ValidationInfo
     ) -> dict[str, ToolPolicy]:
-        """Keep the ``agent.*`` key namespace for agent-level gating.
+        """Keep the ``agent.*`` and ``skill*:`` key namespaces for agent-level gating.
 
-        An authored tool named ``agent.run`` / ``agent.tool:x`` / ``agent.handoff:x``
-        would collide with a lowered agent rule in :attr:`effective_tools` and
+        An authored tool named ``agent.run`` / ``agent.tool:x`` / ``skill:x`` would
+        collide with a lowered agent or skill rule in :attr:`effective_tools` and
         silently shadow (or be shadowed by) it. Reject it at load.
 
         Skipped when validated under a ``{"resolved": True}`` context: a *resolved*
-        policy legitimately carries the lowered ``agent.*`` keys in ``tools`` (the
-        linker's :meth:`resolved` builder puts them there), and it must round-trip
-        back through this loader when a modular agent's bundle is compiled from its
+        policy legitimately carries the lowered keys in ``tools`` (the linker's
+        :meth:`resolved` builder puts them there), and it must round-trip back
+        through this loader when a modular agent's bundle is compiled from its
         resolved YAML (R-POL-002). The guard is an authoring ergonomic — it only
         needs to fire on hand-written source, not on a machine-resolved artifact."""
         if info.context and info.context.get("resolved"):
             return value
         for name in value:
-            if is_agent_key(name):
+            if is_reserved_key(name):
                 raise ValueError(
                     f"tool name {name!r} is reserved for agent-level gating; "
-                    "use the 'admission'/'agents' blocks instead"
+                    "use the 'admission'/'agents'/'skills' blocks instead"
                 )
+        return value
+
+    @field_validator("skills")
+    @classmethod
+    def _reject_blank_or_colliding_skill_names(
+        cls, value: dict[str, SkillPolicy]
+    ) -> dict[str, SkillPolicy]:
+        """One authored skill name per lowered key, and never a blank one.
+
+        :func:`skill_key` trims, so two keys that differ only in padding lower onto
+        one entry and the later one silently wins — erasing a deny or a grant
+        depending on authoring order. A blank name lowers to a key nothing can
+        match, which is an inert rule rather than the deny its author wrote.
+
+        Only reachable through an explicitly quoted key (YAML strips a plain
+        scalar's padding itself, and a bare ``:`` will not parse), so this guards
+        the programmatic route: names arriving from a manifest or the dashboard.
+        The resolved path never sees this — a resolved policy carries its lowered
+        keys in ``tools`` and is built by :meth:`resolved`, which skips validation."""
+        by_key: dict[str, str] = {}
+        for name in value:
+            key = canonical_skill_name(name)
+            if not key:
+                raise ValueError("skill name must not be blank")
+            if key in by_key:
+                raise ValueError(
+                    f"skill names {by_key[key]!r} and {name!r} both normalize to "
+                    f"{key!r}; one rule would silently overwrite the other"
+                )
+            by_key[key] = name
         return value
 
     @classmethod
@@ -217,6 +503,11 @@ class AgentPolicy(BaseModel):
         ``via`` mode (``agent.tool:<name>`` / ``agent.handoff:<name>``). Only the
         *listed* rules are lowered; the fallback for an unlisted target is the
         agent gate's concern, not this map's.
+
+        The target name is canonicalized (:func:`~hexgate.security.naming.canonical_name`)
+        so the lowered key matches the one the reach gate derives from the runtime
+        target's name — both sides normalize identically, or a padded authored name
+        would never match and a policy-allowed handoff would fall to closed-world deny.
         """
         lowered: dict[str, BaseToolPolicy] = {}
         if self.admission is not None:
@@ -226,12 +517,30 @@ class AgentPolicy(BaseModel):
             # rebuild would silently drop any field later added to BaseToolPolicy.
             # via is an extra field the engines ignore.
             for via in target_policy.via:
-                lowered[agent_target_key(via, target)] = target_policy
+                lowered[agent_target_key(via, canonical_name(target))] = target_policy
         return lowered
+
+    def lowered_skill_tools(self) -> dict[str, BaseToolPolicy]:
+        """Expand ``skills`` into synthetic tool entries, one per ``via`` level.
+
+        Each listed skill yields ``skill:<name>`` / ``skill.resource:<name>`` /
+        ``skill.script:<name>`` for the levels its rule governs. Only listed skills
+        are lowered; the fallback for an unlisted one is the engine's concern.
+
+        The :class:`SkillPolicy` is reused as the lowered value (it *is* a
+        :class:`BaseToolPolicy`) rather than rebuilt: a rebuild would silently drop
+        any field later added to the base. ``via`` rides along as an extra the
+        engines ignore, exactly as on a lowered agent rule.
+        """
+        return {
+            skill_key(via, name): policy
+            for name, policy in self.skills.items()
+            for via in policy.via
+        }
 
     @cached_property
     def effective_tools(self) -> dict[str, ToolPolicy]:
-        """Authored ``tools`` plus the lowered agent-level entries.
+        """Authored ``tools`` plus the lowered agent-level and skill entries.
 
         The single view both engines read (:func:`~hexgate.security.policy.get_tool_policy`
         and the Rego compiler), so a lowered ``agent.*`` key evaluates byte-for-byte
@@ -239,7 +548,31 @@ class AgentPolicy(BaseModel):
         this on every decision, and policies are immutable after load (inheritance
         builds fresh instances), so the merge runs once per policy, not per call.
         """
-        lowered = self.lowered_agent_tools()
+        lowered = {**self.lowered_agent_tools(), **self.lowered_skill_tools()}
         if not lowered:
             return self.tools
         return {**self.tools, **lowered}
+
+    def declares_guards(self) -> bool:
+        """True when the policy configures a baseline guard stance.
+
+        The opt-in signal for guard governance, mirroring ``declares_admission`` /
+        ``declares_reach``: a policy that configures nothing leaves every declared
+        guard running as coded, so the pipeline builder can skip guard filtering
+        entirely (R-GUARD-006, applied in R-GUARD-007)."""
+        return bool(self.guards)
+
+    def effective_guards(self, tool_name: str) -> dict[str, bool]:
+        """The enable/disable stance for each governed guard, as ``{name: enabled}``.
+
+        v1 governs guards only at the policy baseline (:attr:`guards`), applied
+        agent-wide, so the stance is the same for every tool — ``tool_name`` is
+        accepted for a uniform signature with the bundle mirror but does not change
+        the result. A guard the policy never mentions is absent here, meaning "run as
+        the manifest declares it" (the default is enabled). Consumed at pipeline-build
+        time (R-GUARD-007), never per call, so it is not on the hot path."""
+        return {name: rule.enabled for name, rule in self.guards.items()}
+
+    def usage_on_unavailable(self) -> OnUnavailable:
+        """This role's fail mode for ``agent_usage.*``; ``allow`` when unset (G3)."""
+        return self.usage.on_unavailable if self.usage else OnUnavailable.ALLOW

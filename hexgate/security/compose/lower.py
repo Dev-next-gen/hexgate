@@ -15,20 +15,55 @@ resolves a single ``default`` role from the top-level blocks alone.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from hexgate.security.compose.grammar import (
     AgentBlock,
     BoundaryBlock,
     Entry,
+    SkillCeilingSpec,
+    SkillGrantSpec,
     _GrantScope,
 )
+from hexgate.security.models import (
+    AgentPolicy,
+    AgentTargetPolicy,
+    BaseToolPolicy,
+    GuardRule,
+    SkillPolicy,
+    UsagePolicy,
+)
 from hexgate.security.module_loader import _canonical_hash
-from hexgate.security.models import AgentPolicy, AgentTargetPolicy, BaseToolPolicy
 from hexgate.security.modules import DEFAULT_AGENT, ModuleContent
 from hexgate.security.policy_set import DEFAULT_ROLE_NAME
 
 # The single role every project has: the generic agent, and any named agent with
 # no `roles:` map, resolve to it. Reuse the SDK's constant so the two can't drift.
 DEFAULT_ROLE = DEFAULT_ROLE_NAME
+
+
+def agent_guards(entry: Entry, agent: str) -> dict[str, GuardRule]:
+    """The agent-level guard stance for ``agent`` (R-GUARD-006).
+
+    The entry's top-level ``guards`` (every agent) overlaid by that agent's own
+    ``guards`` block, last-wins per name. Guards are **not** composed from imported
+    fragments or role bodies — they are agent-level, so this stance is the same for
+    every role of the agent and can never diverge. Empty when neither sets any.
+    """
+    merged: dict[str, GuardRule] = dict(entry.guards)
+    block = entry.agents.get(agent)
+    if block is not None:
+        merged.update(block.guards)
+    return merged
+
+
+def agent_usage_policy(entry: Entry, agent: str) -> UsagePolicy | None:
+    """The agent's ``usage`` block: its own body's, else the entry's top-level one.
+    Not composed from imports or role bodies, so every role reads the same value."""
+    block = entry.agents.get(agent)
+    if block is not None and block.usage is not None:
+        return block.usage
+    return entry.usage
 
 
 def _content_hash(name: str, policy: AgentPolicy) -> str:
@@ -38,9 +73,19 @@ def _content_hash(name: str, policy: AgentPolicy) -> str:
     return _canonical_hash({"name": name, "policy": policy.model_dump(mode="json")})
 
 
+def _skill_policies(
+    specs: Mapping[str, SkillGrantSpec | SkillCeilingSpec],
+) -> dict[str, SkillPolicy]:
+    return {
+        name: SkillPolicy(via=spec.via, mode=spec.mode, constraints=spec.constraints)
+        for name, spec in specs.items()
+    }
+
+
 def _grants_policy(scope: _GrantScope) -> AgentPolicy | None:
-    """An :class:`AgentPolicy` carrying a scope's ``tools``/``mcp``/``reach`` grants
-    (never a boundary). ``None`` when the scope grants nothing."""
+    """An :class:`AgentPolicy` carrying a scope's ``tools``/``mcp``/``reach``/
+    ``admission``/``skills`` grants (never a boundary). ``None`` when the scope
+    grants nothing."""
     # mcp is readability sugar — an MCP tool is a tool; it composes identically
     # (same key namespace). A name in both blocks is rejected at parse (the
     # grammar's _no_tools_mcp_collision), so here they simply merge.
@@ -54,9 +99,19 @@ def _grants_policy(scope: _GrantScope) -> AgentPolicy | None:
         agents[target] = AgentTargetPolicy(
             via=spec.via, mode=spec.mode, constraints=spec.constraints
         )
-    if not tools and not agents:
+    # admission is the ingress grant (may this role start this agent?); the model
+    # lowers it to the ``agent.run`` key. It's about *this* agent, so a single grant.
+    admission = (
+        BaseToolPolicy(
+            mode=scope.admission.mode, constraints=scope.admission.constraints
+        )
+        if scope.admission is not None
+        else None
+    )
+    skills = _skill_policies(scope.skills)
+    if not tools and not agents and admission is None and not skills:
         return None
-    return AgentPolicy(tools=tools, agents=agents)
+    return AgentPolicy(tools=tools, agents=agents, admission=admission, skills=skills)
 
 
 def _boundary_policy(block: BoundaryBlock | None) -> AgentPolicy | None:
@@ -74,48 +129,66 @@ def _boundary_policy(block: BoundaryBlock | None) -> AgentPolicy | None:
         )
         for target, spec in block.reach.items()
     }
+    admission = (
+        BaseToolPolicy(
+            mode=block.admission.mode, constraints=block.admission.constraints
+        )
+        if block.admission is not None
+        else None
+    )
     return AgentPolicy(
-        default_policy=BaseToolPolicy(mode="deny"), tools=tools, agents=agents
+        default_policy=BaseToolPolicy(mode="deny"),
+        tools=tools,
+        agents=agents,
+        admission=admission,
+        skills=_skill_policies(block.skills),
     )
 
 
-def _cap(name: str, policy: AgentPolicy) -> ModuleContent:
+def _cap(name: str, policy: AgentPolicy, source: str) -> ModuleContent:
     return ModuleContent(
         name=name,
         kind="capability",
         policy=policy,
-        source=f"policy.yaml#{name}",
+        source=f"{source}#{name}",
         content_hash=_content_hash(name, policy),
     )
 
 
-def _boundary(name: str, policy: AgentPolicy) -> ModuleContent:
+def _boundary(name: str, policy: AgentPolicy, source: str) -> ModuleContent:
     return ModuleContent(
         name=name,
         kind="boundary",
         policy=policy,
-        source=f"policy.yaml#{name}",
+        source=f"{source}#{name}",
         content_hash=_content_hash(name, policy),
     )
 
 
 def _cell(
-    scopes: list[tuple[str, _GrantScope]],
-    boundaries_src: list[tuple[str, BoundaryBlock | None]],
-    agent: str,
-    role: str,
+    scopes: list[tuple[str, _GrantScope]], agent: str, role: str
 ) -> tuple[list[ModuleContent], list[ModuleContent]]:
-    """Build the ``(boundaries, capabilities)`` ModuleContent lists for one cell."""
+    """Build the ``(boundaries, capabilities)`` ModuleContent lists for one cell.
+
+    Each scope contributes its own blocks *and* its imported leaf fragments
+    (``scope._imported``); grants union and boundaries intersect in the fold, so
+    an imported fragment is just an extra contribution — never a merge/overwrite.
+    """
     caps: list[ModuleContent] = []
-    for label, scope in scopes:
-        policy = _grants_policy(scope)
-        if policy is not None:
-            caps.append(_cap(f"{label}@{agent}/{role}", policy))
     boundaries: list[ModuleContent] = []
-    for label, block in boundaries_src:
-        policy = _boundary_policy(block)
-        if policy is not None:
-            boundaries.append(_boundary(f"boundary:{label}@{agent}/{role}", policy))
+    for label, scope in scopes:
+        for idx, frag in enumerate((scope, *scope._imported)):
+            tag = (
+                f"{label}@{agent}/{role}"
+                if idx == 0
+                else f"{label}#imp{idx}@{agent}/{role}"
+            )
+            grants = _grants_policy(frag)
+            if grants is not None:
+                caps.append(_cap(tag, grants, frag._source))
+            ceiling = _boundary_policy(frag.boundary)
+            if ceiling is not None:
+                boundaries.append(_boundary(f"boundary:{tag}", ceiling, frag._source))
     return boundaries, caps
 
 
@@ -127,6 +200,9 @@ def lower(entry: Entry, agent: str = DEFAULT_AGENT) -> dict[str, tuple[list, lis
     role declared under it, folding the top-level, agent-level, and role-level
     scopes together. The generic/unnamed agent (``"*"``) has only the ``default``
     role from the top-level blocks (roles live under a named agent).
+
+    Imports must already be resolved onto each scope's ``_imported`` (see
+    :func:`hexgate.security.compose.imports.resolve_imports`).
     """
     agent_block: AgentBlock | None = (
         entry.agents.get(agent) if agent != DEFAULT_AGENT else None
@@ -135,18 +211,14 @@ def lower(entry: Entry, agent: str = DEFAULT_AGENT) -> dict[str, tuple[list, lis
     # Scopes that apply regardless of role: top-level always; the agent body when
     # a named agent is being resolved.
     base_scopes: list[tuple[str, _GrantScope]] = [("top", entry)]
-    base_boundaries: list[tuple[str, BoundaryBlock | None]] = [("top", entry.boundary)]
     if agent_block is not None:
         base_scopes.append((f"agent:{agent}", agent_block))
-        base_boundaries.append((f"agent:{agent}", agent_block.boundary))
 
     # The default role: base scopes only (no role-specific block).
     out: dict[str, tuple[list, list]] = {
-        DEFAULT_ROLE: _cell(base_scopes, base_boundaries, agent, DEFAULT_ROLE)
+        DEFAULT_ROLE: _cell(base_scopes, agent, DEFAULT_ROLE)
     }
     # Each named role: base scopes + that role's block.
     for role, role_block in (agent_block.roles if agent_block else {}).items():
-        scopes = [*base_scopes, (f"role:{role}", role_block)]
-        boundaries_src = [*base_boundaries, (f"role:{role}", role_block.boundary)]
-        out[role] = _cell(scopes, boundaries_src, agent, role)
+        out[role] = _cell([*base_scopes, (f"role:{role}", role_block)], agent, role)
     return out

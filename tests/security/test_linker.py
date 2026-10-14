@@ -22,6 +22,7 @@ from hexgate.security import (
     DecisionOutcome,
     LinkError,
     ModuleContent,
+    effective_policy_by_role,
     evaluate_tool_call,
     link,
     link_policy_set,
@@ -32,7 +33,7 @@ _OPA_AVAILABLE = shutil.which("opa") is not None
 needs_opa = pytest.mark.skipif(not _OPA_AVAILABLE, reason="opa not on PATH")
 
 
-def _mod(name, kind, tools, *, default_mode="allow", consts=None):
+def _mod(name, kind, tools, *, default_mode="allow", consts=None, skills=None):
     return ModuleContent(
         name=name,
         kind=kind,
@@ -40,6 +41,7 @@ def _mod(name, kind, tools, *, default_mode="allow", consts=None):
             default_policy=BaseToolPolicy(mode=default_mode),
             tools=tools,
             consts=consts or {},
+            skills=skills or {},
         ),
         source=f"{name}.yaml",
         content_hash=f"hash-{name}",
@@ -395,6 +397,38 @@ def test_capability_agents_deny_is_a_link_error() -> None:
         link([], [cap])
 
 
+def test_link_rejects_policy_level_constraints_in_module() -> None:
+    """The fold composes ``.tools`` only, so a role-wide fence in a module would
+    be silently dropped. ``_MODULE_COMPOSABLE_FIELDS`` rejects it for free;
+    pinned so nobody adds it to that set without teaching ``link()`` to fold
+    it."""
+    mod = ModuleContent(
+        name="d",
+        kind="boundary",
+        policy=AgentPolicy(constraints=["run.tool_calls < 5"]),
+        source="d.yaml",
+        content_hash="hash-d",
+    )
+    with pytest.raises(LinkError, match=r"\['constraints'\]"):
+        link([mod], [])
+
+
+@pytest.mark.parametrize("kind", ["capability", "boundary"])
+def test_link_rejects_usage_block_in_module(kind: str) -> None:
+    """The fail mode is agent-level, not composable, so a tier-folder module that
+    sets ``usage:`` is rejected loud rather than silently dropped by the fold."""
+    mod = ModuleContent(
+        name="d",
+        kind=kind,
+        policy=AgentPolicy(usage={"on_unavailable": "deny"}),
+        source="d.yaml",
+        content_hash="hash-d",
+    )
+    boundaries, capabilities = ([mod], []) if kind == "boundary" else ([], [mod])
+    with pytest.raises(LinkError, match=r"\['usage'\]"):
+        link(boundaries, capabilities)
+
+
 # --- provenance + policy-set wiring ---
 
 
@@ -598,3 +632,78 @@ def test_flat_roles_still_resolve_agent_independently():
     for agent in ("main", "anything"):
         res = resolve_for_project([], [read_only], roles, agent=agent)
         assert "view" in res.by_role["member"].effective["default"].tools
+
+
+def test_module_skills_fold_and_shadowed_key_stays_deny():
+    """``skills`` is composable, and a skill key the fold would drop (shadowed by a
+    ceiling, or listed by a boundary but granted by no capability) stays an explicit
+    deny. Dropped instead, it would take ``declares_skills()`` to False — the bundle
+    would not engage the skill gate and the skill would run ungated (fail-open).
+    ``_MODULE_COMPOSABLE_FIELDS`` admitting ``skills`` and ``_fold_tool`` keeping
+    skill keys must stay paired."""
+    ceiling = _mod(
+        "ceiling",
+        "boundary",
+        {},
+        default_mode="deny",
+        skills={"listed": {"mode": "allow"}},
+    )
+    grant = _mod("grant", "capability", {}, skills={"shadowed": {"mode": "allow"}})
+
+    result = link_policy_set([ceiling], [grant])
+    tools = result.effective["default"].tools
+
+    assert tools["skill:shadowed"].mode == "deny"  # ceiling did not list it
+    assert tools["skill:listed"].mode == "deny"  # listed, but nothing granted it
+    assert result.policy_set.declares_skills()
+
+
+def test_module_skills_grant_folds_through_a_ceiling():
+    ceiling = _mod(
+        "ceiling",
+        "boundary",
+        {},
+        default_mode="deny",
+        skills={"runbook": {"mode": "allow", "via": ["instructions"]}},
+    )
+    grant = _mod("grant", "capability", {}, skills={"runbook": {"mode": "allow"}})
+
+    tools = link_policy_set([ceiling], [grant]).effective["default"].tools
+
+    assert tools["skill:runbook"].mode == "allow"
+    assert tools["skill.script:runbook"].mode == "deny"
+
+
+def test_resolved_policy_dump_shape_is_pinned():
+    """The bundle-hash guard for the resolved path.
+
+    ``effective_policy_by_role`` is what the platform serializes into a modular
+    agent's resolved YAML, and the sha256 of that text is the bundle manifest's
+    ``source_hash``. A key appearing or disappearing here moves every stored
+    project's hash, and the AI Act report then reads the mismatch as "the operator
+    edited the policy" (``MATRIX_SOURCE_DRIFTED``), dropping the authorisation
+    matrix from a compliance document for an edit nobody made.
+
+    ``test_an_empty_policy_level_list_renders_byte_identically`` in
+    ``test_rego_compile.py`` is the analogue on the rego renderer; this is the
+    serializer's. Updating the literal below is allowed — it is a decision, not an
+    accident — but it obliges a forced recompile of modular bundles with the
+    release that carries it."""
+    cap = _mod("c", "capability", {"x": _allow()})
+
+    result = resolve_for_project([], [cap], {"default": ["c"]})
+
+    assert effective_policy_by_role(result) == {
+        "default": {
+            "version": 1,
+            "is_mixin": False,
+            "inherits": [],
+            "default_policy": {"mode": "deny", "constraints": []},
+            "tools": {"x": {"mode": "allow", "constraints": []}},
+            "constraints": [],
+            "consts": {},
+            "admission": None,
+            "agents": {},
+            "skills": {},
+        }
+    }

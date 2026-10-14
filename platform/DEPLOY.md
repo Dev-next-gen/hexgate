@@ -103,6 +103,40 @@ with a JSON 404 and every SDK on that stage silently loses its audit trail —
 stack (Postgres, ClickHouse, Redpanda) binds no host ports; Redpanda in
 particular is PLAINTEXT with no auth — never publish it.
 
+**The `/v1/traces` route carries its own request-body limit.** The collector's
+OTLP receiver accepts 32 MiB (`max_request_body_size`) and an SDK export of LLM
+message spans can reach ~17 MiB, but the proxy enforces its own cap *first* and
+answers `413` before the collector ever sees the POST — so the proxy, not the
+collector, is what decides whether a large export gets through. This is the one
+hop in the record-size budget (`docs/internals/audit-pipeline.md` §4.1) that
+lives outside this repo, so nothing in `make check-all` can catch it.
+
+In nginx the setting is `client_max_body_size`, and it belongs **inside the
+`location = /v1/traces` block** rather than at `http` or `server` level:
+
+```nginx
+location = /v1/traces {
+    proxy_pass http://127.0.0.1:7001;   # 7201 on staging
+    client_max_body_size 32m;
+}
+```
+
+Note the value here is deliberately *tighter* than the surrounding default —
+on the prod box the `http` block allows `100M`, and this route is held to a
+much smaller number on purpose. `/v1/traces` is the only endpoint taking bulk
+binary uploads, and nginx enforces the limit **before** the collector verifies
+the Biscuit token, so whatever it allows is what an unauthenticated caller can
+make the proxy buffer. Keep it as small as the largest legitimate export: 32
+MiB covers a 64-span batch of maximally-sized message spans, and nothing more.
+The value was 8 MiB before message logging, which is why it had to be raised.
+
+Both stages need it — they are separate files
+(`sites-available/app.hexgate.ai` and `…/app.staging.hexgate.ai`), each with
+its own `/v1/traces` block pointing at that stage's collector port. Apply with
+`nginx -t && systemctl reload nginx`; a graceful reload keeps existing
+connections and a failed test changes nothing. Caddy imposes no default body
+limit and needs nothing.
+
 (In Caddy this is two `reverse_proxy` site blocks; in nginx, two `server`
 blocks with `proxy_pass`. Forward `X-Forwarded-Proto: https` — the API trusts
 it, via uvicorn `--proxy-headers`, for correct https OAuth callbacks. `/v1`
@@ -151,11 +185,31 @@ export HEXGATE_SMOKE_PASSWORD=...
 make platform-smoke STAGE=prod               # or STAGE=staging
 ```
 
-It sends five events (allow / deny / needs_approval decisions, one LLM usage,
-one ban enforcement) through the SDK's OTLP sender and polls the dashboard
-API until each shows up, then prints `PASS` or a per-event `MISSING` list.
-Rows are tagged `agent_name = otlp_smoke` and a per-run `session_id`, so they
-are easy to spot and harmless to leave. Run it after every `platform-up`.
+It sends eleven events (allow / deny / needs_approval decisions, one LLM
+usage, one ban enforcement, and six LLM message events) through the SDK's OTLP
+sender and polls the dashboard API until each shows up, then prints `PASS` or a
+per-event `MISSING` list. Rows are tagged `agent_name = otlp_smoke` and a
+per-run `session_id`, so they are easy to spot and harmless to leave. Run it
+after every `platform-up`.
+
+Five of the message events carry an input message past the SDK's 256 KiB cap,
+and the check asserts each came back marked `truncated`, at full size, rather
+than missing. Together they are ~1.25 MiB, which is deliberate: that is over
+both the 1,000,000-byte record the collector's exporter defaults to and the
+1 MiB the broker defaults to, so this run only passes on a stage that actually
+got the record-size limits of `docs/internals/audit-pipeline.md` §4.1 —
+altered topics, restarted collector and enricher — rather than merely a deploy
+of the code. A stage that did not fails with **everything** `MISSING`, because
+an oversized record is rejected whole and takes the decision spans with it.
+
+**Read the traceback before blaming the stage.** All-`MISSING` has a second,
+more common cause: the ~1.3 MB export goes out as one uncompressed POST inside
+the exporter's 5 s deadline, so an uplink much below ~2 Mbit/s — a tether, hotel
+wifi — never finishes the body and the whole batch is dropped locally. The two
+are easy to tell apart in the ERROR lines above `flush complete`:
+`Exception while exporting Span … TimeoutError` is this machine, `Failed to
+export` is the collector refusing the batch. Re-run from a better connection
+before altering any topics.
 
 Exit 0 is the only green: 1 means an event did not land, and 2 means the
 credentials above were missing so nothing was read back at all — the send step
@@ -184,21 +238,53 @@ curl -X POST https://app.hexgate.ai/v1/auth/register \
 
 ```bash
 cd /srv/hexgate-<stage> && git pull   # or checkout a new tag for prod
+
+# Postgres DDL needs locks the running API holds. Stops api + enricher and
+# leaves collector + redpanda up, so OTLP keeps buffering through the window.
+make platform-stop-writers STAGE=<stage>
+
+make platform-migrate STAGE=<stage>   # schema BEFORE images — see below; no-op when nothing is new
 make platform-up STAGE=<stage>        # rebuilds changed images, recreates containers
 ```
 
-Promote a release: tag it, `git checkout` it in the prod checkout, re-run
-`make platform-up STAGE=prod`.
+`platform-migrate` runs first on purpose and is safe to run on every upgrade:
+the files are idempotent, so a release that adds no column replays them to no
+effect. Reversing the two is an outage, not a slower path (see below). Run it
+unconditionally — including a first-ever deploy, where every Postgres file
+guards each table it touches and skips with a `NOTICE` rather than failing on
+one `create_all` has not built yet.
 
-Upgrades reuse the env already on the box: `platform-up` only pulls a
-MISSING `.env.<stage>`, never refreshes an existing one. If the secret changed,
+**Read the last line of the run, not the last file it named.** The two stores
+are applied independently — a Postgres failure no longer skips ClickHouse — and
+the run ends with `migrate(<stage>): postgres=… clickhouse=…` plus a nonzero
+exit if either did not complete. A run that ends without that summary was
+interrupted, and you cannot assume either store finished.
+
+Postgres statements run under `lock_timeout=10s`. If you skip the `stop` above,
+expect `canceling statement due to lock timeout` rather than a hang: an
+`ADD COLUMN` waits behind any session idle in a transaction, and then blocks
+every query queued behind it. Stop the writers and re-run — the files are
+idempotent, so a partial run costs nothing.
+`HEXGATE_MIGRATE_LOCK_TIMEOUT_MS=0` waits forever, for a quiesced stack running
+a long index build.
+
+Promote a release: tag it, `git checkout` it in the prod checkout, then the
+same `platform-stop-writers` → `platform-migrate` → `platform-up` sequence,
+plus any per-release step the migration table below names (e.g.
+`platform-backfill` for `clickhouse/0005`). Rolling *back* past a release
+that added columns has its own step — see below.
+
+Upgrades reuse the env already on the box: the deploy targets only pull a
+MISSING `.env.<stage>`, never refresh an existing one. If the secret changed,
 refresh it first: `make platform-env-pull STAGE=<stage>`.
 
 **When a release adds a required key** (the compose aborts with `required
-variable X is missing a value` — on `platform-up`, and on `platform-logs` /
-`platform-down` too, since compose interpolates the whole file for every
-subcommand; the running stack is unaffected), the order is: an admin adds the
-key to the `/hexgate/<stage>` secret (new version), then on the box
+variable X is missing a value` — on every target that shells out to compose,
+since it interpolates the whole file for every subcommand, `platform-up`,
+`platform-logs`, `platform-down` and `platform-stop-writers` alike; the running
+stack is unaffected). That makes it the very FIRST step of the recipe above,
+so do the refresh before starting the upgrade. The order is: an admin adds
+the key to the `/hexgate/<stage>` secret (new version), then on the box
 `make platform-env-pull STAGE=<stage>`, then `make platform-up`. Never
 hand-edit `.env.<stage>` — the next pull would drop the change. Releases so
 far that did this:
@@ -206,6 +292,172 @@ far that did this:
 | Release | Key | Value |
 |---|---|---|
 | OTLP pipeline (collector/redpanda/enricher) | `HEXGATE_OTLP_PORT` | `7001` prod, `7201` staging |
+
+**When a release adds a Postgres column** — `init_db()` is `create_all`, which
+creates missing tables but never adds columns to an existing one, so the schema
+change has to be applied *before* the new images go up. Files live in
+`platform/postgres/migrations/`, are idempotent, and are applied by
+`make platform-migrate STAGE=<stage>` (the step in the recipe above; it replays
+the whole directory against the stack's Postgres).
+
+**When a release adds a ClickHouse table or column** — `init/schema.sql` runs
+only on an empty volume, so an existing stage gets the change from
+`platform/clickhouse/migrations/`, replayed by the same `platform-migrate`
+step (every file is `IF NOT EXISTS`, so replay is a no-op once applied). The
+ordering matters more here than for Postgres: the api and enricher check the
+tables they write and read at boot (`verify_all`) and refuse to start on a
+missing one, and `platform-up` has already recreated their containers by then
+— the old ones are gone, so a skipped migration is a crash loop of the whole
+API, not a degraded message path.
+
+Applying any of them *after* the deploy is not a slower path, it is an outage —
+and the signature differs per migration, so don't debug one expecting the other.
+Both directories number from `0001`, so the prefixes below are load-bearing.
+
+`postgres/0001` takes OTLP ingest down: the collector's snapshot query selects
+`revoked_at`, so it refuses to boot, and every bearer-authenticated API route
+500s alongside it.
+
+`postgres/0002` leaves the collector running — its query names its columns and
+none of them are new — but it is otherwise *wider* than `postgres/0001`, not
+narrower. `devtoken` is one of its nine tables, so `find_token_by_secret` 500s
+and every bearer-authenticated route goes down exactly as under `postgres/0001`;
+SDK traffic through the API stops, and only OTLP ingest is spared. The other
+eight tables take the cookie-authenticated routes with them, reads included, so
+the dashboard goes blank rather than degrading.
+
+`postgres/0003` is the same failure, scoped to one table: routes touching
+`policy_file` (the compose entry-file store) 500 while the rest of the control
+plane is fine.
+
+The ClickHouse migrations fail differently again — not a 500 on the routes that
+touch the table, but the boot-time `verify_all` crash loop described above.
+
+Every migration here is safe to run early — the *old* code never selects the new
+columns — which is why the step is unconditional in the recipe. The one
+exception is `clickhouse/0005`: it must not run while an older enricher is still
+writing — see *Materialized views and the writers* below.
+
+| Release | Migration |
+|---|---|
+| devtoken soft delete | `postgres/0001_devtoken_soft_delete.sql` |
+| control-plane actor columns | `postgres/0002_actor_columns.sql` |
+| actor trail on the compose file store | `postgres/0003_policy_file_actor_columns.sql` |
+| policy_decision `attributes` | `clickhouse/0001_add_policy_decision_attributes.sql` |
+| run attribution on decisions/usage | `clickhouse/0002_add_run_columns.sql` |
+| LLM message logging (`llm_message` table) | `clickhouse/0003_add_llm_message.sql` — required before the build that stores `hexgate.messages` |
+| run counting (`agent_run` table) | `clickhouse/0004_add_agent_run.sql` — required before the enricher build that stores `hexgate.runs` |
+| agent usage rollup (`usage_minute` + 3 views) | `clickhouse/0005_add_usage_minute.sql` — apply with the writers stopped, then `make platform-backfill STAGE=<stage> FILE=0005_usage_minute` before `platform-up` |
+
+**Materialized views and the writers (`0005`).** The `usage_minute` views sum
+every row inserted into their source tables, duplicates included, and only an
+enricher from the same release dedups retried spans across polls. So for this
+release `platform-stop-writers` is mandatory even though nothing in Postgres
+changes: never let `0005` run beside an older enricher, or every retried span
+is counted twice, permanently. Then backfill once, still with the writers
+stopped, so no row is both backfilled and counted by a view:
+
+```bash
+make platform-stop-writers STAGE=<stage>
+make platform-migrate STAGE=<stage>
+make platform-backfill STAGE=<stage> FILE=0005_usage_minute   # no-op after a successful run
+make platform-up STAGE=<stage>
+```
+
+A forgotten backfill only means `30d` usage reads start near zero. To rebuild
+the rollup (a late backfill, a backfill that failed partway, a re-upgrade after
+a rollback that kept the table, or a count that looks wrong): stop the writers,
+`TRUNCATE TABLE hexgate_audit.usage_minute`, run the backfill, start the writers.
+
+**SDK release order for a new span scope.** The enricher sends any scope it
+does not know to the DLQ as `unknown_scope`. So deploy the enricher build that
+stores `hexgate.runs` to every stage *before* releasing an SDK that emits it:
+otherwise every run start becomes a DLQ record on a stage still running the old
+enricher. No other data is lost, and deploying the enricher stops it. To roll
+back, go the other way: revert the SDK release first, then the enricher.
+
+**Rolling back past a migration.** The columns stay behind when the code goes
+away, and old code does not know to filter on them. Nothing here is automatic,
+so a rollback that skips the compensating step below is silent — the stack comes
+up healthy and behaves wrongly.
+
+*Past `0001_devtoken_soft_delete`* — revocation became a soft delete: the row
+survives with `revoked_at` stamped, and every read filters it out. The
+pre-soft-delete code has no such filter, so it resolves those rows as live keys.
+Before checking out a tag older than that release:
+
+```bash
+cd /srv/hexgate-<stage>
+docker compose -p hexgate-<stage> --env-file platform/.env.<stage> \
+  -f platform/docker-compose.deploy.yml exec -T postgres \
+  psql -v ON_ERROR_STOP=1 -U hexgate -d hexgate \
+  -c "DELETE FROM devtoken WHERE revoked_at IS NOT NULL"
+```
+
+Skipping it does not expose every surface equally. Revoke also masks the
+secret, and the pre-soft-delete code resolves a key by matching that secret
+exactly, so it can never match a revoked row: bearer HTTP and the WebSocket
+handshake stay refused either way. Two surfaces do regress, both of them ones
+that never look at the secret — **OTLP ingest**, which matches the token's
+`token_id` fact against a snapshot of the whole key table and finds the row
+present again, and the **dashboard's key list**, which reads the rows back
+unfiltered. Run it anyway: those are the surfaces the compensating step exists
+for. It discards the audit rows, which is the point — the old schema has
+nowhere to keep them.
+
+*Past `0002_actor_columns`* and *past `0003_policy_file_actor_columns`* —
+**no compensating step.** Every column they add is nullable and unread by the
+older code, so leave them in place. What the rollback cannot undo is the keys
+that member removal revoked while the new code was live — correctly so, and
+irreversibly: `postgres/0001` masked the secret on revoke, so clearing `revoked_at`
+would not bring the credential back. Mint a fresh key instead.
+
+*Past `clickhouse/0005_add_usage_minute`* — drop the three views **before** an
+older enricher starts, or its cross-poll duplicates are summed into
+`usage_minute` again. Empty the table too: nothing older reads it, and a
+re-upgrade backfills only an empty `usage_minute`, so rows left behind would
+hide the whole rollback window from every `30d` count.
+
+```bash
+cd /srv/hexgate-<stage>
+docker compose -p hexgate-<stage> --env-file platform/.env.<stage> \
+  -f platform/docker-compose.deploy.yml exec -T clickhouse sh -c \
+  'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --multiquery' <<'SQL'
+DROP VIEW IF EXISTS hexgate_audit.usage_minute_from_runs;
+DROP VIEW IF EXISTS hexgate_audit.usage_minute_from_decisions;
+DROP VIEW IF EXISTS hexgate_audit.usage_minute_from_llm;
+TRUNCATE TABLE IF EXISTS hexgate_audit.usage_minute;
+SQL
+```
+
+**When a release changes the topic config, re-run `redpanda-init` by hand** —
+`platform-up` will not. `create-topics.sh` reconciles `retention.ms` and
+`max.message.bytes` on every run, but `redpanda-init` is the only thing that
+invokes it, and `restart: "no"` + `service_completed_successfully` means an
+existing stack never starts it again. The collector and enricher take their new
+limits from rebuilt images, so skipping this leaves the broker as the one hop
+still on the old, narrower limit — and it rejects the records everything else
+is now sized to send:
+
+```bash
+cd /srv/hexgate-<stage>
+docker compose -p hexgate-<stage> --env-file platform/.env.<stage> \
+  -f platform/docker-compose.deploy.yml run --rm redpanda-init
+# verify, then restart the two clients of that limit
+docker compose -p hexgate-<stage> --env-file platform/.env.<stage> \
+  -f platform/docker-compose.deploy.yml exec redpanda \
+  rpk topic describe hexgate.otlp.raw --brokers localhost:9092
+docker compose -p hexgate-<stage> --env-file platform/.env.<stage> \
+  -f platform/docker-compose.deploy.yml restart collector enricher
+```
+
+`run --rm` starts a sibling container rather than reusing the completed one, so
+it works on a running stack and leaves nothing behind. Releases so far that
+needed this:
+
+| Release | Change |
+|---|---|
+| LLM message logging | `max.message.bytes` → 8 MiB on `hexgate.otlp.raw` **and** `hexgate.otlp.dlq` |
 
 ## Operations
 
@@ -230,8 +482,18 @@ alone boots the api fine but leaves the collector crash-looping on the missing
 public key — restore both files (or regenerate the public half by hand from
 the private one) until the keystore learns to rewrite it on load.
 
+**Revocation cache tuning** — `poll_interval` (20s) is how long a revoked key
+still works; `max_staleness` (1h) is how long the collector serves its last
+snapshot while refreshes *fail*, after which it rejects every request. Tune per
+stage with `HEXGATE_COLLECTOR_REVOCATION_POLL_INTERVAL` /
+`HEXGATE_COLLECTOR_REVOCATION_MAX_STALENESS` in `.env.<stage>`; never set either
+blank (the collector refuses to boot). Lowering `max_staleness` below a few
+minutes makes routine database maintenance total span loss, reported as a green
+healthcheck.
+
 **Schema changes** apply only on an empty volume; changing one after first boot
-needs a manual migration.
+goes through `platform/clickhouse/migrations/`, applied by `make platform-migrate`
+(§6).
 
 ## Consumer SDK
 

@@ -11,6 +11,8 @@ from typing import Any
 import pytest
 
 from hexgate.runtime import HexgateContext
+from hexgate.runtime.run_facts import run_scope
+from hexgate.tracing import semconv
 from hexgate.tracing import usage as usage_mod
 from hexgate.tracing.usage import emit_llm_usage
 
@@ -124,6 +126,31 @@ def test_records_tokens_without_a_sender(monkeypatch: pytest.MonkeyPatch) -> Non
     assert namespace["llm_calls"] == 1
 
 
+def test_records_llm_usage_on_the_agent_usage_ledger_without_a_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token quota must work in local mode too."""
+    from hexgate.runtime.agent_usage import (
+        MAX_WINDOW_SECONDS,
+        UsageLedgers,
+        UsageMetric,
+        new_usage_ledger,
+    )
+
+    monkeypatch.setattr(usage_mod, "configure_usage_sender", lambda api_key=None: None)
+    ledgers = UsageLedgers(new_usage_ledger)
+    ledgers.enable()
+
+    with run_scope("a", ledgers=ledgers) as facts:
+        emit_llm_usage("agent", "gpt-4o", 100, 20)
+
+    assert facts.ledger is not None
+    usage = facts.ledger.within(MAX_WINDOW_SECONDS)
+    assert usage[UsageMetric.LLM_CALLS] == 1
+    assert usage[UsageMetric.INPUT_TOKENS] == 100
+    assert usage[UsageMetric.OUTPUT_TOKENS] == 20
+
+
 def test_records_tokens_and_emits_when_a_sender_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -203,3 +230,48 @@ def test_token_cap_trails_the_turn_that_exceeded_it() -> None:
         emit_llm_usage("a", "gpt-4o", 400, 0)
         # ...so the overshoot is only visible to the *next* decision.
         assert not enforcer.decide("t", {}).allowed
+
+
+def test_emit_stamps_the_enclosing_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """llm_invocation rows join to the policy_decision rows of the same run, so
+    the run_id has to reach the event, not just the counters."""
+    sender = _FakeSender()
+    monkeypatch.setattr(
+        usage_mod, "configure_usage_sender", lambda api_key=None: sender
+    )
+
+    with run_scope("agent") as facts:
+        emit_llm_usage("agent", "gpt-4o", 10, 5)
+
+    assert sender.events[0].run_id == facts.id
+    assert sender.events[0].span_attributes()[semconv.RUN_ID] == facts.id
+
+
+def test_emit_outside_a_run_scope_sends_no_run_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sender = _FakeSender()
+    monkeypatch.setattr(
+        usage_mod, "configure_usage_sender", lambda api_key=None: sender
+    )
+
+    emit_llm_usage("agent", "gpt-4o", 10, 5)
+
+    assert sender.events[0].run_id == ""
+    assert semconv.RUN_ID not in sender.events[0].span_attributes()
+
+
+def test_emit_attributes_tokens_and_the_run_id_to_the_same_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One get_run_facts() read, so the tokens and the run_id share an object."""
+    sender = _FakeSender()
+    monkeypatch.setattr(
+        usage_mod, "configure_usage_sender", lambda api_key=None: sender
+    )
+
+    with run_scope("agent") as facts:
+        emit_llm_usage("agent", "gpt-4o", 10, 5)
+
+    assert facts.as_namespace("t")["total_tokens"] == 15
+    assert sender.events[0].run_id == facts.id

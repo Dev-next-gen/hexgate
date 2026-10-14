@@ -1,8 +1,8 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
-from sqlalchemy import JSON, Column, DateTime, LargeBinary
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, LargeBinary, String
 from sqlmodel import Field, Relationship, SQLModel, UniqueConstraint
 
 
@@ -38,6 +38,31 @@ def new_uuid_str() -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Control-plane actor trail (issue #160).
+#
+# NULL means "no human actor": a seed row, an SDK write from a key with no
+# owner, or a row predating migrations/0002. There is no sentinel.
+#
+# These record the LAST writer, not history -- that is the audit_event log.
+# Do not grow them into a change log.
+# ---------------------------------------------------------------------------
+
+
+def actor_fk_column(*, index: bool = False) -> Column:
+    """A nullable ``user.id`` FK for the actor trail.
+
+    ``ON DELETE SET NULL``: these are display-only, so a deleted account
+    degrades them to "no actor" rather than blocking the delete. Columns with
+    real semantics (``organization_member.user_id``, ``ban.created_by_user_id``)
+    are not declared here -- those need a deletion flow, not a silent NULL.
+
+    A factory, not a mixin: a ForeignKey shared across mapped classes would
+    need ``declared_attr``, and each call returns a distinct Column.
+    """
+    return Column(String, ForeignKey("user.id", ondelete="SET NULL"), index=index)
+
+
 class Organization(SQLModel, table=True):
     """A tenant. Customers see this as their workspace / team.
 
@@ -57,6 +82,11 @@ class Organization(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )
+    created_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+    updated_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+    updated_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
 
 
 class User(SQLModel, table=True):
@@ -156,6 +186,13 @@ class OrganizationMember(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )
+    # Who granted the access: on invite-accept the inviter, not the invitee
+    # (already ``user_id`` on this row).
+    created_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+    updated_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+    updated_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
 
 
 class Invitation(SQLModel, table=True):
@@ -191,6 +228,7 @@ class Invitation(SQLModel, table=True):
     revoked_at: Optional[datetime] = Field(
         default=None, sa_type=DateTime(timezone=True)
     )
+    revoked_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
     created_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )
@@ -221,16 +259,36 @@ class Project(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )
+    created_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+    updated_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+    updated_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
 
 
 class ApiKey(SQLModel, table=True):
+    """A project's API key. Live while ``revoked_at`` is null; revoke is a soft
+    delete keeping the who/when trail (the row is the audit record), same as
+    :class:`Ban`.
+
+    Every read path filters on ``revoked_at IS NULL`` -- including the Go
+    Collector's snapshot query (``extension/hexgatebiscuitauth/cache.go``),
+    which is the OTLP ingest path's only revocation check.
+
+    Revoking also masks ``secret``: the retained row is an audit record, not a
+    store of credentials that outlive their own revocation.
+
+    ``owner_user_id`` is what makes offboarding possible: keys never expire, so
+    removing a member sweeps the keys they own (``members.service``).
+    """
+
     __tablename__ = "devtoken"  # historical name; renaming needs a migration
 
     id: str = Field(primary_key=True)
     project_id: str = Field(foreign_key="project.id", index=True)
     name: str
     prefix: str  # "fty_test" or "fty_live"
-    secret: str  # full token value; opaque random string for Phase A
+    secret: str  # full token value while live; replaced by its mask on revoke
     scopes_csv: str = ""  # comma-separated for now
     created_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
@@ -238,6 +296,90 @@ class ApiKey(SQLModel, table=True):
     last_used_at: Optional[datetime] = Field(
         default=None, sa_type=DateTime(timezone=True)
     )
+    revoked_at: Optional[datetime] = Field(
+        default=None, sa_type=DateTime(timezone=True)
+    )
+    revoked_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+    created_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+    # Whose key this is, as distinct from who minted it. Indexed because
+    # remove_member sweeps by it on every removal.
+    owner_user_id: Optional[str] = Field(
+        default=None, sa_column=actor_fk_column(index=True)
+    )
+
+
+# ---------------------------------------------------------------------------
+# OAuth 2.1 authorization server (MCP clients log in as the user). Defined
+# here, not in features/oauth/: api-init imports only this module before
+# create_all, so a table declared in the feature slice is never created in
+# deploy. Secrets are stored as SHA-256 hashes only.
+# ---------------------------------------------------------------------------
+
+
+class OAuthAuthorizationCode(SQLModel, table=True):
+    """The one-time code handed to the client after consent, redeemed for
+    tokens once, within about a minute, by the client that started the login.
+
+    ``projects_csv`` is the project ids ticked at consent, kept apart from
+    ``scopes_csv`` so a scope stays a scope. Never empty: a grant with no
+    projects can do nothing.
+    """
+
+    __tablename__ = "oauth_authorization_code"
+
+    id: str = Field(default_factory=new_uuid_str, primary_key=True)
+    code_hash: str = Field(unique=True)
+    user_id: str = Field(foreign_key="user.id")
+    client_id: str  # the client's metadata document URL
+    redirect_uri: str
+    scopes_csv: str
+    projects_csv: str
+    resource: str
+    code_challenge: str  # PKCE, S256 only
+    created_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+    expires_at: datetime = Field(sa_type=DateTime(timezone=True))
+    used_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+
+
+class OAuthRefreshToken(SQLModel, table=True):
+    """One login of one client for one user; what the user revokes to log a
+    client out.
+
+    Each refresh writes a new row with the same ``family_id`` (the ``id`` of
+    the login's first token) and the same ``scopes_csv`` / ``projects_csv``,
+    and revokes the old one with ``replaced_by_id`` set. Reusing a revoked
+    token revokes the whole family in one update on ``family_id``.
+    """
+
+    __tablename__ = "oauth_refresh_token"
+
+    id: str = Field(default_factory=new_uuid_str, primary_key=True)
+    token_hash: str = Field(unique=True)
+    user_id: str = Field(foreign_key="user.id", index=True)
+    client_id: str
+    client_name: str
+    scopes_csv: str
+    projects_csv: str
+    resource: str
+    created_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+    last_used_at: Optional[datetime] = Field(
+        default=None, sa_type=DateTime(timezone=True)
+    )
+    expires_at: datetime = Field(sa_type=DateTime(timezone=True))
+    revoked_at: Optional[datetime] = Field(
+        default=None, sa_type=DateTime(timezone=True)
+    )
+    revoked_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+    # Indexed: Postgres doesn't index a referencing FK, so every clean-up
+    # DELETE would scan the table for rows pointing at the one removed.
+    replaced_by_id: Optional[str] = Field(
+        default=None, foreign_key="oauth_refresh_token.id", index=True
+    )
+    family_id: str = Field(index=True)
 
 
 class Agent(SQLModel, table=True):
@@ -258,6 +400,11 @@ class Agent(SQLModel, table=True):
     updated_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )
+    created_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+    # The last human to author an edit. Not touched by ``recompile_project`` /
+    # ``backfill_bundles``, which rebuild a derived artifact -- see
+    # agents/service.py:_apply_bundle.
+    updated_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
 
     # Compiled + signed WASM bundle, produced from policy_yaml at save time
     # (see hexgate_api.features.agents.compiler.compile_bundle). Null when opa is unavailable or the
@@ -290,9 +437,19 @@ class AgentVersion(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )
+    # Immutable snapshot: creator only. From the registering key's owner, so
+    # NULL for a system or pre-#160 key.
+    created_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
 
 
 class Tool(SQLModel, table=True):
+    """One tool on one :class:`AgentVersion`.
+
+    No actor trail: only ever written as part of a version snapshot, never
+    mutated alone, so it inherits that version's. Exempted in
+    ``tests/test_actor_columns.py``.
+    """
+
     __tablename__ = "tool"
     __table_args__ = (
         UniqueConstraint("agent_version_id", "name", name="uq_tool_agent_version_name"),
@@ -303,6 +460,42 @@ class Tool(SQLModel, table=True):
     name: str
     description: Optional[str] = None
     input_schema: dict = Field(sa_column=Column(JSON, nullable=False))
+
+
+class Skill(SQLModel, table=True):
+    """One skill on one :class:`AgentVersion`.
+
+    No actor trail, for the same reason as :class:`Tool`: only ever written as
+    part of a version snapshot, never mutated alone, so it inherits that row's.
+    Exempted in ``tests/test_actor_columns.py``.
+    """
+
+    __tablename__ = "skill"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_version_id", "name", name="uq_skill_agent_version_name"
+        ),
+    )
+
+    id: str = Field(primary_key=True)
+    agent_version_id: str = Field(foreign_key="agent_version.id", index=True)
+    name: str
+    description: Optional[str] = None
+    source: Optional[str] = None
+    # NULL when the framework does not enumerate resources; a JSON object when
+    # it does. The distinction is the point — an empty object means the skill
+    # ships no resources, NULL means nobody looked.
+    #
+    # ``none_as_null`` is what makes that sentence true in SQL. Without it
+    # SQLAlchemy persists Python None as the JSON scalar ``'null'``, which is
+    # still distinguishable from ``{}`` in Python but makes
+    # ``WHERE resources IS NULL`` match zero rows.
+    resources: Optional[dict] = Field(
+        default=None, sa_column=Column(JSON(none_as_null=True), nullable=True)
+    )
+    allowed_tools: list = Field(sa_column=Column(JSON, nullable=False))
+    additional_tools: list = Field(sa_column=Column(JSON, nullable=False))
+    content_hash: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +526,7 @@ class Ban(SQLModel, table=True):
     revoked_at: Optional[datetime] = Field(
         default=None, sa_type=DateTime(timezone=True)
     )
-    revoked_by_user_id: Optional[str] = Field(default=None, foreign_key="user.id")
+    revoked_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +560,8 @@ class PolicyModule(SQLModel, table=True):
     updated_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )
+    created_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+    updated_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
 
 
 class RoleBinding(SQLModel, table=True):
@@ -379,7 +574,7 @@ class RoleBinding(SQLModel, table=True):
     a mapping ``{agent-or-"*": [capability names]}``. A legacy flat ``[names]``
     list is read as the generic ``{"*": [names]}`` agent — so the agent axis is
     a value-shape evolution with no schema change (the column stays JSON, the
-    key stays ``(project_id, role)``). See ``agent-policy-dimension-design.md``.
+    key stays ``(project_id, role)``).
     """
 
     __tablename__ = "role_binding"
@@ -395,3 +590,149 @@ class RoleBinding(SQLModel, table=True):
     capabilities: list[str] | dict[str, list[str]] = Field(
         default_factory=dict, sa_column=Column(JSON, nullable=False)
     )
+    created_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+    # No updated_* pair: ``set_roles`` replaces every row on each write, so a
+    # row's creation IS its last write.
+    created_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+
+
+class PolicyFile(SQLModel, table=True):
+    """One file in a project's compose policy, addressed by ``name``.
+
+    The entry file is ``policy.yaml``; other files are pulled in via ``import:``
+    from it. Unlike :class:`PolicyModule` (the tier layout), a file has no tier —
+    roles and imports live inside the file content, per the compose grammar. One
+    row per ``(project_id, name)``; the SDK's compose loader reads ``content`` by
+    ``name``, so a project is a small in-DB filesystem.
+    """
+
+    __tablename__ = "policy_file"
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name="uq_policy_file_project_name"),
+    )
+
+    id: str = Field(primary_key=True)  # new_id(PolicyFile) -> "pfl_…"
+    project_id: str = Field(foreign_key="project.id", index=True)
+    name: str = Field(index=True)  # e.g. "policy.yaml", "caps/refunds.yaml"
+    content: str  # the file's YAML text
+    content_hash: str  # sha256 of content, the file's stable identity
+    created_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+    updated_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+    updated_by_user_id: Optional[str] = Field(default=None, sa_column=actor_fk_column())
+
+
+# ---------------------------------------------------------------------------
+# AI Act classification — the operator's own assertion about an agent, kept
+# apart from ``Agent`` on purpose:
+# ``Agent`` is what the agent is and enforces, written by the policy author and
+# read on every bundle fetch; a classification is a different person's
+# statement about the system, on a different cadence, needing its own
+# provenance (``Agent.updated_at`` moves on every policy save). "Incomplete"
+# then reads as *no row* rather than nine nullable columns on the hot table.
+# ---------------------------------------------------------------------------
+
+
+class AgentClassification(SQLModel, table=True):
+    """One operator-recorded AI Act entry for an agent.
+
+    Every descriptive column is nullable: an operator can save a partial entry
+    and come back to it, and the report lists such an agent as *incomplete*
+    rather than omitting it. The platform records the assertion and judges
+    nothing about it — no check that a risk tier fits the agent's tool set.
+    """
+
+    __tablename__ = "agent_classification"
+    __table_args__ = (UniqueConstraint("agent_id", name="uq_agent_classification"),)
+
+    id: str = Field(primary_key=True)  # new_id(AgentClassification) -> "acl_…"
+    # Unique: one current entry per agent. History is not kept in v0 — the
+    # entry carries who recorded the latest assertion and when. No ``index=True``
+    # — the unique constraint already indexes this single column (unlike
+    # ``AgentVersion``, whose constraints are composite).
+    agent_id: str = Field(foreign_key="agent.id")
+    intended_purpose: Optional[str] = None  # Art. 3(12)
+    operator_role: Optional[str] = None  # "provider" | "deployer"
+    # "high_risk" | "not_high_risk" | "prohibited" | "minimal"
+    risk_tier: Optional[str] = None
+    annex_iii_point: Optional[str] = None  # e.g. "5(b)"; null when not high risk
+    oversight_owner_name: Optional[str] = None  # Art. 26(2) named person
+    oversight_owner_contact: Optional[str] = None
+    # Revision of the compliance checker the operator relied on — Art. 6(4)
+    # wants a documented assessment with a name and a date attached.
+    checker_last_update_date: Optional[date] = None
+    # Nullable, ``ON DELETE SET NULL``, like every other actor column: a GDPR
+    # erasure request is a legal obligation with a deadline, and a schema that
+    # answers it with a foreign-key error makes the required action fail. The
+    # attribution is worth a lot here — it is the Art. 6(4) "who assessed
+    # this" — but "we may be entitled to keep the name" is a retention
+    # question, not a reason for DELETE to throw.
+    #
+    # So an erased recorder leaves the assertion standing with no name on it.
+    # Note what that means TODAY: completeness does not look at this column, so
+    # such an entry still reads as complete — a dated assessment with no
+    # asserter. #246 covers both halves of the fix: anonymising the user row
+    # instead of deleting it, so the trail survives erasure intact, and making
+    # an unattributed entry read as needing re-confirmation.
+    #
+    # Rewritten on every PUT, so it names the LATEST recorder, not the creator
+    # — v0 keeps no history (see the class docstring).
+    recorded_by_user_id: Optional[str] = Field(
+        default=None, sa_column=actor_fk_column(index=True)
+    )
+    recorded_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+
+
+# -------------------------------------------------------------------------
+# AI Act evidence report (https://app.notion.com/p/3e2fb45dbae281f794fefa40ff4a1a8d). One row per
+# generated document, project-scoped and purely additive — create_all picks it
+# up with no migration.
+# ---------------------------------------------------------------------------
+
+
+class AiActReport(SQLModel, table=True):
+    """One generated AI Act evidence report.
+
+    ``annex_json`` is the canonical artifact: the exact bytes the signature
+    covers. The digest, signature and kid are derived from it at generation
+    time and stored alongside, so verifying a report later never re-assembles
+    it — a re-assembly would pick up events that arrived since, and produce a
+    different digest for the same report id.
+
+    The row is append-only. A report is evidence of what the platform held
+    over a period; editing one would defeat the point of signing it.
+    """
+
+    __tablename__ = "ai_act_report"
+
+    id: str = Field(primary_key=True)  # new_id(AiActReport) -> "rpt_…"
+    project_id: str = Field(foreign_key="project.id", index=True)
+    period_start: datetime = Field(sa_type=DateTime(timezone=True))
+    period_end: datetime = Field(sa_type=DateTime(timezone=True))
+    generated_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+    # actor_fk_column, not a hard FK: deleting a user who once generated a
+    # report must not fail, and this column is display-only. The attribution
+    # itself is not lost when it nulls — the annex records the requesting user
+    # inside the bytes the signature covers, so the evidence keeps its
+    # provenance even after the account is erased.
+    generated_by_user_id: Optional[str] = Field(
+        default=None, sa_column=actor_fk_column(index=True)
+    )
+    annex_json: str  # the exact signed bytes, as text
+    annex_sha256: str
+    # Stored rather than derived with ``len(annex_json.encode())`` on read: the
+    # history endpoint would otherwise have to load every annex a project has
+    # ever generated — hundreds of KB each — to produce one integer per row.
+    # It is also the more correct place for it: the byte count is a property of
+    # the artifact, fixed when the signature was taken over exactly these
+    # bytes, and a verifier uses it to know how much it should have received.
+    annex_bytes: int
+    signature: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
+    signing_kid: str

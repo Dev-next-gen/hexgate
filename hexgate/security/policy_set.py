@@ -23,6 +23,7 @@ Inheritance semantics: left-to-right merge — ``inherits: [A, B]`` resolves
 to ``merge(A, merge(B, self))``, where ``merge`` deep-merges the ``tools``
 maps (child entries override parent entries by tool name) and replaces
 scalar fields (``default_policy``) with the child's value when set.
+Policy-level ``constraints`` are the exception: they union across the chain.
 
 Mixin policies (``is_mixin: true``) can only be referenced via ``inherits``
 — they're never picked as the effective policy for any context scope.
@@ -30,13 +31,20 @@ Mixin policies (``is_mixin: true``) can only be referenced via ``inherits``
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from hexgate.runtime.agent_usage import (
+    AGENT_USAGE_VOCABULARY,
+    KNOWN_AGENT_USAGE_PATHS,
+    OnUnavailable,
+)
 from hexgate.runtime.run_facts import LIST_PATHS, SCALAR_PATHS
 from hexgate.security.constraints import (
     LEFT,
@@ -50,11 +58,17 @@ from hexgate.security.constraints import (
 from hexgate.security.decision import Verdict
 from hexgate.security.models import (
     AGENT_RUN_TOOL,
+    USAGE_FIELD,
     AgentPolicy,
     AgentTargetPolicy,
     BaseToolPolicy,
+    GuardRule,
+    SkillPolicy,
     ToolPolicy,
+    UsagePolicy,
     is_agent_reach_key,
+    is_agent_via_key,
+    is_skill_key,
 )
 
 DEFAULT_ROLE_NAME = "default"
@@ -66,8 +80,25 @@ DEFAULT_ROLE_NAME = "default"
 # so the reserved-name guard still fires on authored source.
 RESOLVED_POLICY_MARKER = "_resolved"
 
-_RUN_ROOT = "run"
-_RUN_PATH_SEGMENTS = 2  # the namespace is flat: run.<name>
+# Sentinel for the memoized guard stance: distinguishes "not computed" from a
+# genuinely computed None (no role configures a guard).
+_UNSET: object = object()
+
+_ROLES_KEY = "roles"
+_CONSTRAINTS_KEY = "constraints"
+_VERSION_KEY = "version"
+
+# Legal siblings of ``roles:``. Anything else is rejected, not ignored: that
+# shape validates only what sits under ``roles:``, so a stray key would vanish.
+_FILE_LEVEL_KEYS = frozenset(
+    {_ROLES_KEY, _CONSTRAINTS_KEY, _VERSION_KEY, RESOLVED_POLICY_MARKER}
+)
+
+# Policy fields every role must resolve identically. Beside ``roles:`` they are
+# rejected like any other stray key, but with advice that leads to a loadable policy.
+_AGENT_LEVEL_KEYS = frozenset({"guards", USAGE_FIELD})
+
+_ROOTED_PATH_SEGMENTS = 2  # run.* and agent_usage.* are flat: <root>.<name>
 _ORDERED_OPS = frozenset({"<", "<=", ">", ">="})
 # ==/!= excluded: list equality is well-defined, just not useful here.
 _SCALAR_ONLY_OPS = _ORDERED_OPS | {"in", "not in"}
@@ -103,7 +134,9 @@ class PolicySet:
                 f"PolicySet missing required '{DEFAULT_ROLE_NAME}' role"
             )
         _validate_const_refs(policies)
-        _validate_run_refs(policies)
+        _validate_path_refs(policies, _RUN)
+        self._agent_usage_paths = _validate_path_refs(policies, _AGENT_USAGE)
+        self._on_unavailable = _agent_on_unavailable(policies)
         self._policies = policies
         self._aliased_default = aliased_default
 
@@ -131,12 +164,14 @@ class PolicySet:
         args: Mapping[str, Any],
         attributes: Mapping[str, Any] | None = None,
         run: Mapping[str, Any] | None = None,
+        agent_usage: Mapping[str, Any] | None = None,
     ) -> Verdict:
         """:class:`~hexgate.security.decision.PolicyEngine` entry point.
 
         Resolves the role's policy and runs the pydantic engine. ``attributes``
-        feed the ``ctx.*`` constraint namespace and ``run`` the ``run.*`` one;
-        the role still selects the policy bucket (``policy_for``) on its own."""
+        feed the ``ctx.*`` constraint namespace, ``run`` the ``run.*`` one and
+        ``agent_usage`` the ``agent_usage.*`` one; the role still selects the
+        policy bucket (``policy_for``) on its own."""
         from hexgate.security.policy import evaluate_tool_call
 
         return evaluate_tool_call(
@@ -146,6 +181,7 @@ class PolicySet:
             role=role,
             attributes=attributes,
             run=run,
+            agent_usage=agent_usage,
         )
 
     @property
@@ -171,11 +207,120 @@ class PolicySet:
             for policy in self._policies.values()
         )
 
+    def declares_tool_reach(self) -> bool:
+        """True if any resolved role carries an ``agent.tool:`` (agent-as-tool) key."""
+        return any(
+            any(is_agent_via_key(key, "tool") for key in policy.effective_tools)
+            for policy in self._policies.values()
+        )
+
+    def declares_skills(self) -> bool:
+        """True if any resolved role carries a ``skill:`` / ``skill.*:`` key.
+
+        Derived from ``effective_tools`` rather than ``skills`` so it holds after
+        inheritance and module folding, where the block has become lowered keys."""
+        return any(
+            any(is_skill_key(key) for key in policy.effective_tools)
+            for policy in self._policies.values()
+        )
+
+    def agent_usage_paths(self) -> frozenset[str]:
+        """Every ``agent_usage.*`` path (without the root) any role references.
+
+        Derived from ``effective_tools`` like the ``declares_*`` family, so
+        admission and reach constraints count."""
+        return self._agent_usage_paths
+
+    def usage_on_unavailable(self) -> OnUnavailable:
+        """The agent's fail mode for ``agent_usage.*`` (one value, checked at load)."""
+        return self._on_unavailable
+
+    def guard_stance(self) -> dict[str, dict] | None:
+        """The agent-level guard enable/disable stance to carry in the bundle.
+
+        Agent-level, not per-role (R-GUARD-007): the guard pipeline is built once at
+        construction, before any caller role exists, so a single stance governs the
+        agent. v1 is baseline-only (R-GUARD-006), and the baseline is uniform — it
+        applies to every tool and every caller alike — so the only requirement is that
+        every resolved role agree on it. A policy whose roles set *different* baselines
+        cannot be represented, so this fails loud rather than silently pick one (which
+        would enforce one role's disables on callers of another — a fail-open in the
+        disable direction). A role silent on a baseline guard runs it (enabled default),
+        so silence and an explicit ``enabled: false`` genuinely diverge; put shared
+        baseline guards in a mixin every role inherits.
+
+        Returns ``{"baseline": {name: enabled}}``, or ``None`` when no role configures
+        any guard — so the bundle omits the section and a guards-free policy's manifest
+        stays byte-identical (R-GUARD-006 / R-GUARD-007).
+
+        Memoized: ``effective_guards`` / ``governed_guard_names`` call this per guarded
+        call, and the stance is fixed after load, so it is computed once — including a
+        :class:`PolicySetError`, which is cached and re-raised rather than recomputed,
+        so a live divergent fallback engine does not re-run (and re-log) every call.
+        """
+        cached = getattr(self, "_guard_stance_cache", _UNSET)
+        if cached is not _UNSET:
+            if isinstance(cached, PolicySetError):
+                raise cached
+            return cached
+        try:
+            stance = self._compute_guard_stance()
+        except PolicySetError as exc:
+            self._guard_stance_cache: dict[str, dict] | PolicySetError | None = exc
+            raise
+        self._guard_stance_cache = stance
+        return stance
+
+    def _compute_guard_stance(self) -> dict[str, dict] | None:
+        """Fold every role's baseline into one agent-level stance (see
+        :meth:`guard_stance`); raise :class:`PolicySetError` on a divergent baseline."""
+        baseline = json.loads(
+            _agent_wide(
+                self._policies,
+                "baseline guards",
+                "v1 governs the agent, not the caller",
+                lambda p: json.dumps(
+                    {n: r.enabled for n, r in p.guards.items()}, sort_keys=True
+                ),
+            )
+        )
+        return {"baseline": baseline} if baseline else None
+
+    def effective_guards(self, tool_name: str) -> dict[str, bool]:
+        """Agent-level guard stance (R-GUARD-007). Baseline-only in v1, so uniform for
+        every tool — ``tool_name`` is accepted for a signature shared with the bundle
+        mirror but does not change the result.
+
+        The readable-engine mirror of :meth:`PolicyBundle.effective_guards`, so the
+        guarded runner reads the stance identically whether the engine is a compiled
+        bundle or this set. Empty when no guard is configured."""
+        stance = self.guard_stance()
+        return dict(stance["baseline"]) if stance else {}
+
+    def governed_guard_names(self) -> frozenset[str]:
+        """Every guard name the stance references (R-GUARD-007), for the closed-world
+        check. Mirror of :meth:`PolicyBundle.governed_guard_names`."""
+        stance = self.guard_stance()
+        return frozenset(stance["baseline"]) if stance else frozenset()
+
     def __contains__(self, role: str) -> bool:
         return role in self._policies
 
     def __repr__(self) -> str:
         return f"PolicySet(roles={self.roles!r})"
+
+
+def _raw_constraints(
+    policy: AgentPolicy, *, tools: Iterable[BaseToolPolicy]
+) -> Iterator[str]:
+    """Every constraint string a role evaluates, policy-level first.
+
+    ``tools`` is a parameter because the two validators walk different views:
+    const refs cover the lowered ``agent.*`` keys, run refs only authored ones.
+    """
+    yield from policy.constraints
+    for tool_policy in (*tools, policy.default_policy):
+        yield from tool_policy.constraints
 
 
 def _validate_const_refs(policies: Mapping[str, AgentPolicy]) -> None:
@@ -189,14 +334,13 @@ def _validate_const_refs(policies: Mapping[str, AgentPolicy]) -> None:
     """
     for role, policy in policies.items():
         available = set(policy.consts)
-        for tool_policy in (*policy.effective_tools.values(), policy.default_policy):
-            for raw in tool_policy.constraints:
-                for name in iter_const_refs(parse_constraint(raw)):
-                    if name not in available:
-                        raise PolicySetError(
-                            f"role {role!r}: constraint {raw!r} references "
-                            f"undefined constant consts.{name}"
-                        )
+        for raw in _raw_constraints(policy, tools=policy.effective_tools.values()):
+            for name in iter_const_refs(parse_constraint(raw)):
+                if name not in available:
+                    raise PolicySetError(
+                        f"role {role!r}: constraint {raw!r} references "
+                        f"undefined constant consts.{name}"
+                    )
 
 
 def _sdk_version() -> str:
@@ -206,20 +350,51 @@ def _sdk_version() -> str:
         return "unknown"
 
 
-def _run_paths_in(node: Node):
-    """Every ``run``-rooted path in a node, whatever its position."""
+@dataclass(frozen=True, slots=True)
+class _PathRoot:
+    """A flat ``<root>.<name>`` namespace the linter closes."""
+
+    name: str
+    scalar_paths: frozenset[str]
+    list_paths: frozenset[str]
+    # What "this SDK knows" renders as in the unknown-path error.
+    vocabulary: str
+
+    @property
+    def known(self) -> frozenset[str]:
+        return self.scalar_paths | self.list_paths
+
+
+def _run_root(scalar_paths: frozenset[str], list_paths: frozenset[str]) -> _PathRoot:
+    return _PathRoot(
+        "run",
+        scalar_paths,
+        list_paths,
+        vocabulary=", ".join(sorted(scalar_paths | list_paths)),
+    )
+
+
+_RUN = _run_root(SCALAR_PATHS, LIST_PATHS)
+_AGENT_USAGE = _PathRoot(
+    "agent_usage",
+    KNOWN_AGENT_USAGE_PATHS,
+    frozenset(),
+    vocabulary=AGENT_USAGE_VOCABULARY,
+)
+
+
+def _rooted_paths_in(node: Node, root: str) -> Iterator[tuple[str, ...]]:
+    """Every ``root``-rooted path in a node, whatever its position."""
     for path in iter_arg_refs(node):
-        if path and path[0] == _RUN_ROOT:
+        if path and path[0] == root:
             yield path
 
 
-def _validate_run_refs(
-    policies: Mapping[str, AgentPolicy],
-    *,
-    scalar_paths: frozenset[str] = SCALAR_PATHS,
-    list_paths: frozenset[str] = LIST_PATHS,
-) -> None:
-    """Reject a ``run.*`` reference this SDK cannot answer, or answers silently.
+def _validate_path_refs(
+    policies: Mapping[str, AgentPolicy], root: _PathRoot
+) -> frozenset[str]:
+    """Reject a ``<root>.*`` reference this SDK cannot answer, or answers silently;
+    return every ``<root>.*`` name referenced, without the root.
 
     Sibling of :func:`_validate_const_refs` — same construction-time check, same
     reason (pydantic and the Rego compiler must agree a policy is valid).
@@ -228,46 +403,47 @@ def _validate_run_refs(
     (``run.tool_call``, ``run.id.value``) resolves to missing and denies every
     call; a list-valued path used as a scalar (``run.tools_used not in [...]``)
     can silently *pass* every call instead.
-
-    Registries are parameters, not module reads, so the list rule is testable
-    before any list-valued path is registered.
     """
+    referenced: set[str] = set()
     for role, policy in policies.items():
-        for tool_policy in (*policy.tools.values(), policy.default_policy):
-            for raw in tool_policy.constraints:
-                node = parse_constraint(raw)
-                _reject_unknown_run_paths(node, role, raw, scalar_paths | list_paths)
-                _reject_list_paths_in_scalar_position(node, role, raw, list_paths)
+        # effective_tools, not tools — so a ref on a lowered agent key (admission
+        # ``agent.run`` / reach ``agent.tool:``/``agent.handoff:``) is validated
+        # too, matching :func:`_validate_const_refs`. Walking only ``tools``
+        # fail-opened run.* constraints on those keys.
+        for raw in _raw_constraints(policy, tools=policy.effective_tools.values()):
+            node = parse_constraint(raw)
+            _reject_unknown_paths(node, role, raw, root)
+            _reject_list_paths_in_scalar_position(node, role, raw, root)
+            referenced.update(path[1] for path in _rooted_paths_in(node, root.name))
+    return frozenset(referenced)
 
 
-def _reject_unknown_run_paths(
-    node: Node, role: str, raw: str, known: frozenset[str]
-) -> None:
-    for path in _run_paths_in(node):
-        if len(path) != _RUN_PATH_SEGMENTS:
+def _reject_unknown_paths(node: Node, role: str, raw: str, root: _PathRoot) -> None:
+    for path in _rooted_paths_in(node, root.name):
+        if len(path) != _ROOTED_PATH_SEGMENTS:
             raise PolicySetError(
-                f"role {role!r}: constraint {raw!r} references run.* path "
-                f"{'.'.join(path[1:])!r}; run.* paths are exactly two segments "
-                "(run.<name>)"
+                f"role {role!r}: constraint {raw!r} references {root.name}.* path "
+                f"{'.'.join(path[1:])!r}; {root.name}.* paths are exactly two "
+                f"segments ({root.name}.<name>)"
             )
-        if path[1] not in known:
+        if path[1] not in root.known:
             raise PolicySetError(
-                f"role {role!r}: constraint {raw!r} references unknown run.* "
-                f"path {path[1]!r} (hexgate {_sdk_version()} knows: "
-                f"{', '.join(sorted(known))}). Upgrade the SDK or fix the path."
+                f"role {role!r}: constraint {raw!r} references unknown "
+                f"{root.name}.* path {path[1]!r} (hexgate {_sdk_version()} knows: "
+                f"{root.vocabulary}). Upgrade the SDK or fix the path."
             )
 
 
 def _reject_list_paths_in_scalar_position(
-    node: Node, role: str, raw: str, list_paths: frozenset[str]
+    node: Node, role: str, raw: str, root: _PathRoot
 ) -> None:
     for operand, op, side in iter_cmp_operands(node):
         # Ref-only: a Count is the correct way to use a list here.
         if not isinstance(operand, Ref) or op not in _SCALAR_ONLY_OPS:
             continue
-        if len(operand.path) != _RUN_PATH_SEGMENTS or operand.path[0] != _RUN_ROOT:
+        if len(operand.path) != _ROOTED_PATH_SEGMENTS or operand.path[0] != root.name:
             continue
-        if operand.path[1] not in list_paths:
+        if operand.path[1] not in root.list_paths:
             continue
         # in/not in only accept a literal or const on the right, so a
         # list-valued ref can only ever be their left operand.
@@ -362,6 +538,51 @@ def _load_legacy_file(path: Path) -> PolicySet:
     return load_policy_set_from_dict(payload)
 
 
+def _reject_unknown_file_level_keys(payload: dict[str, Any]) -> None:
+    """Fail closed on an unrecognised sibling of ``roles:``."""
+    unknown = sorted(set(payload) - _FILE_LEVEL_KEYS)
+    agent_level = [key for key in unknown if key in _AGENT_LEVEL_KEYS]
+    if agent_level:
+        raise PolicySetError(
+            f"{agent_level} beside {_ROLES_KEY!r} is agent-level: every role must "
+            "resolve to the same value, so put it in a mixin (is_mixin: true) that "
+            "every role lists in `inherits`. Setting it under only some roles fails "
+            "the cross-role check."
+        )
+    if unknown:
+        allowed = sorted(_FILE_LEVEL_KEYS - {_ROLES_KEY, RESOLVED_POLICY_MARKER})
+        raise PolicySetError(
+            f"unrecognised top-level key(s) {unknown} beside {_ROLES_KEY!r}; "
+            f"a role-keyed document reads policy fields inside each role, so "
+            f"move them under a role. Only {allowed} are file-level keys."
+        )
+
+
+def _file_level_constraints(payload: dict[str, Any]) -> list[str]:
+    """The file-level fence list, or empty. Shape is checked before the hoist:
+    a bare string would splat into characters, each a valid ``str``."""
+    raw = payload.get(_CONSTRAINTS_KEY)
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise PolicySetError(
+            f"top-level {_CONSTRAINTS_KEY!r} must be a list of constraint "
+            f"expressions (got {type(raw).__name__})"
+        )
+    return raw
+
+
+def _with_file_level_constraints(spec: Any, fences: list[str]) -> Any:
+    """Union the file-level fences ahead of a role's own — replacing would let a
+    role drop the file's fence, which is fail-open. Non-mappings pass through."""
+    if not fences or not isinstance(spec, dict):
+        return spec
+    own = spec.get(_CONSTRAINTS_KEY, [])
+    if not isinstance(own, list):
+        return spec
+    return {**spec, _CONSTRAINTS_KEY: [*fences, *own]}
+
+
 def load_policy_set_from_dict(payload: dict[str, Any]) -> PolicySet:
     """Build a :class:`PolicySet` from an already-parsed YAML document.
 
@@ -371,6 +592,10 @@ def load_policy_set_from_dict(payload: dict[str, Any]) -> PolicySet:
       a mapping of ``{role_name: agent_policy_spec}``. Each value is validated
       as an :class:`AgentPolicy`; the resulting map is wrapped via
       :func:`load_policy_map` so inheritance and mixin filtering apply.
+
+      A file-level ``constraints:`` block unions into every role, so the key
+      means the same thing in both shapes. ``version`` is file metadata; any
+      other sibling of ``roles:`` is rejected rather than silently dropped.
 
     * **Flat single-policy shape** (legacy) — anything else is treated as a
       single :class:`AgentPolicy` and wrapped as the ``default`` role.
@@ -387,10 +612,14 @@ def load_policy_set_from_dict(payload: dict[str, Any]) -> PolicySet:
     for SDK-local agents.
     """
     context = {"resolved": True} if payload.get(RESOLVED_POLICY_MARKER) else None
-    if isinstance(payload.get("roles"), dict):
+    if isinstance(payload.get(_ROLES_KEY), dict):
+        _reject_unknown_file_level_keys(payload)
+        fences = _file_level_constraints(payload)
         role_policies = {
-            role_name: AgentPolicy.model_validate(spec or {}, context=context)
-            for role_name, spec in payload["roles"].items()
+            role_name: AgentPolicy.model_validate(
+                _with_file_level_constraints(spec or {}, fences), context=context
+            )
+            for role_name, spec in payload[_ROLES_KEY].items()
         }
         return load_policy_map(role_policies)
     flat = {k: v for k, v in payload.items() if k != RESOLVED_POLICY_MARKER}
@@ -432,6 +661,39 @@ def _load_from_directory(root: Path) -> PolicySet:
     return PolicySet(concrete, aliased_default=aliased)
 
 
+def _agent_on_unavailable(policies: Mapping[str, AgentPolicy]) -> OnUnavailable:
+    """The one fail mode every role resolves to, or :class:`PolicySetError`.
+
+    Agent-wide because the usage snapshot is fetched per agent. A role that says
+    nothing reads ``allow``, so a silent role and a ``deny`` role disagree: put the
+    block in a mixin every role inherits."""
+    return _agent_wide(
+        policies,
+        "usage.on_unavailable",
+        "the usage snapshot is per agent",
+        AgentPolicy.usage_on_unavailable,
+    )
+
+
+def _agent_wide[V: Hashable](
+    policies: Mapping[str, AgentPolicy],
+    field: str,
+    reason: str,
+    value_of: Callable[[AgentPolicy], V],
+) -> V:
+    """The one value of an agent-level ``field`` every role resolves to, or
+    :class:`PolicySetError` naming each role's value."""
+    by_role = {role: value_of(policy) for role, policy in policies.items()}
+    values = set(by_role.values())
+    if len(values) > 1:
+        detail = ", ".join(f"{role}={value}" for role, value in sorted(by_role.items()))
+        raise PolicySetError(
+            f"{field} must resolve to the same value across all roles ({reason}); "
+            f"got {detail}. Put it in a mixin every role inherits."
+        )
+    return values.pop()
+
+
 def _resolve_inheritance(
     name: str, raw: dict[str, AgentPolicy], chain: list[str]
 ) -> AgentPolicy:
@@ -441,6 +703,11 @@ def _resolve_inheritance(
     then this role's own fields overlay last. Equivalent to Python's MRO
     with explicit precedence: ``self`` wins, then later parents, then
     earlier parents.
+
+    ``constraints`` is the one exception: it **unions** across the chain, since
+    letting a child replace a mixin's cap would silently remove it. Union can
+    only narrow. Deduplicated in first-seen order, so a diamond does not
+    evaluate the same predicate twice.
     """
     if name in chain:
         raise PolicySetError(f"cyclic inheritance: {' -> '.join(chain + [name])}")
@@ -449,26 +716,37 @@ def _resolve_inheritance(
             f"role {name!r} not found (inherited from {chain[-1] if chain else '<root>'})"
         )
     own = raw[name]
+    _reject_explicit_null_usage(name, own)
     if not own.inherits:
         return own
     merged_tools: dict[str, ToolPolicy] = {}
     merged_agents: dict[str, AgentTargetPolicy] = {}
+    merged_skills: dict[str, SkillPolicy] = {}
+    merged_guards: dict[str, GuardRule] = {}
     merged_consts: dict[str, object] = {}
+    merged_constraints: list[str] = []
     merged_default: BaseToolPolicy = own.default_policy
     merged_admission: BaseToolPolicy | None = own.admission
+    merged_usage: UsagePolicy | None = own.usage
 
-    # Merge parents left-to-right (later parents override earlier). ``agents``
-    # merges by target name like ``tools`` does. ``admission`` only overwrites when
-    # a parent actually sets one, so a later mixin that omits it can't null out an
-    # earlier parent's rule — dropping an agent gate silently would be fail-open.
+    # Merge parents left-to-right (later parents override earlier). ``agents`` and
+    # ``skills`` merge by name like ``tools`` does. ``admission`` and ``usage`` only
+    # overwrite when a parent actually sets one, so a later mixin that omits it can't
+    # null out an earlier parent's rule — dropping an agent gate or a usage ``deny``
+    # silently would be fail-open.
     for parent_name in own.inherits:
         parent = _resolve_inheritance(parent_name, raw, chain + [name])
         merged_tools.update(parent.tools)
         merged_agents.update(parent.agents)
+        merged_skills.update(parent.skills)
+        merged_guards.update(parent.guards)
         merged_consts.update(parent.consts)
+        _extend_unique(merged_constraints, parent.constraints)
         merged_default = parent.default_policy
         if parent.admission is not None:
             merged_admission = parent.admission
+        if parent.usage is not None:
+            merged_usage = parent.usage
 
     # Self overrides everything from parents. Check ``model_fields_set`` rather
     # than comparing against ``BaseToolPolicy()``: a child that explicitly says
@@ -477,19 +755,47 @@ def _resolve_inheritance(
     # parent would be fail-open.
     merged_tools.update(own.tools)
     merged_agents.update(own.agents)
+    merged_skills.update(own.skills)
+    merged_guards.update(own.guards)
     merged_consts.update(own.consts)
+    # Union, not override — the one field here that accumulates (see docstring).
+    _extend_unique(merged_constraints, own.constraints)
     if "default_policy" in own.model_fields_set:
         merged_default = own.default_policy
     if "admission" in own.model_fields_set:
         merged_admission = own.admission
+    if own.usage is not None:
+        merged_usage = own.usage
 
     return AgentPolicy(
         version=own.version,
         inherits=own.inherits,
         is_mixin=own.is_mixin,
         default_policy=merged_default,
+        constraints=merged_constraints,
         tools=merged_tools,
         consts=merged_consts,
         admission=merged_admission,
         agents=merged_agents,
+        skills=merged_skills,
+        guards=merged_guards,
+        usage=merged_usage,
     )
+
+
+def _reject_explicit_null_usage(name: str, policy: AgentPolicy) -> None:
+    """The merge never lets a role drop an inherited ``deny`` (fail-open), so
+    ``usage: null`` would keep the parent's value where ``admission: null`` clears
+    it. Reject the spelling rather than let one syntax mean two things."""
+    if USAGE_FIELD in policy.model_fields_set and policy.usage is None:
+        raise PolicySetError(
+            f"role {name!r}: usage: null is not allowed; omit the key to inherit, "
+            "or set usage.on_unavailable"
+        )
+
+
+def _extend_unique(target: list[str], values: Iterable[str]) -> None:
+    """Append values not already present, preserving first-seen order."""
+    for value in values:
+        if value not in target:
+            target.append(value)
