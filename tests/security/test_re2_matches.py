@@ -6,7 +6,7 @@ hand-maintained list of Python features to avoid (`_RE2_INCOMPATIBLE`) went, and
 they never agreed on *cost*: `re` backtracks, RE2 does not.
 
 Running RE2 on both sides makes the agreement structural. This suite covers what
-that buys, and the one place where behaviour changes.
+that buys, and the places where behaviour changes.
 
 The corpus below is adversarial on purpose: every pattern in `LINEAR_UNDER_RE2`
 is one Python's engine takes exponential time on, so a regression to `re` would
@@ -158,10 +158,9 @@ def test_ascii_classes_keep_their_meaning() -> None:
 def test_an_invalid_pattern_is_an_error_not_a_silent_deny() -> None:
     """A typo must surface, not quietly refuse every call.
 
-    RE2 can be built with error logging off, which also makes an invalid pattern
-    compile into an object that simply never matches. That would turn a typo
-    into a policy that denies everything for a reason nobody can see, so the
-    default (raise) is what this code relies on.
+    Patterns are compiled with RE2's error logging off, which only silences
+    its stderr copy of the error: the compile still raises, so a typo cannot
+    become a policy that denies everything for a reason nobody can see.
     """
     with pytest.raises(ConstraintParseError):
         parse_constraint(_constraint("(unbalanced"))
@@ -181,25 +180,30 @@ def test_reason_falls_back_to_text_when_re2_reports_a_string() -> None:
     assert isinstance(_re2_reason(ValueError()), str)  # and never raises
 
 
-def test_an_unencodable_argument_denies_instead_of_raising() -> None:
-    """A tool argument that is not valid UTF-8 must fail closed.
+def test_an_unencodable_argument_is_matched_not_given_a_verdict() -> None:
+    """A tool argument that is not valid UTF-8 is still matched.
 
     RE2 matches over UTF-8 bytes, and `json.loads` accepts strings that have no
     encoding: an emoji is a surrogate pair, and a truncated payload can deliver
-    only its first half. Python's `re` evaluated such a value and the constraint
-    failed; RE2 cannot encode it at all. The constraint must still deny rather
-    than raise, since `evaluate_tool_call` only catches `PolicyDeniedError` and
-    anything else escapes the enforcer.
+    only its first half. Each such code point is read as U+FFFD and the rest of
+    the value is matched as written. Returning a fixed `False` instead would
+    turn into an allow under `not`, letting one appended surrogate bypass a
+    deny-list pattern.
     """
     lone_surrogate = chr(0xD83D)  # the first half of a surrogate pair
-    args = json.loads(json.dumps({"ticket": "INC-42 " + lone_surrogate}))
+    ticket = json.loads(json.dumps("INC-42 " + lone_surrogate))
     with pytest.raises(PolicyDeniedError):
         check_constraints(
-            [_constraint("^INC-[0-9]+$")],
-            {"v": args["ticket"]},
-            "update_ticket",
-            role="support",
+            [_constraint("^INC-[0-9]+$")], {"v": ticket}, "tool", role="support"
         )
+    check_constraints(
+        [_constraint("^INC-[0-9]+ ")], {"v": ticket}, "tool", role="support"
+    )
+
+    path = json.loads(json.dumps("../etc/passwd" + lone_surrogate))
+    no_traversal = f"not {_constraint(r'[.][.]/')}"
+    with pytest.raises(PolicyDeniedError):
+        check_constraints([no_traversal], {"v": path}, "tool", role="support")
 
 
 def test_an_unencodable_pattern_is_refused_at_load() -> None:

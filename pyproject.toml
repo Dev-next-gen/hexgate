@@ -56,8 +56,9 @@ dependencies = [
     # RE2 (Go regexp / Rego's `regex.match`) evaluates `matches` on the
     # pydantic engine, so a constraint behaves the same there as in a
     # compiled WASM bundle -- same syntax accepted, and linear time either
-    # way. Prebuilt wheels for 3.13/3.14 on macOS, Linux and Windows, so
-    # nothing is compiled on install. See docs/adr/R-CONSTRAINT-001.
+    # way. Prebuilt wheels for 3.13/3.14 on manylinux, macOS 13+ and
+    # Windows; elsewhere (musllinux, older glibc or macOS) pip builds the
+    # sdist, which needs RE2 and pybind11. See docs/adr/R-CONSTRAINT-001.
     "google-re2>=1.1.20251105",
 ]
 

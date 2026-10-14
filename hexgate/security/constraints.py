@@ -686,7 +686,11 @@ def _compile_re2(pattern: str) -> _Regexp:
     evaluation reuses the object. ``re2.error`` is left to the caller, which
     turns it into a :class:`ConstraintParseError` naming the constraint.
     """
-    return re2.compile(pattern)
+    options = re2.Options()
+    # An invalid pattern still raises with this off. It only stops RE2 from
+    # writing its own copy of the error to stderr, which callers cannot capture.
+    options.log_errors = False
+    return re2.compile(pattern, options)
 
 
 def _re2_reason(exc: BaseException) -> str:
@@ -872,10 +876,11 @@ def _eval_call(node: Call, context: dict[str, Any]) -> bool:
         except UnicodeEncodeError:
             # RE2 matches over UTF-8 bytes, and `json.loads` accepts strings
             # that have no encoding: a lone `\ud83d` is half an emoji whose other
-            # half never arrived. Fail the constraint rather than raise, so a
-            # malformed argument denies like any other unmatchable value here
-            # instead of escaping the enforcer as an exception.
-            return False
+            # half never arrived. Read each such code point as U+FFFD and match
+            # the rest as usual. Returning a fixed verdict here would not fail
+            # closed: under `not`, a False becomes an allow.
+            replaced = re.sub("[\ud800-\udfff]", "�", x)
+            return _compile_re2(v).search(replaced) is not None
     return False  # unreachable given the _FUNCS whitelist
 
 

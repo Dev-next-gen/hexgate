@@ -34,9 +34,12 @@ per two characters. Under RE2 the same pattern decides a 4 000-character
 argument in about 0.1ms. Since tool arguments are model-written and there is no
 timeout on the decision path, that difference is the one that matters.
 
-**Dependency.** `google-re2` publishes prebuilt wheels for the Python versions
-this project supports, alongside the native packages already shipped
-(`wasmtime`, `cryptography`, `biscuit-python`), so contributors compile nothing.
+**Dependency.** `google-re2` publishes prebuilt wheels for Python 3.13 and 3.14
+on manylinux (glibc 2.27+ on x86_64, 2.26+ on aarch64), macOS 13+ and Windows.
+Elsewhere — musllinux (Alpine), an older glibc, macOS 12 and earlier —
+pip falls back to the sdist, which needs the RE2 library and pybind11 installed
+to build. `hexgate.security.constraints` imports `re2` at module level, so on
+those platforms the SDK does not import until that build succeeds.
 
 ## Consequences
 
@@ -48,19 +51,25 @@ this project supports, alongside the native packages already shipped
 - `re.ASCII` is no longer needed to keep `\d` / `\w` ASCII: RE2 is ASCII for
   these by default.
 - `\s` no longer covers the vertical tab. RE2 counts tab, newline, form feed,
-  carriage return and space; Python's ASCII class also counts ``. Same
+  carriage return and space; Python's ASCII class also counts `\v`. Same
   direction as the `$` change: it aligns the engine with the bundle, which never
   matched it either.
-- An argument that is not valid UTF-8 denies instead of raising. RE2 matches
-  over UTF-8 bytes, and `json.loads` accepts strings that have no encoding (an
-  unpaired surrogate, half of an emoji from a truncated payload). Python's `re`
-  evaluated those and the constraint failed; here the encode fails, so the
-  constraint is failed closed rather than allowed to escape the enforcer as an
-  exception. The same input on the *pattern* side is a malformed policy, and is
-  refused at load.
-- Error logging stays on. RE2 can be built with it off, but that also makes an
-  invalid pattern compile into an object that never matches — turning a typo
-  into a policy that silently denies everything. Raising is worth the log line.
+- `{,n}` is literal text. Python reads it as `{0,n}`; RE2, and the bundle,
+  read the characters `{,n}`. `^\d{,5}$` used to match `"123"` on the pydantic
+  engine and now denies it on both.
+- `(?i)` folds case over Unicode, where `re.ASCII` folded ASCII only: `(?i)k`
+  now also matches the Kelvin sign `K` (U+212A), as it does in the bundle.
+- An unpaired surrogate in an argument is matched as U+FFFD. RE2 matches over
+  UTF-8 bytes, and `json.loads` accepts strings that have no encoding (half of
+  an emoji from a truncated payload). Replacing only those code points keeps
+  the rest of the value matched as written, so `not matches(args.p, "\\.\\./")`
+  still denies `"../etc/passwd\ud83d"`; returning a fixed `False` would have
+  allowed it. The WASM engine aborts on such an input
+  (`WasmEvalError: opa_abort invoked`) rather than deciding it. The same input
+  on the *pattern* side is a malformed policy, and is refused at load.
+- RE2's error logging is off. An invalid pattern still raises with it off; it
+  only stops RE2 from writing its own copy of the error to stderr, outside
+  anything a caller can capture.
 
 ## Rejected alternatives
 
